@@ -1,0 +1,136 @@
+================================================================================
+INGENDATA: TRANSFORMATION RULES & PIPELINE ARCHITECTURE REFERENCE
+================================================================================
+
+1. OVERVIEW & ARCHITECTURAL ROLE
+--------------------------------------------------------------------------------
+IngenData serves as the foundational data ingestion, schema normalization, and
+feature transformation layer within the platform. When raw sales or commercial
+audit datasets are uploaded, IngenData executes:
+  1. Automated Header Detection against metadata dictionary rulesets.
+  2. Data Format Classification into one of 4 canonical sales schemas.
+  3. Temporal Aggregation & Pivoting to create standardized volume and share
+     tables (trans_sales_data1, trans_sales_data2, trans_sales_data3).
+
+
+2. CODE ANCHORS & FILE PATHS
+--------------------------------------------------------------------------------
+- API Entry Point:
+  File: python_code.py (Lines 3179 - 3245)
+  Function: POST /salestransformation
+
+- Ruleset Column Detection & Save:
+  File: python_code.py (Lines 6365 - 6605)
+  Function: POST /insert_sales_data_columns_name
+
+- Transformation Controller:
+  File: ingencustomer_views.py (Lines 2790 - 3035)
+  Function: salestransformation_view
+
+- Core Transformation Class:
+  File: ingencustomer_views.py (Lines 1121 - 2788)
+  Class: class SalesDataTansformation
+
+- Format 1 Transformer:
+  File: ingencustomer_views.py (Lines 766 - 850, 1909 - 2070)
+  Function: transform_sales_volume_for_format1 / transformation_for_format1_data
+
+- Format 2 Transformer:
+  File: ingencustomer_views.py (Lines 929 - 1020, 2071 - 2300)
+  Function: transform_sales_volume_for_format2 / transformation_for_format2_data
+
+- Format 3 Transformer:
+  File: ingencustomer_views.py (Lines 2301 - 2450, 2562 - 2643)
+  Function: transformation_for_format3_data / transformed_data1_format_sales_var_as_timeperiod_and_salesunit
+
+- Format 4 Transformer:
+  File: ingencustomer_views.py (Lines 2644 - 2788)
+  Function: transformation_for_format4_data
+
+- Column Ruleset Detection Utility:
+  File: functions.py (Lines 377 - 445)
+  Function: sales_trans_column_detection
+
+
+3. AUTOMATED COLUMN DETECTION RULESETS
+--------------------------------------------------------------------------------
+When an input table is processed, column headers are sanitized (spaces and
+underscores removed, converted to lowercase) and classified against database
+dictionary tables:
+
+A. public.application_specific_data_ruleset
+   Maps raw column headers to functional analytical categories:
+   - Customer Identifier: Matches customer_id_var and customer_name_var
+     (e.g., customerid, account_no, doctor_id, npi).
+   - Product Identifier: Matches product_id_var and product_name_var
+     (e.g., productcode, brand, item_type, drug_name).
+   - Sales Metrics: Matches sales_var1, sales_var2, sales_var3
+     (e.g., quantity, units, sales, revenue, trx, nrx).
+   - Temporal Variables: Matches date, week_var, month_var, quarter_var
+     (e.g., order_date, week_number, cal_month).
+
+B. Domain-Specific Dictionary Rulesets
+   - public.customer_data_ruleset: Recognizes demographic, specialty, and
+     geographic columns (customer_type, address_line1, zip_code, first_name).
+   - public.product_data_ruleset: Recognizes category, group, and therapeutic
+     classes (class, therapeutic_area, category).
+
+
+4. THE 4 SALES TRANSFORMATION FORMAT RULES
+--------------------------------------------------------------------------------
+
+RULE 1: DATA FORMAT 1 (Sales on Specific Calendar Date)
+- Input Structure: Narrow / long transaction log:
+  Columns: [customer_id, product_id, date, sales_metric]
+- Processing Logic:
+  1. Decomposes date into ISO week numbers (1 to 52), calendar months (1 to 12),
+     calendar quarters (1 to 4), and years.
+  2. Aggregates metrics at the (customer, product) level.
+  3. Dynamic column naming:
+     - Weekly:     <Year>_<SalesMetric>_wk<1..52>
+     - Monthly:    <Year>_<SalesMetric>_month<1..12>
+     - Quarterly:  <Year>_<SalesMetric>_quarter<1..4>
+     - Annual:     <Year>_Total_<SalesMetric>
+  4. Market Share Derivation:
+     Share(c, p, t) = ( Sales(c, p, t) / Sum_over_Class(Sales(c, q, t)) ) * 100
+     Yields column: <Product>_<Class>_<Year>_Total_<SalesMetric> share percent.
+
+RULE 2: DATA FORMAT 2 (Period Number / Categorical Time)
+- Input Structure: Records where time is specified by index or name:
+  Columns: [customer_id, product_id, Month / Week / Quarter, sales_metric]
+- Processing Logic:
+  1. Parses textual month names (e.g. 'Jan', 'February') to 2-digit numeric
+     codes 01 to 12.
+  2. Groups by (customer, product, period) and pivots into chronological period metrics.
+  3. Materializes trans_sales_data1 and trans_sales_data3.
+
+RULE 3: DATA FORMAT 3 (Time-Period and Sales Metric in Headers)
+- Input Structure: Wide pre-aggregated matrices:
+  Columns: [customer_id, product_id, JAN04_QTY, FEB04_QTY, ..., DEC04_QTY, JAN04_NRX, ...]
+- Processing Logic:
+  1. Regular expression tokenization detects date/year fragments inside header strings.
+  2. Drops columns where all values are null or zero.
+  3. Reconstructs monthly series and annual totals (<Year>_Total_<Metric>).
+  4. Calculates customer x product shares within category for each detected timeframe.
+
+RULE 4: DATA FORMAT 4 (Relative Unspecified Period Columns)
+- Input Structure: Files without calendar timestamps, containing relative period counters:
+  Columns: [customer_id, product_id, units_month1, units_month2, ..., units_month12]
+- Processing Logic:
+  1. Separates physical volume ('units', 'qty') from monetary metrics ('dollar', 'revenue').
+  2. Groups by (customer, product) and computes cumulative annual and period totals.
+  3. Evaluates relative brand shares across the sequential periods.
+
+
+5. OUTPUT STANDARDIZED PARQUET TABLES & STORAGE CONVENTION
+--------------------------------------------------------------------------------
+Output Table Identifier | Granularity                  | Data Contained                                             | Downstream Consumer Modules
+------------------------+------------------------------+------------------------------------------------------------+----------------------------
+trans_sales_data1       | (Customer, Product)          | Volume aggregations by week, month, quarter, and year      | Decile, Quartile, Volume Trend
+trans_sales_data2       | (Customer, Class)            | Total category/class-level volumes                         | Customer 360
+trans_sales_data3       | (Customer, Product, Class)   | Percentage market shares within therapeutic class          | Market Dominant, Share Trend
+
+All generated parquet files are saved to Amazon S3 under:
+  S3_Transformation_Tables_Folder + "trans_sales_data{1|2|3}_" + <timestamp> + "_" + <sales_metric>
+and cataloged in public.user_file_upload.transformed_tablenames.
+================================================================================

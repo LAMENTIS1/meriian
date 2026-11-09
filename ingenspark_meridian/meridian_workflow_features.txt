@@ -1,0 +1,102 @@
+Meridian’s features, grouped by the stage of the workflow they belong to. This list comes from the module inventory you shared earlier, the notebook, and the analysis guide.
+
+1. Data input
+
+Loaders for pandas DataFrames, CSV files, xarray Datasets, and raw NumPy arrays (DataFrameDataLoader, CsvDataLoader, XrDatasetDataLoader, the NDArray builder).
+CoordToColumns to map your column names to model roles.
+Validation of shapes, time alignment, and non-negative values.
+Support for media (impressions) and spend, reach and frequency (RF) channels, organic media, controls, non-media treatments, and population.
+Optional currency code on the data.
+
+2. Model specification
+
+Adstock decay functions: geometric and binomial, set per channel.
+Saturation: Hill or none, set per channel.
+Hill before or after adstock.
+Knots for a time-varying baseline, including automatic knot selection (AKS).
+Geo-level hierarchical effects, with normal or log-normal media effects.
+Population scaling for controls and non-media variables.
+Non-media baseline values (fixed, min, or max).
+Time-varying media effects through changepoints (new in the current module list).
+
+3. Priors and calibration
+
+Four media prior types: ROI, marginal ROI (mROI), contribution, and coefficient.
+Default priors that you can override per parameter.
+Experiment calibration: CalibrationBuilder converts incrementality experiment results (including GeoX results) into ROI priors, with spend, recency, and duration adjustments.
+ROI calibration periods to limit which weeks the ROI prior applies to.
+
+4. Holdouts
+
+Geo-based and date-based holdout specs.
+Random holdouts, optionally balanced across time periods.
+Holdouts keep media in the model so adstock carry-over stays correct.
+
+5. Sampling
+
+Prior sampling (sample_prior) to check what the priors imply.
+Posterior sampling with the No-U-Turn Sampler (sample_posterior), with multiple chains.
+Combined sample-and-review (sample_posterior_and_review).
+Posterior thinning, progress reporting, and a TQDM progress bar.
+Backends: JAX (default in the current version) and TensorFlow, which is deprecated.
+
+6. Model review and health
+
+ModelReviewer with these checks:
+Convergence (R-hat)
+Baseline (probability of a negative baseline)
+Bayesian posterior predictive p-value
+Goodness of fit (R-squared, MAPE, wMAPE)
+Prior-to-posterior shift
+ROI consistency
+Implausible ROI
+High-variance ROI
+Potential bias from control correlation
+A combined health score and a PASS, REVIEW, or FAIL status.
+Exploratory data analysis (EDA) checks before fitting: KPI invariability, VIF (multicollinearity), pairwise correlation, standard deviation, cost per media unit, and population correlation.
+
+7. Analysis
+
+Analyzer for incremental outcome, ROI, mROI, CPIK (cost per incremental KPI), contribution share, expected vs. actual, response curves, adstock decay, and Hill curves.
+Credible intervals on every metric.
+Analysis at national or geo level, over selected geos and time periods, and on KPI or revenue.
+Support for new data (counterfactual scenarios).
+
+8. Visualization
+
+ModelFit: predicted vs. actual over time.
+ModelDiagnostics: R-hat and prior/posterior plots.
+MediaEffects: response curves and adstock decay.
+MediaSummary: contribution, ROI, CPIK, and waterfall charts.
+ReachAndFrequency: optimal frequency curves.
+Chart output is Altair (Vega-Lite).
+
+9. Budget optimization
+
+BudgetOptimizer with fixed-budget and flexible-budget (target ROI or mROI) scenarios.
+Per-channel spend constraints, absolute or relative.
+Optimal frequency for reach and frequency channels.
+Optimization grids for interactive what-if analysis.
+Response curves and spend-delta plots for the results.
+
+10. Reports and persistence
+
+Summarizer for a self-contained HTML results summary.
+The model review also produces an HTML health card.
+save_mmm and load_mmm for pickle files, plus a protocol buffer serializer (meridian.schema.serde) for versioned model files.
+
+11. Enterprise export
+
+Protocol buffer schema (mmm-proto-schema) for marketing analysis, budget optimization, reach and frequency results, and model fit.
+Scenario Planner export to Google Sheets and a Looker Studio dashboard (scenarioplanner).
+MLflow integration (meridian.mlflow). The module was not installed in the environment shown, so it needs separate setup.
+
+12. Full-funnel modeling (not built in)
+Meridian does not include a combined two-stage analyzer. The Colab notebook shows how to build one (AnalyzerFullFunnel), and that class has to be copied into your own code.
+
+Limitations to be aware of
+
+The model fits on aggregated, geo-level data, not user-level data.
+Sampling is slow and benefits from a GPU.
+Non-revenue KPIs without a revenue per unit need custom priors. Otherwise Meridian falls back to a total media contribution prior.
+Some API details in the analysis guide and notebook differ from the library. Check method names against the installed version.

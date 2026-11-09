@@ -1,0 +1,20 @@
+[
+  {
+    "id": 101,
+    "name": "ABC Healthcare",
+    "industry": "Healthcare",
+    "revenue": 500000
+  },
+  {
+    "id": 102,
+    "name": "XYZ Pharma",
+    "industry": "Pharma",
+    "revenue": 300000
+  },
+  {
+    "id": 103,
+    "name": "Global Retail",
+    "industry": "Retail",
+    "revenue": 700000
+  }
+]

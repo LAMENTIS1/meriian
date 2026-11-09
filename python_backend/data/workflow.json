@@ -1,0 +1,12 @@
+[
+  {
+    "dataset": "dataset_A",
+    "workflow": "workflow_1",
+    "steps": ["cleaning", "scaling", "kmeans"]
+  },
+  {
+    "dataset": "dataset_B",
+    "workflow": "workflow_2",
+    "steps": ["cleaning"]
+  }
+]

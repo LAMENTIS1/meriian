@@ -1,0 +1,2426 @@
+# Copyright 2026 The Meridian Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import dataclasses
+import datetime
+import itertools
+import re
+import warnings
+
+from absl.testing import absltest
+from absl.testing import parameterized
+from ingenspark_meridian.meridian import backend
+from ingenspark_meridian.meridian import constants
+from ingenspark_meridian.meridian.data import input_data
+from ingenspark_meridian.meridian.data import test_utils
+import numpy as np
+import pandas as pd
+import xarray as xr
+import xarray.testing as xrt
+
+
+def _with_cell_value(da: xr.DataArray, value: float) -> xr.DataArray:
+  """Returns a copy of `da` with one cell (first geo and channel) set."""
+  da = da.astype(float)
+  da[{dim: 5 if dim == constants.MEDIA_TIME else 0 for dim in da.dims}] = value
+  return da
+
+
+def _at_least_one(frequency: xr.DataArray) -> xr.DataArray:
+  """Returns a copy of `frequency` with every value raised to at least 1."""
+  return frequency.copy(data=np.maximum(frequency.values, 1.0))
+
+
+class InputDataTest(parameterized.TestCase):
+
+  def setUp(self):
+    """Generates `sample` DataArrays."""
+    super().setUp()
+
+    self.n_times = 149
+    self.n_lagged_media_times = 152
+    self.n_geos = 10
+    self.n_media_channels = 6
+    self.n_rf_channels = 2
+    self.n_controls = 3
+
+    self.not_lagged_media = test_utils.random_media_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_times,
+        n_media_channels=self.n_media_channels,
+    )
+    self.not_lagged_media_invalid_time_values = test_utils.random_media_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_times,
+        n_media_channels=self.n_media_channels,
+        date_format="week-%U",
+    )
+    self.not_lagged_media_invalid_timestamp_values = test_utils.random_media_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_times,
+        n_media_channels=self.n_media_channels,
+        explicit_time_index=pd.date_range(  # pyrefly: ignore[bad-argument-type]
+            start="2022-01-01", periods=self.n_times, freq="W"
+        ),
+    )
+    self.lagged_media = test_utils.random_media_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_lagged_media_times,
+        n_media_channels=self.n_media_channels,
+    )
+    self.media_spend = test_utils.random_media_spend_nd_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_channels=self.n_media_channels,
+    )
+    self.media_spend_1d = test_utils.random_media_spend_nd_da(
+        n_media_channels=self.n_media_channels
+    )
+    self.not_lagged_controls = test_utils.random_controls_da(
+        media=self.not_lagged_media,
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_controls=self.n_controls,
+    )
+    self.not_lagged_controls_invalid_time_values = (
+        test_utils.random_controls_da(
+            media=self.not_lagged_media,
+            n_geos=self.n_geos,
+            n_times=self.n_times,
+            n_controls=self.n_controls,
+            date_format="week-%U",
+        )
+    )
+    self.not_lagged_controls_timestamp_values = test_utils.random_controls_da(
+        media=self.not_lagged_media,
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_controls=self.n_controls,
+        explicit_time_index=pd.date_range(  # pyrefly: ignore[bad-argument-type]
+            start="2022-01-01", periods=self.n_times, freq="W"
+        ),
+    )
+    self.lagged_controls = test_utils.random_controls_da(
+        media=self.lagged_media,
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_controls=self.n_controls,
+    )
+    self.not_lagged_kpi = test_utils.random_kpi_da(
+        media=self.not_lagged_media,
+        controls=self.not_lagged_controls,
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_channels=self.n_media_channels,
+        n_controls=self.n_controls,
+    )
+    self.lagged_kpi = test_utils.random_kpi_da(
+        media=self.lagged_media,
+        controls=self.lagged_controls,
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_channels=self.n_media_channels,
+        n_controls=self.n_controls,
+    )
+    self.revenue_per_kpi = test_utils.constant_revenue_per_kpi(
+        n_geos=self.n_geos, n_times=self.n_times, value=2.2
+    )
+    self.population = test_utils.random_population(n_geos=self.n_geos)
+    self.not_lagged_reach = test_utils.random_reach_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_times,
+        n_rf_channels=self.n_rf_channels,
+    )
+    self.lagged_reach = test_utils.random_reach_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_lagged_media_times,
+        n_rf_channels=self.n_rf_channels,
+    )
+    self.not_lagged_frequency = test_utils.random_frequency_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_times,
+        n_rf_channels=self.n_rf_channels,
+    )
+    self.lagged_frequency = test_utils.random_frequency_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_lagged_media_times,
+        n_rf_channels=self.n_rf_channels,
+    )
+    self.rf_spend = test_utils.random_rf_spend_nd_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_rf_channels=self.n_rf_channels,
+    )
+
+  def test_construct_media_only_invalid_media_time_values(self):
+    with self.assertRaisesRegex(
+        ValueError, expected_regex="Invalid media_time label: 'week-04'"
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=self.not_lagged_media_invalid_time_values,
+          media_spend=self.media_spend,
+      )
+
+  def test_construct_media_only_invalid_media_time_values_type(self):
+    with self.assertRaisesRegex(
+        ValueError, expected_regex="Invalid media_time label:"
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=self.not_lagged_media_invalid_timestamp_values,
+          media_spend=self.media_spend,
+      )
+
+  def test_validate_unique_geos(self):
+    media = test_utils.random_media_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_times,
+        n_media_channels=self.n_media_channels,
+        explicit_geo_names=[
+            "geo1",
+            "geo2",
+            "geo3",
+            "geo4",
+            "geo5",
+            "geo6",
+            "geo7",
+            "geo8",
+            "geo9",
+            "geo9",
+        ],
+    )
+
+    with self.assertRaisesRegex(
+        ValueError,
+        expected_regex="`geo` names must be unique within the array `media`.",
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=media,
+          media_spend=self.media_spend,
+          reach=self.not_lagged_reach,
+          frequency=self.not_lagged_frequency,
+          rf_spend=self.rf_spend,
+      )
+
+  def test_validate_kpi_wrong_type(self):
+    with self.assertRaisesRegex(
+        ValueError,
+        expected_regex=(
+            "Invalid kpi_type: `wrong_type`; must be one of `revenue` or"
+            " `non_revenue`."
+        ),
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type="wrong_type",
+          population=self.population,
+          revenue_per_kpi=self.revenue_per_kpi,
+          media=self.not_lagged_media,
+          media_spend=self.media_spend,
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="media_spend",
+          field=constants.MEDIA_SPEND,
+          name="Media Spend",
+          kpi_type=constants.REVENUE,
+      ),
+      dict(
+          testcase_name="rf_spend",
+          field=constants.RF_SPEND,
+          name="RF Spend",
+          kpi_type=constants.REVENUE,
+      ),
+      dict(
+          testcase_name="reach",
+          field=constants.REACH,
+          name="Reach",
+          kpi_type=constants.REVENUE,
+      ),
+      dict(
+          testcase_name="frequency",
+          field=constants.FREQUENCY,
+          name="Frequency",
+          kpi_type=constants.REVENUE,
+      ),
+      dict(
+          testcase_name="kpi",
+          field=constants.KPI,
+          name="KPI",
+          kpi_type=constants.REVENUE,
+      ),
+      dict(
+          testcase_name="revenue_per_kpi",
+          field=constants.REVENUE_PER_KPI,
+          name="Revenue per KPI",
+          kpi_type=constants.NON_REVENUE,
+      ),
+  )
+  def test_validate_no_negative_values(
+      self, field: str, name: str, kpi_type: str
+  ):
+    maybe_flip = lambda da, key: (da * -1) if key == field else (da * 1)
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        expected_exception_message=f"{name} values must be non-negative.",
+    ):
+      input_data.InputData(
+          controls=self.lagged_controls,
+          kpi=maybe_flip(self.lagged_kpi, constants.KPI),
+          kpi_type=kpi_type,
+          population=self.population,
+          revenue_per_kpi=maybe_flip(
+              self.revenue_per_kpi, constants.REVENUE_PER_KPI
+          ),
+          media_spend=maybe_flip(self.media_spend, constants.MEDIA_SPEND),
+          rf_spend=maybe_flip(self.rf_spend, constants.RF_SPEND),
+          media=self.lagged_media,
+          reach=maybe_flip(self.lagged_reach, constants.REACH),
+          frequency=maybe_flip(self.lagged_frequency, constants.FREQUENCY),
+      )
+
+  def test_validate_media_channels_duplicate_names(self):
+    media = test_utils.random_media_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_times,
+        n_media_channels=self.n_media_channels,
+        explicit_media_channel_names=[
+            "ch_1",
+            "ch_2",
+            "ch_3",
+            "ch_4",
+            "ch_5",
+            "ch_5",
+        ],
+    )
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        expected_exception_message=(
+            "Channel names across `media_channel`, `rf_channel`,"
+            " `organic_media_channel`, `organic_rf_channel`, and"
+            " `non_media_channel` must be unique. Channel `ch_5` is present in"
+            " multiple channel types: ['media_channel', 'media_channel']."
+        ),
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.REVENUE,
+          population=self.population,
+          revenue_per_kpi=self.revenue_per_kpi,
+          media=media,
+          media_spend=self.media_spend.assign_coords(
+              media_channel=media.coords["media_channel"]
+          ),
+      )
+
+  def test_validate_rf_channels_duplicate_names(self):
+    reach = test_utils.random_reach_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_times,
+        n_rf_channels=self.n_rf_channels,
+        explicit_rf_channel_names=[
+            "rf_ch_1",
+            "rf_ch_1",
+        ],
+    )
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        expected_exception_message=(
+            "Channel names across `media_channel`, `rf_channel`,"
+            " `organic_media_channel`, `organic_rf_channel`, and"
+            " `non_media_channel` must be unique. Channel `rf_ch_1` is present"
+            " in multiple channel types: ['rf_channel', 'rf_channel']."
+        ),
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.REVENUE,
+          population=self.population,
+          revenue_per_kpi=self.revenue_per_kpi,
+          media=self.not_lagged_media,
+          media_spend=self.media_spend,
+          reach=reach,
+          frequency=self.not_lagged_frequency.assign_coords(
+              rf_channel=reach.coords["rf_channel"]
+          ),
+          rf_spend=self.rf_spend.assign_coords(
+              rf_channel=reach.coords["rf_channel"]
+          ),
+      )
+
+  def test_validate_rf_channels_with_duplicate_media_channels(self):
+    media = test_utils.random_media_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_times,
+        n_media_channels=self.n_media_channels,
+        explicit_media_channel_names=[
+            "ch_1",
+            "ch_2",
+            "ch_3",
+            "ch_4",
+            "ch_5",
+            "ch_5",
+        ],
+    )
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        expected_exception_message=(
+            "Channel names across `media_channel`, `rf_channel`,"
+            " `organic_media_channel`, `organic_rf_channel`, and"
+            " `non_media_channel` must be unique. Channel `ch_5` is present in"
+            " multiple channel types: ['media_channel', 'media_channel']."
+        ),
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=media,
+          media_spend=self.media_spend.assign_coords(
+              media_channel=media.coords["media_channel"]
+          ),
+          reach=self.not_lagged_reach,
+          frequency=self.not_lagged_frequency,
+          rf_spend=self.rf_spend,
+      )
+
+  def test_validate_duplicate_channel_names_across_media_and_rf(self):
+    media = test_utils.random_media_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_times,
+        n_media_channels=self.n_media_channels,
+        explicit_media_channel_names=[
+            "ch_1",
+            "ch_2",
+            "ch_3",
+            "ch_4",
+            "ch_5",
+            "ch_6",
+        ],
+    )
+    reach = test_utils.random_reach_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_times,
+        n_rf_channels=self.n_rf_channels,
+        explicit_rf_channel_names=[
+            "rf_ch_1",
+            "ch_2",
+        ],
+    )
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        expected_exception_message=(
+            "Channel names across `media_channel`, `rf_channel`,"
+            " `organic_media_channel`, `organic_rf_channel`, and"
+            " `non_media_channel` must be unique. Channel `ch_2` is present in"
+            " multiple channel types: ['media_channel', 'rf_channel']."
+        ),
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=media,
+          media_spend=self.media_spend.assign_coords(
+              media_channel=media.coords["media_channel"]
+          ),
+          reach=reach,
+          frequency=self.not_lagged_frequency.assign_coords(
+              rf_channel=reach.coords["rf_channel"]
+          ),
+          rf_spend=self.rf_spend.assign_coords(
+              rf_channel=reach.coords["rf_channel"]
+          ),
+      )
+
+  def test_scenarios_kpi_type_revenue_revenue_per_kpi_set_to_ones(self):
+    input_data_test = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.REVENUE,
+        population=self.population,
+        revenue_per_kpi=None,
+        media=self.not_lagged_media,
+        media_spend=self.media_spend,
+    )
+    n_geos = len(input_data_test.kpi.coords[constants.GEO])
+    n_times = len(input_data_test.kpi.coords[constants.TIME])
+
+    ones = np.ones((n_geos, n_times))
+    revenue_per_kpi = xr.DataArray(
+        ones,
+        dims=[constants.GEO, constants.TIME],
+        coords={
+            constants.GEO: input_data_test.geo,
+            constants.TIME: input_data_test.time,
+        },
+        name=constants.REVENUE_PER_KPI,
+    )
+    xrt.assert_equal(input_data_test.revenue_per_kpi, revenue_per_kpi)
+
+  def test_scenarios_kpi_type_revenue_incorrect_revenue_per_kpi_warning(self):
+    with self.assertWarnsRegex(
+        UserWarning,
+        expected_regex=(
+            "Revenue from the `kpi` data is used when `kpi_type`=`revenue`."
+            " `revenue_per_kpi` is ignored."
+        ),
+    ) as cm:
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.REVENUE,
+          population=self.population,
+          revenue_per_kpi=self.revenue_per_kpi,
+          media=self.not_lagged_media,
+          media_spend=self.media_spend,
+      )
+    self.assertNotIsInstance(cm.warning, input_data.DataValidationWarning)
+
+  def test_scenarios_kpi_type_non_revenue_no_revenue_per_kpi_warning(self):
+    with self.assertWarnsRegex(
+        UserWarning,
+        expected_regex=(
+            "Consider setting custom priors, as kpi_type was specified as"
+            " `non_revenue` with no `revenue_per_kpi` being set. Otherwise, the"
+            " total media contribution prior will be used with `p_mean=0.4` and"
+            " `p_sd=0.2`. Further documentation available at"
+            " https://developers.google.com/meridian/docs/advanced-modeling/unknown-revenue-kpi-custom#set-total-paid-media-contribution-prior"
+        ),
+    ) as cm:
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.NON_REVENUE,
+          population=self.population,
+          revenue_per_kpi=None,
+          media=self.not_lagged_media,
+          media_spend=self.media_spend,
+      )
+    self.assertNotIsInstance(cm.warning, input_data.DataValidationWarning)
+
+  def test_construct_media_only_invalid_controls_time_values(self):
+    with self.assertRaisesRegex(
+        ValueError, expected_regex="Invalid time label: 'week-04'"
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls_invalid_time_values,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=self.not_lagged_media,
+          media_spend=self.media_spend,
+      )
+
+  def test_construct_media_only_invalid_controls_time_values_type(self):
+    with self.assertRaisesRegex(
+        ValueError, expected_regex="Invalid time label:"
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls_timestamp_values,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=self.not_lagged_media,
+          media_spend=self.media_spend,
+      )
+
+  def test_construct_from_random_dataarrays_media_only(self):
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.not_lagged_media,
+        media_spend=self.media_spend,
+    )
+
+    xr.testing.assert_equal(data.kpi, self.not_lagged_kpi)
+    xr.testing.assert_equal(data.revenue_per_kpi, self.revenue_per_kpi)
+    xr.testing.assert_equal(data.controls, self.not_lagged_controls)
+    xr.testing.assert_equal(data.population, self.population)
+    xr.testing.assert_equal(data.media, self.not_lagged_media)
+    xr.testing.assert_equal(data.media_spend, self.media_spend)
+    self.assertIsNone(data.reach)
+    self.assertIsNone(data.frequency)
+    self.assertIsNone(data.rf_spend)
+
+  def test_construct_from_random_dataarrays_media_only_no_controls(self):
+    data = input_data.InputData(
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.not_lagged_media,
+        media_spend=self.media_spend,
+    )
+
+    xr.testing.assert_equal(data.kpi, self.not_lagged_kpi)
+    xr.testing.assert_equal(data.revenue_per_kpi, self.revenue_per_kpi)
+    self.assertIsNone(data.controls)
+    self.assertIsNone(data.control_variable)
+    xr.testing.assert_equal(data.population, self.population)
+    xr.testing.assert_equal(data.media, self.not_lagged_media)
+    xr.testing.assert_equal(data.media_spend, self.media_spend)
+    self.assertIsNone(data.reach)
+    self.assertIsNone(data.frequency)
+    self.assertIsNone(data.rf_spend)
+
+  def test_construct_from_random_dataarrays_rf_only(self):
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        reach=self.not_lagged_reach,
+        frequency=self.not_lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+
+    xr.testing.assert_equal(data.kpi, self.not_lagged_kpi)
+    xr.testing.assert_equal(data.revenue_per_kpi, self.revenue_per_kpi)
+    xr.testing.assert_equal(data.controls, self.not_lagged_controls)
+    xr.testing.assert_equal(data.population, self.population)
+    xr.testing.assert_equal(data.reach, self.not_lagged_reach)
+    xr.testing.assert_equal(data.frequency, self.not_lagged_frequency)
+    xr.testing.assert_equal(data.rf_spend, self.rf_spend)
+    self.assertIsNone(data.media)
+    self.assertIsNone(data.media_spend)
+
+  def test_construct_from_random_dataarrays_media_and_rf(self):
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.not_lagged_media,
+        media_spend=self.media_spend,
+        reach=self.not_lagged_reach,
+        frequency=self.not_lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+
+    xr.testing.assert_equal(data.kpi, self.not_lagged_kpi)
+    xr.testing.assert_equal(data.revenue_per_kpi, self.revenue_per_kpi)
+    xr.testing.assert_equal(data.media, self.not_lagged_media)
+    xr.testing.assert_equal(data.media_spend, self.media_spend)
+    xr.testing.assert_equal(data.controls, self.not_lagged_controls)
+    xr.testing.assert_equal(data.population, self.population)
+    xr.testing.assert_equal(data.reach, self.not_lagged_reach)
+    xr.testing.assert_equal(data.frequency, self.not_lagged_frequency)
+    xr.testing.assert_equal(data.rf_spend, self.rf_spend)
+
+  def test_properties_media_only(self):
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.not_lagged_media,
+        media_spend=self.media_spend,
+    )
+
+    xr.testing.assert_equal(data.geo, self.not_lagged_kpi[constants.GEO])
+    xr.testing.assert_equal(data.time, self.not_lagged_kpi[constants.TIME])
+    self.assertEqual(
+        data.time_coordinates.all_dates_str,
+        [t for t in self.not_lagged_kpi[constants.TIME]],
+    )
+    xr.testing.assert_equal(
+        data.media_time, self.not_lagged_media[constants.MEDIA_TIME]
+    )
+    self.assertEqual(
+        data.media_time_coordinates.all_dates_str,
+        [t for t in self.not_lagged_media[constants.MEDIA_TIME]],
+    )
+    xr.testing.assert_equal(
+        data.media_channel, self.not_lagged_media[constants.MEDIA_CHANNEL]
+    )
+    xr.testing.assert_equal(
+        data.control_variable,
+        self.not_lagged_controls[constants.CONTROL_VARIABLE],
+    )
+    self.assertIsNone(data.rf_channel)
+
+  def test_properties_rf_only(self):
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        reach=self.not_lagged_reach,
+        frequency=self.not_lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+
+    xr.testing.assert_equal(data.geo, self.not_lagged_kpi[constants.GEO])
+    xr.testing.assert_equal(data.time, self.not_lagged_kpi[constants.TIME])
+    xr.testing.assert_equal(
+        data.media_time, self.not_lagged_reach[constants.MEDIA_TIME]
+    )
+    xr.testing.assert_equal(
+        data.rf_channel, self.not_lagged_reach[constants.RF_CHANNEL]
+    )
+    xr.testing.assert_equal(
+        data.control_variable,
+        self.not_lagged_controls[constants.CONTROL_VARIABLE],
+    )
+    self.assertIsNone(data.media_channel)
+
+  def test_geo_property_returns_strings(self):
+    media_spend = test_utils.random_media_spend_nd_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_channels=self.n_media_channels,
+        integer_geos=True,
+    )
+    controls = test_utils.random_controls_da(
+        media=self.not_lagged_media,
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_controls=self.n_controls,
+        integer_geos=True,
+    )
+    kpi = test_utils.random_kpi_da(
+        media=self.not_lagged_media,
+        controls=self.not_lagged_controls,
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_channels=self.n_media_channels,
+        n_controls=self.n_controls,
+        integer_geos=True,
+    )
+    revenue_per_kpi = test_utils.constant_revenue_per_kpi(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        value=2.2,
+        integer_geos=True,
+    )
+    population = test_utils.random_population(
+        n_geos=self.n_geos, integer_geos=True
+    )
+    media = test_utils.random_media_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_times,
+        n_media_channels=self.n_media_channels,
+        integer_geos=True,
+    )
+    data = input_data.InputData(
+        controls=controls,
+        kpi=kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=revenue_per_kpi,
+        population=population,
+        media=media,
+        media_spend=media_spend,
+    )
+    self.assertTrue(all(isinstance(g, str) for g in data.geo.values))
+    self.assertEqual(
+        data.geo.values.tolist(),
+        ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
+    )
+    self.assertIn("1", data.population.coords[constants.GEO].values)
+
+  def test_properties_media_and_rf(self):
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.not_lagged_media,
+        media_spend=self.media_spend,
+        reach=self.not_lagged_reach,
+        frequency=self.not_lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+
+    xr.testing.assert_equal(data.geo, self.not_lagged_kpi[constants.GEO])
+    xr.testing.assert_equal(data.time, self.not_lagged_kpi[constants.TIME])
+    xr.testing.assert_equal(
+        data.media_time, self.not_lagged_media[constants.MEDIA_TIME]
+    )
+    xr.testing.assert_equal(
+        data.media_channel, self.not_lagged_media[constants.MEDIA_CHANNEL]
+    )
+    xr.testing.assert_equal(
+        data.rf_channel, self.not_lagged_reach[constants.RF_CHANNEL]
+    )
+    xr.testing.assert_equal(
+        data.control_variable,
+        self.not_lagged_controls[constants.CONTROL_VARIABLE],
+    )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="geo_time_channel", n_geos=10, n_times=100),
+      dict(testcase_name="channel", n_geos=None, n_times=None),
+  )
+  def test_spend_properties(self, n_geos: int | None, n_times: int | None):
+    media_spend = test_utils.random_media_spend_nd_da(
+        n_geos=n_geos, n_times=n_times, n_media_channels=self.n_media_channels
+    )
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.not_lagged_media,
+        media_spend=media_spend,
+    )
+    self.assertEqual(n_geos is not None, data.media_spend_has_geo_dimension)
+    self.assertEqual(n_times is not None, data.media_spend_has_time_dimension)
+    self.assertFalse(data.rf_spend_has_geo_dimension)
+    self.assertFalse(data.rf_spend_has_time_dimension)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="geo_time_channel", n_geos=10, n_times=100),
+      dict(testcase_name="channel", n_geos=None, n_times=None),
+  )
+  def test_rf_spend_properties(self, n_geos: int | None, n_times: int | None):
+    rf_spend = test_utils.random_rf_spend_nd_da(
+        n_geos=n_geos, n_times=n_times, n_rf_channels=self.n_rf_channels
+    )
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        reach=self.not_lagged_reach,
+        frequency=self.not_lagged_frequency,
+        rf_spend=rf_spend,
+    )
+    self.assertEqual(n_geos is not None, data.rf_spend_has_geo_dimension)
+    self.assertEqual(n_times is not None, data.rf_spend_has_time_dimension)
+    self.assertFalse(data.media_spend_has_geo_dimension)
+    self.assertFalse(data.media_spend_has_time_dimension)
+
+  def test_construct_from_random_dataarrays_lagged(self):
+    data = input_data.InputData(
+        controls=self.lagged_controls,
+        kpi=self.lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        reach=self.lagged_reach,
+        frequency=self.lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+
+    xr.testing.assert_equal(data.kpi, self.lagged_kpi)
+    xr.testing.assert_equal(data.revenue_per_kpi, self.revenue_per_kpi)
+    xr.testing.assert_equal(data.media, self.lagged_media)
+    xr.testing.assert_equal(data.media_spend, self.media_spend)
+    xr.testing.assert_equal(data.controls, self.lagged_controls)
+    xr.testing.assert_equal(data.population, self.population)
+    xr.testing.assert_equal(data.reach, self.lagged_reach)
+    xr.testing.assert_equal(data.frequency, self.lagged_frequency)
+    xr.testing.assert_equal(data.rf_spend, self.rf_spend)
+
+  def test_construct_from_random_dataarrays_media_spend_1d(self):
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.not_lagged_media,
+        media_spend=self.media_spend_1d,
+    )
+    xr.testing.assert_equal(data.kpi, self.not_lagged_kpi)
+    xr.testing.assert_equal(data.revenue_per_kpi, self.revenue_per_kpi)
+    xr.testing.assert_equal(data.media, self.not_lagged_media)
+    xr.testing.assert_equal(data.media_spend, self.media_spend_1d)
+    xr.testing.assert_equal(data.controls, self.not_lagged_controls)
+    xr.testing.assert_equal(data.population, self.population)
+
+  def test_as_dataset_media_and_rf(self):
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.not_lagged_media,
+        media_spend=self.media_spend,
+        reach=self.not_lagged_reach,
+        frequency=self.not_lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+
+    dataset = data.as_dataset()
+
+    xr.testing.assert_equal(dataset[constants.KPI], self.not_lagged_kpi)
+    xr.testing.assert_equal(
+        dataset[constants.REVENUE_PER_KPI], self.revenue_per_kpi
+    )
+    xr.testing.assert_equal(dataset[constants.MEDIA], self.not_lagged_media)
+    xr.testing.assert_equal(dataset[constants.MEDIA_SPEND], self.media_spend)
+    xr.testing.assert_equal(
+        dataset[constants.CONTROLS], self.not_lagged_controls
+    )
+    xr.testing.assert_equal(dataset[constants.POPULATION], self.population)
+    xr.testing.assert_equal(dataset[constants.REACH], self.not_lagged_reach)
+    xr.testing.assert_equal(
+        dataset[constants.FREQUENCY], self.not_lagged_frequency
+    )
+    xr.testing.assert_equal(dataset[constants.RF_SPEND], self.rf_spend)
+
+  def test_as_dataset_media_only(self):
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.not_lagged_media,
+        media_spend=self.media_spend,
+    )
+
+    dataset = data.as_dataset()
+
+    xr.testing.assert_equal(dataset[constants.KPI], self.not_lagged_kpi)
+    xr.testing.assert_equal(
+        dataset[constants.REVENUE_PER_KPI], self.revenue_per_kpi
+    )
+    xr.testing.assert_equal(
+        dataset[constants.CONTROLS], self.not_lagged_controls
+    )
+    xr.testing.assert_equal(dataset[constants.POPULATION], self.population)
+    xr.testing.assert_equal(dataset[constants.MEDIA], self.not_lagged_media)
+    xr.testing.assert_equal(dataset[constants.MEDIA_SPEND], self.media_spend)
+    self.assertNotIn(constants.REACH, dataset)
+    self.assertNotIn(constants.FREQUENCY, dataset)
+    self.assertNotIn(constants.RF_SPEND, dataset)
+
+  def test_as_dataset_rf_only(self):
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        reach=self.not_lagged_reach,
+        frequency=self.not_lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+
+    dataset = data.as_dataset()
+
+    xr.testing.assert_equal(dataset[constants.KPI], self.not_lagged_kpi)
+    xr.testing.assert_equal(
+        dataset[constants.REVENUE_PER_KPI], self.revenue_per_kpi
+    )
+    xr.testing.assert_equal(
+        dataset[constants.CONTROLS], self.not_lagged_controls
+    )
+    xr.testing.assert_equal(dataset[constants.POPULATION], self.population)
+    xr.testing.assert_equal(dataset[constants.REACH], self.not_lagged_reach)
+    xr.testing.assert_equal(
+        dataset[constants.FREQUENCY], self.not_lagged_frequency
+    )
+    xr.testing.assert_equal(dataset[constants.RF_SPEND], self.rf_spend)
+    self.assertNotIn(constants.MEDIA, dataset)
+    self.assertNotIn(constants.MEDIA_SPEND, dataset)
+
+  def test_wrong_coordinate_name(self):
+    media2 = self.not_lagged_media.rename({constants.GEO: "group"})
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        (
+            "The dimension list of array 'media' doesn't match any of the"
+            " following dimension lists: [['geo', 'media_time',"
+            " 'media_channel']]."
+        ),
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=media2,
+          media_spend=self.media_spend,
+      )
+
+  def test_not_matching_dimensions(self):
+    media_spend2 = test_utils.random_media_spend_nd_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_channels=self.n_media_channels - 1,
+    )
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "'media_channel' dimensions [6, 5] of arrays ['media', 'media_spend']"
+        " don't match.",
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=self.not_lagged_media,
+          media_spend=media_spend2,
+      )
+
+  def test_validate_different_geo_coords(self):
+    kpi = self.not_lagged_kpi.copy()
+    population = self.population.copy()
+    population.coords[constants.GEO] = [
+        "geo10",
+        "geo11",
+        "geo12",
+        "geo13",
+        "geo14",
+        "geo15",
+        "geo16",
+        "geo17",
+        "geo18",
+        "geo19",
+    ]
+
+    with self.assertRaisesRegex(
+        ValueError,
+        expected_regex="`geo` coordinates of array `population` don't match.",
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=population,
+          media=self.not_lagged_media,
+          media_spend=self.media_spend,
+      )
+
+  def test_not_matching_dimensions_media_spend_1d(self):
+    media_spend_1d_2 = test_utils.random_media_spend_nd_da(
+        n_media_channels=self.n_media_channels - 1
+    )
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "'media_channel' dimensions [6, 5] of arrays ['media', 'media_spend']"
+        " don't match.",
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=self.not_lagged_media,
+          media_spend=media_spend_1d_2,
+      )
+
+  def test_media_spend_2d_fails(self):
+    media_spend_2d = test_utils.random_media_spend_nd_da(
+        n_geos=self.n_geos, n_media_channels=self.n_media_channels
+    )
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        (
+            "The dimension list of array 'media_spend' doesn't match any of the"
+            " following dimension lists: [['media_channel'], ['geo', 'time',"
+            " 'media_channel']]."
+        ),
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=self.not_lagged_media,
+          media_spend=media_spend_2d,
+      )
+
+  def test_media_shorter_than_kpi_fails(self):
+    media_short = self.not_lagged_media[
+        :, (self.n_times - self.n_times + 1) :, :
+    ]
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        (
+            "The 'media_time' dimension of the 'media' array (148) cannot be"
+            " smaller than the 'time' dimension of the 'kpi' array (149)"
+        ),
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=media_short,
+          media_spend=self.media_spend,
+      )
+
+  def test_time_interval_irregular(self):
+    kpi = self.not_lagged_kpi.copy()
+    # In the `kpi` data array copy, tweak one of the `time` coordinate value so
+    # that it is not regularly spaced with other coordinate values.
+    old_time_coords = kpi[constants.TIME].values
+    new_time_coords = old_time_coords.copy()
+    new_time_coords[-2] = (
+        datetime.datetime.strptime(old_time_coords[-2], constants.DATE_FORMAT)
+        + datetime.timedelta(days=2)
+    ).strftime(constants.DATE_FORMAT)
+    kpi = kpi.assign_coords({constants.TIME: new_time_coords})
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "Time coordinates must be regularly spaced.",
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=self.not_lagged_media,
+          media_spend=self.media_spend,
+      )
+
+  def test_media_time_interval_irregular(self):
+    media = self.not_lagged_media.copy()
+    # In the `media` data array copy, tweak one of the `media_time` coordinate
+    # value so that it is not regularly spaced with other coordinate values.
+    old_media_time_coords = media[constants.MEDIA_TIME].values
+    new_media_time_coords = old_media_time_coords.copy()
+    new_media_time_coords[2] = (
+        datetime.datetime.strptime(
+            old_media_time_coords[2], constants.DATE_FORMAT
+        )
+        + datetime.timedelta(days=2)
+    ).strftime(constants.DATE_FORMAT)
+    media = media.assign_coords({constants.MEDIA_TIME: new_media_time_coords})
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "Media time coordinates must be regularly spaced.",
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=media,
+          media_spend=self.media_spend,
+      )
+
+  def test_reach_shorter_than_kpi_fails(self):
+    reach_short = self.not_lagged_reach[
+        :, (self.n_times - self.n_times + 1) :, :
+    ]
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        (
+            "The 'media_time' dimension of the 'reach' array (148) cannot be"
+            " smaller than the 'time' dimension of the 'kpi' array (149)"
+        ),
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=self.not_lagged_media,
+          media_spend=self.media_spend,
+          reach=reach_short,
+          frequency=self.not_lagged_frequency,
+          rf_spend=self.rf_spend,
+      )
+
+  def test_frequency_shorter_than_kpi_fails(self):
+    frequency_short = self.not_lagged_frequency[
+        :, (self.n_times - self.n_times + 1) :, :
+    ]
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        (
+            "The 'media_time' dimension of the 'frequency' array (148) cannot"
+            " be smaller than the 'time' dimension of the 'kpi' array"
+            " (149)"
+        ),
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=self.not_lagged_media,
+          media_spend=self.media_spend,
+          reach=self.not_lagged_reach,
+          frequency=frequency_short,
+      )
+
+  def test_get_n_top_largest_geos(self):
+    population = xr.DataArray(
+        data=[100, 5, 50, 10, 75, 25, 80, 30, 20, 95],
+        coords={constants.GEO: test_utils.sample_geos(10)},
+        name=constants.POPULATION,
+    )
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=population,
+        media=self.not_lagged_media,
+        media_spend=self.media_spend,
+    )
+
+    top_geos = data.get_n_top_largest_geos(3)
+    self.assertEqual(top_geos, ["geo_0", "geo_9", "geo_6"])
+
+    top_geos = data.get_n_top_largest_geos(5)
+    self.assertEqual(top_geos, ["geo_0", "geo_9", "geo_6", "geo_4", "geo_2"])
+
+  def test_get_all_channels_media_only(self):
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.not_lagged_media,
+        media_spend=self.media_spend,
+    )
+    channels = data.get_all_channels()
+    self.assertTrue(
+        (channels == self.not_lagged_media[constants.MEDIA_CHANNEL]).all()
+    )
+
+  def test_get_all_channels_rf_only(self):
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        reach=self.not_lagged_reach,
+        frequency=self.not_lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+    channels = data.get_all_channels()
+    self.assertTrue(
+        (channels == self.not_lagged_reach[constants.RF_CHANNEL]).all()
+    )
+
+  def test_get_all_paid_channels(self):
+    data = input_data.InputData(
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        controls=self.lagged_controls,
+        kpi=self.lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        reach=self.lagged_reach,
+        frequency=self.lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+    channels = data.get_all_paid_channels()
+    expected_paid_channels = [
+        m.item() for m in self.lagged_media[constants.MEDIA_CHANNEL]
+    ] + [rf.item() for rf in self.lagged_reach[constants.RF_CHANNEL]]
+    self.assertSequenceEqual(
+        channels.tolist(),
+        expected_paid_channels,
+    )
+
+  def test_get_all_adstock_hill_channels(self):
+    data = input_data.InputData(
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        controls=self.lagged_controls,
+        kpi=self.lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        reach=self.lagged_reach,
+        frequency=self.lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+    channels = data.get_all_adstock_hill_channels()
+    expected_adstock_hill_channels = [
+        m.item() for m in self.lagged_media[constants.MEDIA_CHANNEL]
+    ] + [rf.item() for rf in self.lagged_reach[constants.RF_CHANNEL]]
+    self.assertSequenceEqual(
+        channels.tolist(),
+        expected_adstock_hill_channels,
+    )
+
+  def test_get_paid_channels_argument_builder(self):
+    data = input_data.InputData(
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        controls=self.lagged_controls,
+        kpi=self.lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        reach=self.lagged_reach,
+        frequency=self.lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+
+    paid_channels_arg_builder = data.get_paid_channels_argument_builder()
+    expected_paid_channels = [
+        m.item() for m in self.lagged_media[constants.MEDIA_CHANNEL]
+    ] + [rf.item() for rf in self.lagged_reach[constants.RF_CHANNEL]]
+
+    self.assertSequenceEqual(
+        paid_channels_arg_builder._ordered_coords,
+        expected_paid_channels,
+    )
+
+  def test_get_paid_media_channels_argument_builder(self):
+    data = input_data.InputData(
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        controls=self.lagged_controls,
+        kpi=self.lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        reach=self.lagged_reach,
+        frequency=self.lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+
+    paid_media_channels_arg_builder = (
+        data.get_paid_media_channels_argument_builder()
+    )
+
+    expected_paid_media_channels = [
+        m.item() for m in self.lagged_media[constants.MEDIA_CHANNEL]
+    ]
+    self.assertSequenceEqual(
+        paid_media_channels_arg_builder._ordered_coords,
+        expected_paid_media_channels,
+    )
+
+  def test_get_paid_media_channels_argument_builder_no_media_channels(self):
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        reach=self.not_lagged_reach,
+        frequency=self.not_lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "There are no media channels in the input data.",
+    ):
+      data.get_paid_media_channels_argument_builder()
+
+  def test_get_paid_rf_channels_argument_builder(self):
+    data = input_data.InputData(
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        controls=self.lagged_controls,
+        kpi=self.lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        reach=self.lagged_reach,
+        frequency=self.lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+
+    paid_rf_channels_arg_builder = data.get_paid_rf_channels_argument_builder()
+
+    expected_paid_rf_channels = [
+        rf.item() for rf in self.lagged_reach[constants.RF_CHANNEL]
+    ]
+    self.assertSequenceEqual(
+        paid_rf_channels_arg_builder._ordered_coords,
+        expected_paid_rf_channels,
+    )
+
+  def test_get_paid_rf_channels_argument_builder_no_rf_channels(self):
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.not_lagged_media,
+        media_spend=self.media_spend,
+    )
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "There are no RF channels in the input data.",
+    ):
+      data.get_paid_rf_channels_argument_builder()
+
+  def test_get_all_channels_media_and_rf(self):
+    data = input_data.InputData(
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        controls=self.lagged_controls,
+        kpi=self.lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        reach=self.lagged_reach,
+        frequency=self.lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+    channels = data.get_all_channels()
+    self.assertLen(
+        channels,
+        self.n_media_channels + self.n_rf_channels,
+    )
+    self.assertTrue(
+        channel in channels
+        for channel in self.lagged_media[constants.MEDIA_CHANNEL]
+    )
+    self.assertTrue(
+        channel in channels
+        for channel in self.lagged_reach[constants.RF_CHANNEL]
+    )
+
+  def test_get_all_media_and_rf(self):
+    data = input_data.InputData(
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        controls=self.lagged_controls,
+        kpi=self.lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        reach=self.lagged_reach,
+        frequency=self.lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+    all_media_and_rf = data.get_all_media_and_rf()
+    self.assertEqual(
+        all_media_and_rf.shape,
+        (
+            self.n_geos,
+            self.n_lagged_media_times,
+            self.n_media_channels + self.n_rf_channels,
+        ),
+    )
+
+    media_from_rf = self.lagged_reach * self.lagged_frequency
+    self.assertTrue(media in all_media_and_rf for media in media_from_rf)
+    self.assertTrue(media in all_media_and_rf for media in self.lagged_media)
+
+  def test_get_all_spend(self):
+    data = input_data.InputData(
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        controls=self.lagged_controls,
+        kpi=self.lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        reach=self.lagged_reach,
+        frequency=self.lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+    total_spend = data.get_total_spend()
+    self.assertEqual(
+        total_spend.shape,
+        (
+            self.n_geos,
+            self.n_times,
+            self.n_media_channels + self.n_rf_channels,
+        ),
+    )
+    self.assertTrue(spend in total_spend for spend in self.rf_spend)
+    self.assertTrue(spend in total_spend for spend in self.media_spend)
+
+  def test_allocate_media_spend_basic(self):
+    """Tests basic allocation, dimensions, and total spend conservation."""
+    data = input_data.InputData(
+        controls=self.lagged_controls,
+        kpi=self.lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.lagged_media,
+        media_spend=xr.DataArray(
+            [1000, 2000, 3000, 4000, 5000, 6000],
+            coords=[self.lagged_media[constants.MEDIA_CHANNEL].media_channel],
+            dims=[constants.MEDIA_CHANNEL],
+            name=constants.MEDIA_SPEND,
+        ),
+    )
+    allocated_spend = data.allocated_media_spend
+
+    # 1. Verify dimensions
+    self.assertEqual(
+        allocated_spend.dims,  # pyrefly: ignore[missing-attribute]
+        (constants.GEO, constants.TIME, constants.MEDIA_CHANNEL),
+    )
+    self.assertLen(allocated_spend[constants.GEO], self.n_geos)  # pyrefly: ignore[unsupported-operation]
+    self.assertLen(allocated_spend[constants.TIME], self.n_times)  # pyrefly: ignore[unsupported-operation]
+    self.assertLen(
+        allocated_spend[constants.MEDIA_CHANNEL], self.n_media_channels  # pyrefly: ignore[unsupported-operation]
+    )
+    # Verify time coordinates match kpi time, not media_time
+    np.testing.assert_array_equal(
+        allocated_spend[constants.TIME].values, self.lagged_kpi.time  # pyrefly: ignore[unsupported-operation]
+    )
+
+    # 2. Verify total spend conservation per channel
+    total_allocated = allocated_spend.sum(dim=[constants.GEO, constants.TIME])  # pyrefly: ignore[missing-attribute]
+    xr.testing.assert_allclose(total_allocated, data.media_spend)
+
+  def test_allocate_rf_spend_all_zero_media(self):
+    """Tests allocation when all media units across all channels are zero."""
+    reach_zeros = xr.DataArray(
+        np.zeros((self.n_geos, self.n_lagged_media_times, self.n_rf_channels)),
+        coords=[
+            self.lagged_reach[constants.GEO].geo,
+            self.lagged_reach[constants.MEDIA_TIME].media_time,
+            self.lagged_reach[constants.RF_CHANNEL].rf_channel,
+        ],
+        dims=[constants.GEO, constants.MEDIA_TIME, constants.RF_CHANNEL],
+        name=constants.REACH,
+    )
+    data = input_data.InputData(
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        controls=self.lagged_controls,
+        kpi=self.lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        reach=reach_zeros,
+        frequency=self.lagged_frequency,
+        rf_spend=xr.DataArray(
+            [1000, 2000],
+            coords=[self.lagged_reach[constants.RF_CHANNEL].rf_channel],
+            dims=[constants.RF_CHANNEL],
+            name=constants.RF_SPEND,
+        ),
+    )
+
+    allocated_spend = data.allocated_rf_spend
+
+    # Verify dimensions are still correct
+    self.assertEqual(
+        allocated_spend.dims,  # pyrefly: ignore[missing-attribute]
+        (constants.GEO, constants.TIME, constants.RF_CHANNEL),
+    )
+
+    # All channels had zero total units, expect all NaN allocation
+    self.assertTrue(np.isnan(allocated_spend).all())  # pyrefly: ignore[no-matching-overload]
+
+  def test_get_aggregated_media_spend_no_cal(self):
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        population=self.population,
+        media=self.not_lagged_media,  # media_spend's time dim matches kpi time
+        media_spend=self.media_spend,  # self.media_spend has n_times
+    )
+    result = data.aggregate_media_spend(calibration_period=None)
+    expected_sum = self.media_spend.values.sum(axis=(0, 1))
+    np.testing.assert_array_almost_equal(result, expected_sum)  # pyrefly: ignore[bad-argument-type]
+
+  def test_get_aggregated_media_spend_with_cal_mixed(self):
+    n_spend_times = self.media_spend.shape[1]
+    n_channels = self.media_spend.shape[2]
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        population=self.population,
+        media=self.not_lagged_media,
+        media_spend=self.media_spend,
+    )
+    # Create a mixed calibration period
+    calibration_period = np.random.choice(
+        [True, False], size=(n_spend_times, n_channels)
+    )
+    result = data.aggregate_media_spend(calibration_period=calibration_period)
+
+    factors = np.where(calibration_period.astype(bool), 1.0, 0.0)
+    expected_sum = np.einsum("gtm,tm->m", self.media_spend.values, factors)
+    np.testing.assert_array_almost_equal(result, expected_sum)  # pyrefly: ignore[bad-argument-type]
+
+  def test_get_aggregated_rf_spend_no_cal(self):
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        population=self.population,
+        reach=self.not_lagged_reach,  # rf_spend's time dim matches kpi time
+        frequency=self.not_lagged_frequency,
+        rf_spend=self.rf_spend,  # self.rf_spend has n_times
+    )
+    result = data.aggregate_rf_spend(calibration_period=None)
+    expected_sum = self.rf_spend.values.sum(axis=(0, 1))
+    np.testing.assert_array_almost_equal(result, expected_sum)  # pyrefly: ignore[bad-argument-type]
+
+  def test_get_aggregated_rf_spend_with_cal_mixed(self):
+    n_spend_times = self.rf_spend.shape[1]
+    n_channels = self.rf_spend.shape[2]
+    data = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=self.not_lagged_kpi,
+        kpi_type=constants.NON_REVENUE,
+        population=self.population,
+        reach=self.not_lagged_reach,
+        frequency=self.not_lagged_frequency,
+        rf_spend=self.rf_spend,
+    )
+    calibration_period = np.random.choice(
+        [True, False], size=(n_spend_times, n_channels)
+    )
+    result = data.aggregate_rf_spend(calibration_period=calibration_period)
+    factors = np.where(calibration_period.astype(bool), 1.0, 0.0)
+    expected_sum = np.einsum("gtm,tm->m", self.rf_spend.values, factors)
+    np.testing.assert_array_almost_equal(result, expected_sum)  # pyrefly: ignore[bad-argument-type]
+
+  def test_scaled_centered_kpi(self):
+    tensor = test_utils.sample_input_data_from_dataset(
+        test_utils.random_dataset(
+            n_geos=1,
+            n_times=20,
+            n_media_times=20,
+            n_controls=2,
+            n_media_channels=5,
+        ),
+        "non_revenue",
+    ).scaled_centered_kpi
+    self.assertLen(tensor, 1)
+    np.testing.assert_allclose(
+        tensor[0].tolist(),
+        [
+            2.2627279108728477,
+            0.23631363080491555,
+            1.2752080884690158,
+            -0.5568927832723847,
+            1.0900254672561442,
+            1.1659889773033834,
+            -1.2555846027456177,
+            -0.4878882033108945,
+            -0.710828578320152,
+            -0.9461028701343918,
+            -1.1358022006132944,
+            -0.916229997265268,
+            -0.8039075798379829,
+            -0.4954278956685814,
+            -0.388120367674675,
+            -1.2567157354290128,
+            0.6854030057326468,
+            0.41937018236711265,
+            0.7154972479952508,
+            1.1029663034709385,
+        ],
+    )
+
+  def test_scaled_centered_kpi_supports_dtype_int(self):
+    data = test_utils.sample_input_data_revenue(n_media_channels=5)
+    data.kpi = data.kpi.astype(int)
+    data.population = data.population.astype(int)
+    self.assertNotEmpty(data.scaled_centered_kpi)
+
+  def test_construct_with_na_raises_error(self):
+    kpi_with_na = self.not_lagged_kpi.copy()
+    kpi_with_na.values[0, 0] = np.nan
+    with self.assertRaisesRegex(
+        ValueError,
+        expected_regex="NA values found in the kpi data.",
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=kpi_with_na,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=self.not_lagged_media,
+          media_spend=self.media_spend,
+      )
+
+  def test_construct_with_coercible_object_dtype_succeeds(self):
+    kpi_object = self.not_lagged_kpi.copy().astype(object)
+    self.assertEqual(kpi_object.dtype, np.dtype("O"))
+
+    input_data_obj = input_data.InputData(
+        controls=self.not_lagged_controls,
+        kpi=kpi_object,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.not_lagged_media,
+        media_spend=self.media_spend,
+    )
+    self.assertEqual(input_data_obj.kpi.dtype, backend.np_float_dtype)
+
+  def test_construct_with_non_coercible_object_dtype_raises_error(self):
+    kpi_object = self.not_lagged_kpi.copy().astype(object)
+    kpi_object.values[0, 0] = "not_a_number"
+
+    with self.assertRaisesRegex(
+        ValueError,
+        expected_regex="Failed to convert array 'kpi' from object to float.",
+    ):
+      input_data.InputData(
+          controls=self.not_lagged_controls,
+          kpi=kpi_object,
+          kpi_type=constants.NON_REVENUE,
+          revenue_per_kpi=self.revenue_per_kpi,
+          population=self.population,
+          media=self.not_lagged_media,
+          media_spend=self.media_spend,
+      )
+
+  def test_channel_coordinates_order_mismatch(self):
+    media_reversed = self.not_lagged_media.assign_coords({
+        constants.MEDIA_CHANNEL: self.not_lagged_media.coords[
+            constants.MEDIA_CHANNEL
+        ].values[::-1]
+    })
+
+    with self.assertRaisesRegex(
+        ValueError,
+        "`media_channel` coordinates of array `media_spend` don't match.",
+    ):
+      input_data.InputData(
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.REVENUE,
+          population=self.population,
+          media=media_reversed,
+          media_spend=self.media_spend,
+      )
+
+    reach_reversed = self.not_lagged_reach.assign_coords({
+        constants.RF_CHANNEL: self.not_lagged_reach.coords[
+            constants.RF_CHANNEL
+        ].values[::-1]
+    })
+
+    with self.assertRaisesRegex(
+        ValueError,
+        "`rf_channel` coordinates of array `frequency` don't match.",
+    ):
+      input_data.InputData(
+          kpi=self.not_lagged_kpi,
+          kpi_type=constants.REVENUE,
+          population=self.population,
+          reach=reach_reversed,
+          frequency=self.not_lagged_frequency,
+          rf_spend=self.rf_spend,
+      )
+
+
+class NonpaidInputDataTest(parameterized.TestCase):
+  """Tests for non-paid InputData."""
+
+  def setUp(self):
+    super().setUp()
+
+    self.n_times = 149
+    self.n_lagged_media_times = 152
+    self.n_geos = 10
+    self.n_media_channels = 6
+    self.n_rf_channels = 2
+    self.n_controls = 3
+
+    self.n_non_media_channels = 2
+    self.n_organic_media_channels = 4
+    self.n_organic_rf_channels = 1
+
+    self.lagged_media = test_utils.random_media_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_lagged_media_times,
+        n_media_channels=self.n_media_channels,
+    )
+    self.media_spend = test_utils.random_media_spend_nd_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_channels=self.n_media_channels,
+    )
+    self.lagged_reach = test_utils.random_reach_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_lagged_media_times,
+        n_rf_channels=self.n_rf_channels,
+    )
+    self.lagged_frequency = test_utils.random_frequency_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_lagged_media_times,
+        n_rf_channels=self.n_rf_channels,
+    )
+    self.rf_spend = test_utils.random_rf_spend_nd_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_rf_channels=self.n_rf_channels,
+    )
+    self.controls = test_utils.random_controls_da(
+        media=self.lagged_media,
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_controls=self.n_controls,
+    )
+    self.kpi = test_utils.random_kpi_da(
+        media=self.lagged_media,
+        controls=self.controls,
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_channels=self.n_media_channels,
+        n_controls=self.n_controls,
+    )
+    self.non_media_treatments = test_utils.random_non_media_treatments_da(
+        media=self.lagged_media,
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_non_media_channels=self.n_non_media_channels,
+    )
+    self.lagged_organic_media = test_utils.random_organic_media_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_lagged_media_times,
+        n_organic_media_channels=self.n_organic_media_channels,
+    )
+    self.lagged_organic_reach = test_utils.random_organic_reach_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_lagged_media_times,
+        n_organic_rf_channels=self.n_organic_rf_channels,
+    )
+    self.lagged_organic_frequency = test_utils.random_organic_frequency_da(
+        n_geos=self.n_geos,
+        n_times=self.n_times,
+        n_media_times=self.n_lagged_media_times,
+        n_organic_rf_channels=self.n_organic_rf_channels,
+    )
+    self.revenue_per_kpi = test_utils.constant_revenue_per_kpi(
+        n_geos=self.n_geos, n_times=self.n_times, value=2.2
+    )
+    self.population = test_utils.random_population(n_geos=self.n_geos)
+
+  def test_construct_non_media_from_random_dataarrays_lagged(self):
+    data = input_data.InputData(
+        controls=self.controls,
+        kpi=self.kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        non_media_treatments=self.non_media_treatments,
+        population=self.population,
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        organic_media=self.lagged_organic_media,
+        organic_reach=self.lagged_organic_reach,
+        organic_frequency=self.lagged_organic_frequency,
+    )
+
+    xr.testing.assert_equal(data.kpi, self.kpi)
+    xr.testing.assert_equal(data.revenue_per_kpi, self.revenue_per_kpi)
+    xr.testing.assert_equal(
+        data.non_media_treatments, self.non_media_treatments
+    )
+    xr.testing.assert_equal(data.media, self.lagged_media)
+    xr.testing.assert_equal(data.media_spend, self.media_spend)
+    xr.testing.assert_equal(data.organic_media, self.lagged_organic_media)
+    xr.testing.assert_equal(data.organic_reach, self.lagged_organic_reach)
+    xr.testing.assert_equal(
+        data.organic_frequency, self.lagged_organic_frequency
+    )
+    xr.testing.assert_equal(data.controls, self.controls)
+    xr.testing.assert_equal(data.population, self.population)
+
+  def test_get_all_paid_channels(self):
+    # Expect that non-paid channels are not included.
+    data = input_data.InputData(
+        controls=self.controls,
+        kpi=self.kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        non_media_treatments=self.non_media_treatments,
+        population=self.population,
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        organic_media=self.lagged_organic_media,
+        organic_reach=self.lagged_organic_reach,
+        organic_frequency=self.lagged_organic_frequency,
+    )
+    channels = data.get_all_paid_channels()
+    expected_paid_channels = [
+        m.item() for m in self.lagged_media[constants.MEDIA_CHANNEL]
+    ]
+    self.assertSequenceEqual(
+        channels.tolist(),
+        expected_paid_channels,
+    )
+
+  def test_get_all_adstock_hill_channels(self):
+    data = input_data.InputData(
+        controls=self.controls,
+        kpi=self.kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        non_media_treatments=self.non_media_treatments,
+        population=self.population,
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        reach=self.lagged_reach,
+        frequency=self.lagged_frequency,
+        rf_spend=self.rf_spend,
+        organic_media=self.lagged_organic_media,
+        organic_reach=self.lagged_organic_reach,
+        organic_frequency=self.lagged_organic_frequency,
+    )
+
+    channels = data.get_all_adstock_hill_channels()
+
+    expected_adstock_hill_channels = [m.item() for m in itertools.chain(
+        self.lagged_media[constants.MEDIA_CHANNEL],
+        self.lagged_reach[constants.RF_CHANNEL],
+        self.lagged_organic_media[constants.ORGANIC_MEDIA_CHANNEL],
+        self.lagged_organic_reach[constants.ORGANIC_RF_CHANNEL]
+    )]
+
+    self.assertSequenceEqual(
+        channels.tolist(),
+        expected_adstock_hill_channels,
+    )
+
+  def test_get_organic_media_channels_argument_builder(self):
+    data = input_data.InputData(
+        controls=self.controls,
+        kpi=self.kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        non_media_treatments=self.non_media_treatments,
+        population=self.population,
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        organic_media=self.lagged_organic_media,
+        organic_reach=self.lagged_organic_reach,
+        organic_frequency=self.lagged_organic_frequency,
+    )
+
+    organic_media_channels_arg_builder = (
+        data.get_organic_media_channels_argument_builder()
+    )
+
+    expected_organic_media_channels = [
+        m.item()
+        for m in self.lagged_organic_media[constants.ORGANIC_MEDIA_CHANNEL]
+    ]
+
+    self.assertSequenceEqual(
+        organic_media_channels_arg_builder._ordered_coords,
+        expected_organic_media_channels,
+    )
+
+  def test_get_organic_media_channels_argument_builder_no_organic_media_channels(
+      self,
+  ):
+    data = input_data.InputData(
+        controls=self.controls,
+        kpi=self.kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        organic_reach=self.lagged_organic_reach,
+        organic_frequency=self.lagged_organic_frequency,
+    )
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "There are no organic media channels in the input data.",
+    ):
+      data.get_organic_media_channels_argument_builder()
+
+  def test_get_organic_rf_channels_argument_builder(self):
+    data = input_data.InputData(
+        controls=self.controls,
+        kpi=self.kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        non_media_treatments=self.non_media_treatments,
+        population=self.population,
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        organic_media=self.lagged_organic_media,
+        organic_reach=self.lagged_organic_reach,
+        organic_frequency=self.lagged_organic_frequency,
+    )
+
+    organic_rf_channels_arg_builder = (
+        data.get_organic_rf_channels_argument_builder()
+    )
+
+    expected_organic_rf_channels = [
+        m.item()
+        for m in self.lagged_organic_reach[constants.ORGANIC_RF_CHANNEL]
+    ]
+
+    self.assertSequenceEqual(
+        organic_rf_channels_arg_builder._ordered_coords,
+        expected_organic_rf_channels,
+    )
+
+  def test_get_organic_rf_channels_argument_builder_no_organic_rf_channels(
+      self,
+  ):
+    data = input_data.InputData(
+        controls=self.controls,
+        kpi=self.kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        organic_media=self.lagged_organic_media,
+    )
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "There are no organic RF channels in the input data.",
+    ):
+      data.get_organic_rf_channels_argument_builder()
+
+  def test_get_total_outcome_no_revenue(self):
+    """Tests get_total_outcome when revenue_per_kpi is None."""
+    data = input_data.InputData(
+        controls=self.controls,
+        kpi=self.kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=None,  # Explicitly set to None
+        non_media_treatments=self.non_media_treatments,
+        population=self.population,
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        organic_media=self.lagged_organic_media,
+        organic_reach=self.lagged_organic_reach,
+        organic_frequency=self.lagged_organic_frequency,
+    )
+    total_outcome = data.get_total_outcome()
+    expected_outcome = np.sum(self.kpi.values)
+    # Use xarray testing for potential floating point comparisons
+    self.assertAlmostEqual(total_outcome, expected_outcome)
+
+  def test_get_total_outcome_with_revenue(self):
+    """Tests get_total_outcome when revenue_per_kpi is provided."""
+    data = input_data.InputData(
+        controls=self.controls,
+        kpi=self.kpi,
+        kpi_type=constants.NON_REVENUE,  # kpi_type shouldn't affect this calc
+        revenue_per_kpi=self.revenue_per_kpi,  # Provided
+        non_media_treatments=self.non_media_treatments,
+        population=self.population,
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        organic_media=self.lagged_organic_media,
+        organic_reach=self.lagged_organic_reach,
+        organic_frequency=self.lagged_organic_frequency,
+    )
+    total_outcome = data.get_total_outcome()
+    expected_outcome = np.sum(self.kpi.values * self.revenue_per_kpi.values)
+    # Use xarray testing for potential floating point comparisons
+    # Need to convert expected_outcome to a 0-d DataArray for assert_allclose
+    expected_outcome_da = xr.DataArray(expected_outcome)
+    self.assertAlmostEqual(total_outcome, expected_outcome_da)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="deep", deep=True),
+      dict(testcase_name="shallow", deep=False),
+  )
+  def test_copy_all_fields_populated(self, deep: bool):
+    """Tests copy with an InputData instance having all fields."""
+    original = input_data.InputData(
+        controls=self.controls,
+        kpi=self.kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        non_media_treatments=self.non_media_treatments,
+        population=self.population,
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        reach=self.lagged_reach,
+        frequency=self.lagged_frequency,
+        rf_spend=self.rf_spend,
+        organic_media=self.lagged_organic_media,
+        organic_reach=self.lagged_organic_reach,
+        organic_frequency=self.lagged_organic_frequency,
+    )
+    self._verify_copy(original, deep=deep)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="deep", deep=True),
+      dict(testcase_name="shallow", deep=False),
+  )
+  def test_copy_partial_fields_populated(self, deep: bool):
+    """Tests copy with an InputData instance having partial fields."""
+    original = input_data.InputData(
+        controls=self.controls,
+        kpi=self.kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        organic_media=self.lagged_organic_media,
+    )
+    self._verify_copy(original, deep=deep)
+
+  def _verify_copy(self, original: input_data.InputData, deep: bool):
+    """Verifies that the copy is correct."""
+    copied = original.copy(deep=deep)
+
+    # Assert that the copied object is a new instance
+    self.assertIsNot(original, copied)
+
+    # Iterate through all fields of the InputData dataclass
+    for field in dataclasses.fields(original):
+      original_value = getattr(original, field.name)
+      copied_value = getattr(copied, field.name)
+
+      if isinstance(original_value, xr.DataArray):
+        if deep:
+          # In a deep copy, DataArrays should be new instances and equal in
+          # content.
+          self.assertIsNot(original_value, copied_value)
+          xrt.assert_equal(original_value, copied_value)
+        else:
+          # In a shallow copy, DataArrays should be the same instance
+          self.assertIs(original_value, copied_value)
+      else:
+        # Non-DataArray fields should always be the same instance
+        self.assertIs(original_value, copied_value)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="media_spend",
+          field=constants.MEDIA_SPEND,
+          name="Media Spend",
+          kpi_type=constants.NON_REVENUE,
+      ),
+      dict(
+          testcase_name="rf_spend",
+          field=constants.RF_SPEND,
+          name="RF Spend",
+          kpi_type=constants.NON_REVENUE,
+      ),
+      dict(
+          testcase_name="reach",
+          field=constants.REACH,
+          name="Reach",
+          kpi_type=constants.NON_REVENUE,
+      ),
+      dict(
+          testcase_name="frequency",
+          field=constants.FREQUENCY,
+          name="Frequency",
+          kpi_type=constants.NON_REVENUE,
+      ),
+      dict(
+          testcase_name="organic_reach",
+          field=constants.ORGANIC_REACH,
+          name="Organic Reach",
+          kpi_type=constants.NON_REVENUE,
+      ),
+      dict(
+          testcase_name="organic_frequency",
+          field=constants.ORGANIC_FREQUENCY,
+          name="Organic Frequency",
+          kpi_type=constants.NON_REVENUE,
+      ),
+      dict(
+          testcase_name="kpi",
+          field=constants.KPI,
+          name="KPI",
+          kpi_type=constants.NON_REVENUE,
+      ),
+      dict(
+          testcase_name="revenue_per_kpi",
+          field=constants.REVENUE_PER_KPI,
+          name="Revenue per KPI",
+          kpi_type=constants.NON_REVENUE,
+      ),
+  )
+  def test_validate_no_negative_values(
+      self, field: str, name: str, kpi_type: str
+  ):
+    maybe_flip = lambda da, key: (da * -1) if key == field else (da * 1)
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        expected_exception_message=f"{name} values must be non-negative.",
+    ):
+      input_data.InputData(
+          controls=self.controls,
+          kpi=maybe_flip(self.kpi, constants.KPI),
+          kpi_type=kpi_type,
+          revenue_per_kpi=maybe_flip(
+              self.revenue_per_kpi, constants.REVENUE_PER_KPI
+          ),
+          non_media_treatments=self.non_media_treatments,
+          population=self.population,
+          media=self.lagged_media,
+          media_spend=maybe_flip(self.media_spend, constants.MEDIA_SPEND),
+          reach=maybe_flip(self.lagged_reach, constants.REACH),
+          frequency=maybe_flip(self.lagged_frequency, constants.FREQUENCY),
+          rf_spend=maybe_flip(self.rf_spend, constants.RF_SPEND),
+          organic_media=self.lagged_organic_media,
+          organic_reach=maybe_flip(
+              self.lagged_organic_reach, constants.ORGANIC_REACH
+          ),
+          organic_frequency=maybe_flip(
+              self.lagged_organic_frequency, constants.ORGANIC_FREQUENCY
+          ),
+      )
+
+  def _input_data_with_rf(self, **overrides) -> input_data.InputData:
+    """Builds InputData with valid paid and organic R&F, plus `overrides`."""
+    kwargs = dict(
+        controls=self.controls,
+        kpi=self.kpi,
+        kpi_type=constants.NON_REVENUE,
+        revenue_per_kpi=self.revenue_per_kpi,
+        population=self.population,
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        reach=self.lagged_reach,
+        frequency=_at_least_one(self.lagged_frequency),
+        rf_spend=self.rf_spend,
+        organic_reach=self.lagged_organic_reach,
+        organic_frequency=_at_least_one(self.lagged_organic_frequency),
+    )
+    kwargs.update(overrides)
+    return input_data.InputData(**kwargs)
+
+  def _assert_no_warning_matching(self, regex: str, **overrides):
+    with warnings.catch_warnings(record=True) as caught:
+      warnings.simplefilter("always")
+      self._input_data_with_rf(**overrides)
+    self.assertEmpty(
+        [str(w.message) for w in caught if re.search(regex, str(w.message))]
+    )
+
+  def test_data_validation_warning_is_user_warning_subclass(self):
+    self.assertTrue(issubclass(input_data.DataValidationWarning, UserWarning))
+
+  def test_valid_rf_and_population_no_warning(self):
+    self._assert_no_warning_matching("below 1|Population must be positive")
+
+  @parameterized.named_parameters(
+      dict(testcase_name="fractional", frequency=0.5),
+      dict(testcase_name="zero", frequency=0.0),
+      dict(testcase_name="beyond_tolerance", frequency=0.998),
+  )
+  def test_frequency_below_one_with_positive_reach_warns(self, frequency):
+    with self.assertWarnsRegex(
+        input_data.DataValidationWarning,
+        expected_regex=(
+            r"^Frequency is below 1 where reach is positive\. Number of"
+            r" affected \(geo, time\) cells by channel: \{'rf_ch_0': 1\}\."
+        ),
+    ):
+      self._input_data_with_rf(
+          reach=_with_cell_value(self.lagged_reach, 1000.0),
+          frequency=_with_cell_value(
+              _at_least_one(self.lagged_frequency), frequency
+          ),
+      )
+
+  def test_organic_frequency_below_one_with_positive_reach_warns(self):
+    with self.assertWarnsRegex(
+        input_data.DataValidationWarning,
+        expected_regex=(
+            r"^Organic Frequency is below 1 where reach is positive\. Number of"
+            r" affected \(geo, time\) cells by channel:"
+            r" \{'organic_rf_ch_0': 1\}\."
+        ),
+    ):
+      self._input_data_with_rf(
+          organic_reach=_with_cell_value(self.lagged_organic_reach, 1000.0),
+          organic_frequency=_with_cell_value(
+              _at_least_one(self.lagged_organic_frequency), 0.5
+          ),
+      )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="zero_reach_zero_frequency", reach=0.0, frequency=0.0),
+      dict(
+          testcase_name="zero_reach_fractional_frequency",
+          reach=0.0,
+          frequency=0.5,
+      ),
+      dict(
+          testcase_name="within_tolerance", reach=1000.0, frequency=0.9995
+      ),
+  )
+  def test_frequency_below_one_not_flagged(self, reach, frequency):
+    self._assert_no_warning_matching(
+        "below 1",
+        reach=_with_cell_value(self.lagged_reach, reach),
+        frequency=_with_cell_value(
+            _at_least_one(self.lagged_frequency), frequency
+        ),
+    )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="zero", population=0.0),
+      dict(testcase_name="negative", population=-100.0),
+  )
+  def test_non_positive_population_warns(self, population):
+    pop = self.population.astype(float)
+    pop[1] = population
+    geo = str(pop.coords[constants.GEO].values[1])
+    with self.assertWarnsRegex(
+        input_data.DataValidationWarning,
+        expected_regex=(
+            r"^Population must be positive, but these geos have a population"
+            rf" of 0 or below: \['{geo}'\]\."
+        ),
+    ):
+      self._input_data_with_rf(population=pop)
+
+  def test_small_positive_population_no_warning(self):
+    pop = self.population.astype(float)
+    pop[1] = 1e-6
+    self._assert_no_warning_matching(
+        "Population must be positive", population=pop
+    )
+
+  def test_currency_code_default_is_none(self):
+    data = input_data.InputData(
+        kpi=self.kpi,
+        kpi_type=constants.NON_REVENUE,
+        population=self.population,
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+    )
+    self.assertIsNone(data.currency_code)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="usd", currency_code="USD"),
+      dict(testcase_name="eur", currency_code="EUR"),
+      dict(testcase_name="jpy", currency_code="JPY"),
+  )
+  def test_currency_code_valid(self, currency_code: str):
+    data = input_data.InputData(
+        kpi=self.kpi,
+        kpi_type=constants.NON_REVENUE,
+        population=self.population,
+        media=self.lagged_media,
+        media_spend=self.media_spend,
+        currency_code=currency_code,
+    )
+    self.assertEqual(data.currency_code, currency_code)
+
+  def test_currency_code_invalid_type_raises_type_error(self):
+    with self.assertRaises(TypeError):
+      input_data.InputData(
+          kpi=self.kpi,
+          kpi_type=constants.NON_REVENUE,
+          population=self.population,
+          media=self.lagged_media,
+          media_spend=self.media_spend,
+          currency_code=123,  # pyrefly: ignore[bad-argument-type]
+      )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="too_short", currency_code="US"),
+      dict(testcase_name="too_long", currency_code="USDT"),
+      dict(testcase_name="unrecognized", currency_code="FOO"),
+  )
+  def test_currency_code_unrecognized_emits_warning(self, currency_code: str):
+    with self.assertWarns(UserWarning) as cm:
+      input_data.InputData(
+          kpi=self.kpi,
+          kpi_type=constants.NON_REVENUE,
+          population=self.population,
+          media=self.lagged_media,
+          media_spend=self.media_spend,
+          currency_code=currency_code,
+      )
+    self.assertNotIsInstance(cm.warning, input_data.DataValidationWarning)
+
+
+if __name__ == "__main__":
+  absltest.main()

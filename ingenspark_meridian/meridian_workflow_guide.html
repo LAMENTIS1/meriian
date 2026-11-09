@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Google Meridian MMM - Complete End-to-End Workflow Guide</title>
+  <style>
+    :root {
+      --primary: #1a73e8;
+      --primary-dark: #1557b0;
+      --secondary: #4285f4;
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --text: #f1f5f9;
+      --text-muted: #94a3b8;
+      --accent: #34a853;
+      --warning: #fbbc04;
+      --danger: #ea4335;
+      --border: #334155;
+      --code-bg: #0b1120;
+    }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      padding: 24px;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    header {
+      background: linear-gradient(135deg, #1e3a8a 0%, #172554 100%);
+      padding: 36px 32px;
+      border-radius: 14px;
+      margin-bottom: 32px;
+      border: 1px solid #2563eb44;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.4);
+    }
+    header h1 {
+      font-size: 2.2rem;
+      margin-bottom: 8px;
+      color: #ffffff;
+    }
+    header p {
+      color: #93c5fd;
+      font-size: 1.1rem;
+    }
+    .badge {
+      display: inline-block;
+      background: rgba(66, 133, 244, 0.2);
+      color: #93c5fd;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      border: 1px solid rgba(66, 133, 244, 0.4);
+      margin-top: 10px;
+    }
+    .workflow-nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 32px;
+      position: sticky;
+      top: 10px;
+      z-index: 100;
+      background: rgba(15, 23, 42, 0.95);
+      padding: 12px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      backdrop-filter: blur(8px);
+    }
+    .workflow-nav a {
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 0.85rem;
+      padding: 6px 12px;
+      border-radius: 8px;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      transition: all 0.2s ease;
+    }
+    .workflow-nav a:hover {
+      background: var(--primary);
+      color: #ffffff;
+      border-color: var(--primary);
+    }
+    .step-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 28px;
+      margin-bottom: 24px;
+      transition: transform 0.2s ease, border-color 0.2s ease;
+    }
+    .step-card:hover {
+      border-color: var(--primary);
+      transform: translateY(-2px);
+    }
+    .step-header {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 14px;
+    }
+    .step-num {
+      background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+      color: white;
+      font-weight: 700;
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1rem;
+      flex-shrink: 0;
+    }
+    .step-title {
+      font-size: 1.35rem;
+      color: #ffffff;
+      font-weight: 600;
+    }
+    .purpose-box {
+      background: rgba(30, 58, 138, 0.25);
+      border-left: 4px solid var(--secondary);
+      padding: 12px 16px;
+      border-radius: 0 8px 8px 0;
+      margin-bottom: 18px;
+    }
+    .purpose-box strong {
+      color: #60a5fa;
+    }
+    .features-list {
+      list-style-type: none;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-bottom: 18px;
+    }
+    .features-list li {
+      position: relative;
+      padding-left: 24px;
+      color: #cbd5e1;
+    }
+    .features-list li::before {
+      content: "▹";
+      position: absolute;
+      left: 0;
+      color: var(--primary);
+      font-size: 1.1rem;
+    }
+    .classes-tag-container {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .code-tag {
+      background: var(--code-bg);
+      color: #38bdf8;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.82rem;
+      padding: 3px 8px;
+      border-radius: 6px;
+      border: 1px solid #1e293b;
+    }
+    .flow-diagram {
+      background: #0b1120;
+      border: 1px dashed var(--border);
+      border-radius: 10px;
+      padding: 20px;
+      margin: 24px 0 32px 0;
+      text-align: center;
+      color: #94a3b8;
+    }
+    .flow-steps {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .flow-pill {
+      background: #1e293b;
+      padding: 8px 16px;
+      border-radius: 20px;
+      border: 1px solid #3b82f6;
+      color: #93c5fd;
+      font-weight: 600;
+      font-size: 0.85rem;
+    }
+    .flow-arrow {
+      color: #64748b;
+      font-weight: bold;
+      font-size: 1.2rem;
+    }
+    .alert-box {
+      background: rgba(234, 67, 53, 0.1);
+      border: 1px solid rgba(234, 67, 53, 0.3);
+      padding: 16px;
+      border-radius: 8px;
+      margin-top: 24px;
+    }
+    .alert-box h4 {
+      color: #f87171;
+      margin-bottom: 6px;
+    }
+    footer {
+      text-align: center;
+      padding: 30px;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      border-top: 1px solid var(--border);
+      margin-top: 40px;
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <header>
+    <h1>Google Meridian MMM - Complete Workflow Blueprint</h1>
+    <p>A structured, end-to-end interactive guide from raw data ingestion to enterprise decision reporting.</p>
+    <div class="badge">Based on Meridian Module Inventory & Technical Architecture Guide</div>
+  </header>
+
+  <!-- Visual Workflow Diagram -->
+  <div class="flow-diagram">
+    <strong style="color: #f1f5f9; font-size: 1.1rem;">Full Pipeline Architecture (Data to Decision)</strong>
+    <div class="flow-steps">
+      <div class="flow-pill">1. Data Ingestion</div>
+      <div class="flow-arrow">➔</div>
+      <div class="flow-pill">2. Model Spec</div>
+      <div class="flow-arrow">➔</div>
+      <div class="flow-pill">3. Priors & Calibration</div>
+      <div class="flow-arrow">➔</div>
+      <div class="flow-pill">4. Holdouts</div>
+      <div class="flow-arrow">➔</div>
+      <div class="flow-pill">5. MCMC Sampling</div>
+      <div class="flow-arrow">➔</div>
+      <div class="flow-pill">6. Review & Health</div>
+      <div class="flow-arrow">➔</div>
+      <div class="flow-pill">7. Analysis & ROI</div>
+      <div class="flow-arrow">➔</div>
+      <div class="flow-pill">8. Visualizations</div>
+      <div class="flow-arrow">➔</div>
+      <div class="flow-pill">9. Budget Optimizer</div>
+      <div class="flow-arrow">➔</div>
+      <div class="flow-pill">10-11. Reports & Export</div>
+    </div>
+  </div>
+
+  <!-- Navigation Bar -->
+  <nav class="workflow-nav">
+    <a href="#step1">1. Data Input</a>
+    <a href="#step2">2. Model Spec</a>
+    <a href="#step3">3. Priors & Calib</a>
+    <a href="#step4">4. Holdouts</a>
+    <a href="#step5">5. Sampling</a>
+    <a href="#step6">6. Review & Health</a>
+    <a href="#step7">7. Analysis</a>
+    <a href="#step8">8. Visualization</a>
+    <a href="#step9">9. Budget Optimizer</a>
+    <a href="#step10">10. Persistence</a>
+    <a href="#step11">11. Enterprise Export</a>
+    <a href="#step12">12. Full-Funnel</a>
+  </nav>
+
+  <!-- STEP 1 -->
+  <div class="step-card" id="step1">
+    <div class="step-header">
+      <div class="step-num">1</div>
+      <div class="step-title">Data Input & Ingestion Layer</div>
+    </div>
+    <div class="purpose-box">
+      <strong>What this is used for:</strong> Ingesting, reshaping, and rigorously validating rectangular panel datasets (across Geos and Weeks) for media impressions, spend, reach/frequency, controls, and baseline KPI targets.
+    </div>
+    <ul class="features-list">
+      <li><strong>Loaders:</strong> Ingestion pipelines for pandas DataFrames, CSVs, xarray Datasets, and raw NumPy arrays.</li>
+      <li><strong>CoordToColumns:</strong> Standardized column-to-dimension mapping schema for automated ETL.</li>
+      <li><strong>Validation:</strong> Shape checking, time-step continuity validation, and non-negative spend/impression verification.</li>
+      <li><strong>Channel Types:</strong> Direct media channels, Reach & Frequency (RF) channels, organic media, non-media controls, and population weights.</li>
+      <li><strong>Currency:</strong> Optional explicit ISO currency coding for financial aggregations.</li>
+    </ul>
+    <div class="classes-tag-container">
+      <span class="code-tag">meridian.data.InputData</span>
+      <span class="code-tag">CsvDataLoader</span>
+      <span class="code-tag">DataFrameDataLoader</span>
+      <span class="code-tag">XrDatasetDataLoader</span>
+      <span class="code-tag">CoordToColumns</span>
+    </div>
+  </div>
+
+  <!-- STEP 2 -->
+  <div class="step-card" id="step2">
+    <div class="step-header">
+      <div class="step-num">2</div>
+      <div class="step-title">Model Specification Layer</div>
+    </div>
+    <div class="purpose-box">
+      <strong>What this is used for:</strong> Formulating the structural econometric equations, Adstock carryover decay, Hill saturation curves, time-varying baseline trends, and hierarchical geo structures.
+    </div>
+    <ul class="features-list">
+      <li><strong>Adstock Decay:</strong> Geometric or binomial decay curves configured per channel.</li>
+      <li><strong>Saturation Function:</strong> Non-linear Hill curves or linear responses per channel.</li>
+      <li><strong>Transformation Ordering:</strong> Ability to apply Hill saturation before or after Adstock carryover.</li>
+      <li><strong>Knots (Baseline):</strong> Time-varying baseline splines with Automatic Knot Selection (AKS).</li>
+      <li><strong>Hierarchical Geo Effects:</strong> Geo-level shrinkage using Normal or Log-Normal media distribution effects.</li>
+      <li><strong>Changepoints:</strong> New time-varying media effectiveness changepoints to model structural shifts.</li>
+    </ul>
+    <div class="classes-tag-container">
+      <span class="code-tag">meridian.model.spec.ModelSpec</span>
+      <span class="code-tag">SaturationType</span>
+      <span class="code-tag">adstock_hill</span>
+      <span class="code-tag">knots.py</span>
+      <span class="code-tag">changepoints.py</span>
+    </div>
+  </div>
+
+  <!-- STEP 3 -->
+  <div class="step-card" id="step3">
+    <div class="step-header">
+      <div class="step-num">3</div>
+      <div class="step-title">Priors and Experimental Calibration</div>
+    </div>
+    <div class="purpose-box">
+      <strong>What this is used for:</strong> Injecting business intuition, historical benchmarks, and randomized geo-experiment ground-truth into the model prior to fitting.
+    </div>
+    <ul class="features-list">
+      <li><strong>Media Prior Types:</strong> Four flexible formulations: ROI, marginal ROI (mROI), contribution share, and direct regression coefficient.</li>
+      <li><strong>Custom Prior Overrides:</strong> Configure custom parametric priors (Lognormal, Half-Normal, Beta, Normal) per channel.</li>
+      <li><strong>Experiment Calibration:</strong> <code>CalibrationBuilder</code> ingests incrementality test results (e.g. Meridian GeoX lift tests) with recency, duration, and spend adjustments.</li>
+      <li><strong>ROI Calibration Periods:</strong> Restrict calibration constraints strictly to the test experiment's execution window.</li>
+    </ul>
+    <div class="classes-tag-container">
+      <span class="code-tag">meridian.model.prior_distribution.PriorDistribution</span>
+      <span class="code-tag">CalibrationSpec</span>
+      <span class="code-tag">ChannelCalibrationSpec</span>
+    </div>
+  </div>
+
+  <!-- STEP 4 -->
+  <div class="step-card" id="step4">
+    <div class="step-header">
+      <div class="step-num">4</div>
+      <div class="step-title">Holdout Splits (Validation)</div>
+    </div>
+    <div class="purpose-box">
+      <strong>What this is used for:</strong> Creating train/validation splits to test out-of-sample predictive accuracy while preserving media adstock carryover continuity.
+    </div>
+    <ul class="features-list">
+      <li><strong>Geo & Date Holdouts:</strong> Exclude specific DMAs or time intervals from likelihood computation.</li>
+      <li><strong>Balanced Random Holdouts:</strong> Randomly mask cells across time while maintaining regional balance.</li>
+      <li><strong>Adstock Preservation:</strong> Media spend is retained across holdout periods so cumulative adstock carry-over math remains accurate.</li>
+    </ul>
+    <div class="classes-tag-container">
+      <span class="code-tag">meridian.model.spec.GeoHoldoutSpec</span>
+      <span class="code-tag">meridian.model.spec.RandomHoldoutSpec</span>
+      <span class="code-tag">HoldoutSpec</span>
+    </div>
+  </div>
+
+  <!-- STEP 5 -->
+  <div class="step-card" id="step5">
+    <div class="step-header">
+      <div class="step-num">5</div>
+      <div class="step-title">Probabilistic MCMC Sampling Engine</div>
+    </div>
+    <div class="purpose-box">
+      <strong>What this is used for:</strong> Drawing full Bayesian posterior distributions for all model parameters using No-U-Turn Sampler (NUTS) across GPU/CPU hardware.
+    </div>
+    <ul class="features-list">
+      <li><strong>Prior Sampling:</strong> <code>sample_prior()</code> validates prior assumptions and checks implied outcomes before fitting.</li>
+      <li><strong>Posterior Sampling:</strong> <code>sample_posterior()</code> runs multi-chain NUTS with adaptive step sizes.</li>
+      <li><strong>Progress & Thinning:</strong> Live TQDM progress indicators and posterior thinning to conserve memory.</li>
+      <li><strong>Execution Backends:</strong> JAX engine (default high-performance backend) and TensorFlow Probability.</li>
+    </ul>
+    <div class="classes-tag-container">
+      <span class="code-tag">meridian.model.Meridian</span>
+      <span class="code-tag">posterior_sampler.py</span>
+      <span class="code-tag">prior_sampler.py</span>
+    </div>
+  </div>
+
+  <!-- STEP 6 -->
+  <div class="step-card" id="step6">
+    <div class="step-header">
+      <div class="step-num">6</div>
+      <div class="step-title">Model Review & Diagnostic Health Checks</div>
+    </div>
+    <div class="purpose-box">
+      <strong>What this is used for:</strong> Assessing mathematical convergence, goodness of fit, and potential econometric biases before presenting results to stakeholders.
+    </div>
+    <ul class="features-list">
+      <li><strong>ModelReviewer Health Score:</strong> Categorizes model health as PASS, REVIEW, or FAIL.</li>
+      <li><strong>Convergence Checks:</strong> Gelman-Rubin R-hat and Effective Sample Size (ESS).</li>
+      <li><strong>Fit Metrics:</strong> Bayesian posterior predictive p-values, R², MAPE, and weighted MAPE.</li>
+      <li><strong>Econometric Checks:</strong> Prior-to-posterior shift, negative baseline probability, implausible ROI checks, and control multicollinearity.</li>
+      <li><strong>Pre-fit EDA Engine:</strong> Invariability tests, Variance Inflation Factor (VIF), and population correlation.</li>
+    </ul>
+    <div class="classes-tag-container">
+      <span class="code-tag">meridian.analysis.review.ModelReviewer</span>
+      <span class="code-tag">eda.py</span>
+      <span class="code-tag">health_summary()</span>
+    </div>
+  </div>
+
+  <!-- STEP 7 -->
+  <div class="step-card" id="step7">
+    <div class="step-header">
+      <div class="step-num">7</div>
+      <div class="step-title">Analysis & Outcome Extraction Layer</div>
+    </div>
+    <div class="purpose-box">
+      <strong>What this is used for:</strong> Translating sampled posterior parameters into actionable business metrics: incremental revenue, ROI, mROI, and diminishing returns.
+    </div>
+    <ul class="features-list">
+      <li><strong>Incremental Conversions/Revenue:</strong> Posterior distributions of channel incremental outcome.</li>
+      <li><strong>Efficiency Metrics:</strong> Return on Investment (ROI), Marginal ROI (mROI), and Cost per Incremental KPI (CPIK).</li>
+      <li><strong>Full Credible Intervals:</strong> Explicit uncertainty bounds (e.g. 90% credible intervals) on every metric.</li>
+      <li><strong>Flexible Slicing:</strong> Compute national or geo-level metrics over custom time windows.</li>
+      <li><strong>Counterfactuals:</strong> Evaluate KPI outcomes under hypothetical media interventions.</li>
+    </ul>
+    <div class="classes-tag-container">
+      <span class="code-tag">meridian.analysis.analyzer.Analyzer</span>
+      <span class="code-tag">get_incremental_kpi()</span>
+      <span class="code-tag">expected_outcome()</span>
+    </div>
+  </div>
+
+  <!-- STEP 8 -->
+  <div class="step-card" id="step8">
+    <div class="step-header">
+      <div class="step-num">8</div>
+      <div class="step-title">Visualization & Diagnostic Plotting</div>
+    </div>
+    <div class="purpose-box">
+      <strong>What this is used for:</strong> Generating interactive, publication-grade visual diagnostics and charts using Altair / Vega-Lite.
+    </div>
+    <ul class="features-list">
+      <li><strong>ModelFit:</strong> Actual vs. predicted fit curves over time across individual geos or nationally.</li>
+      <li><strong>ModelDiagnostics:</strong> Visual R-hat distributions, chain trace plots, and prior vs. posterior shifts.</li>
+      <li><strong>MediaEffects:</strong> Hill saturation curves, diminishing returns, and geometric Adstock decay half-lives.</li>
+      <li><strong>MediaSummary:</strong> Waterfall contribution charts, ROI comparisons, and spend-to-revenue ratios.</li>
+      <li><strong>ReachAndFrequency:</strong> Optimal frequency saturation curves for RF channels.</li>
+    </ul>
+    <div class="classes-tag-container">
+      <span class="code-tag">meridian.analysis.visualizer.Visualizer</span>
+      <span class="code-tag">ModelFit</span>
+      <span class="code-tag">MediaEffects</span>
+      <span class="code-tag">ReachAndFrequency</span>
+    </div>
+  </div>
+
+  <!-- STEP 9 -->
+  <div class="step-card" id="step9">
+    <div class="step-header">
+      <div class="step-num">9</div>
+      <div class="step-title">Budget Optimizer & Scenario Planning</div>
+    </div>
+    <div class="purpose-box">
+      <strong>What this is used for:</strong> Calculating mathematical optimal spend allocations across marketing channels to maximize revenue or target specific ROI thresholds.
+    </div>
+    <ul class="features-list">
+      <li><strong>Fixed-Budget Optimization:</strong> Reallocates an existing or scaled budget to maximize incremental outcome.</li>
+      <li><strong>Flexible-Budget Optimization:</strong> Determines the optimal total budget required to hit a target ROI or mROI hurdle rate.</li>
+      <li><strong>Spend Constraints:</strong> Imposes upper and lower bounds (relative or absolute) per channel to prevent unrealistic shifts.</li>
+      <li><strong>RF Frequency Optimization:</strong> Solves for optimal target frequency for digital reach campaigns.</li>
+      <li><strong>Spend Grids:</strong> Generates multi-dimensional response grids for interactive what-if explorations.</li>
+    </ul>
+    <div class="classes-tag-container">
+      <span class="code-tag">meridian.analysis.optimizer.BudgetOptimizer</span>
+      <span class="code-tag">FixedBudgetScenario</span>
+      <span class="code-tag">FlexibleBudgetScenario</span>
+      <span class="code-tag">OptimizationGrid</span>
+    </div>
+  </div>
+
+  <!-- STEP 10 -->
+  <div class="step-card" id="step10">
+    <div class="step-header">
+      <div class="step-num">10</div>
+      <div class="step-title">Reports & Persistence Layer</div>
+    </div>
+    <div class="purpose-box">
+      <strong>What this is used for:</strong> Serializing fitted model states for production reuse and generating standalone HTML deliverables for leadership.
+    </div>
+    <ul class="features-list">
+      <li><strong>Model Results Summary:</strong> Standalone HTML executive report with embedded plots and metric tables.</li>
+      <li><strong>Health Card:</strong> Standalone HTML diagnostic report summarizing MCMC health and potential risks.</li>
+      <li><strong>Pickle Serialization:</strong> <code>save_mmm()</code> and <code>load_mmm()</code> for local state persistence.</li>
+      <li><strong>Versioned Proto Serde:</strong> Protocol buffer serialization (<code>meridian.schema.serde</code>) for forward/backward compatibility.</li>
+    </ul>
+    <div class="classes-tag-container">
+      <span class="code-tag">meridian.analysis.summarizer.Summarizer</span>
+      <span class="code-tag">save_mmm</span>
+      <span class="code-tag">load_mmm</span>
+      <span class="code-tag">meridian.schema.serde</span>
+    </div>
+  </div>
+
+  <!-- STEP 11 -->
+  <div class="step-card" id="step11">
+    <div class="step-header">
+      <div class="step-num">11</div>
+      <div class="step-title">Enterprise Export & BI Integration</div>
+    </div>
+    <div class="purpose-box">
+      <strong>What this is used for:</strong> Handing off fitted results to BI dashboards (Looker Studio), data warehouses, and ML experiment tracking platforms.
+    </div>
+    <ul class="features-list">
+      <li><strong>Protocol Buffer Schema:</strong> Structured export formats (<code>mmm-proto-schema</code>) for marketing analysis and budget grids.</li>
+      <li><strong>Scenario Planner & Looker Studio:</strong> Exports spend grids to Google Sheets / Colab to power interactive Looker Studio dashboards.</li>
+      <li><strong>MLflow Autologging:</strong> Native tracking of priors, posteriors, and artifacts directly to MLflow servers.</li>
+    </ul>
+    <div class="classes-tag-container">
+      <span class="code-tag">meridian.schema.mmm_proto_generator</span>
+      <span class="code-tag">meridian.mlflow.autolog</span>
+      <span class="code-tag">scenarioplanner</span>
+    </div>
+  </div>
+
+  <!-- STEP 12 -->
+  <div class="step-card" id="step12">
+    <div class="step-header">
+      <div class="step-num">12</div>
+      <div class="step-title">Advanced Full-Funnel Modeling (Custom Extension)</div>
+    </div>
+    <div class="purpose-box">
+      <strong>What this is used for:</strong> Connecting upper-funnel branding campaigns to intermediate KPIs (e.g. site visits, brand search) and flowing those into final sales revenue.
+    </div>
+    <ul class="features-list">
+      <li><strong>Two-Stage Architecture:</strong> Upper-funnel model drives brand metrics; lower-funnel model drives sales with upper metrics as controls.</li>
+      <li><strong>Implementation:</strong> Built via user custom class (<code>AnalyzerFullFunnel</code>) using Meridian's modular primitives.</li>
+    </ul>
+    <div class="classes-tag-container">
+      <span class="code-tag">Custom AnalyzerFullFunnel Pattern</span>
+    </div>
+  </div>
+
+  <!-- Limitations Box -->
+  <div class="alert-box">
+    <h4>Key Production Considerations & Limitations</h4>
+    <p>• <strong>Aggregated Data:</strong> Built for geo-temporal aggregate data, not individual user-level tracking.<br>
+       • <strong>Hardware Requirement:</strong> MCMC sampling with NUTS benefits heavily from a T4/V100/A100 GPU.<br>
+       • <strong>Non-Revenue KPIs:</strong> Require custom priors or revenue-per-unit mappings to avoid falling back to total contribution priors.</p>
+  </div>
+
+  <footer>
+    Google Meridian MMM Technical Pipeline • Generated for Production System Design
+  </footer>
+</div>
+
+</body>
+</html>

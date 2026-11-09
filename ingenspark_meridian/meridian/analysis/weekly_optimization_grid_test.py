@@ -1,0 +1,1455 @@
+# Copyright 2026 The Meridian Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import copy
+import dataclasses
+import os
+from unittest import mock
+
+from absl.testing import absltest
+from absl.testing import parameterized
+import arviz as az
+from ingenspark_meridian.meridian import backend
+from ingenspark_meridian.meridian import constants as c
+from ingenspark_meridian.meridian.analysis import analyzer
+from ingenspark_meridian.meridian.analysis import optimizer
+from ingenspark_meridian.meridian.analysis import test_utils as analysis_test_utils
+from ingenspark_meridian.meridian.analysis import weekly_optimization_grid
+from ingenspark_meridian.meridian.common import errors as common_errors
+from ingenspark_meridian.meridian.data import test_utils as data_test_utils
+from ingenspark_meridian.meridian.model import context
+from ingenspark_meridian.meridian.model import model
+from ingenspark_meridian.meridian.model import spec
+import numpy as np
+import xarray as xr
+
+_TEST_DATA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), 'model', 'test_data'
+)
+
+_N_GEOS = 5
+_N_TIMES = 52
+_N_MEDIA_TIMES = 55
+_N_MEDIA_CHANNELS = 3
+_N_RF_CHANNELS = 2
+_N_ORGANIC_MEDIA_CHANNELS = 4
+_N_ORGANIC_RF_CHANNELS = 1
+_N_NON_MEDIA_CHANNELS = 4
+_N_CONTROLS = 2
+_N_CHAINS = 1
+_N_DRAWS = 1
+
+
+def _verify_actual_vs_expected_budget_data(
+    actual_data: xr.Dataset,
+    expected_data: xr.Dataset,
+    *,
+    atol: float = 0.1,
+    rtol: float = 0.01,
+) -> None:
+  xr.testing.assert_allclose(actual_data, expected_data, atol=atol, rtol=rtol)
+  np.testing.assert_allclose(
+      actual_data.budget, expected_data.budget, atol=atol, rtol=rtol
+  )
+  np.testing.assert_allclose(
+      actual_data.profit, expected_data.profit, atol=atol, rtol=rtol
+  )
+  np.testing.assert_allclose(
+      actual_data.total_incremental_outcome,
+      expected_data.total_incremental_outcome,
+      atol=atol,
+      rtol=rtol,
+  )
+  np.testing.assert_allclose(
+      actual_data.total_roi, expected_data.total_roi, atol=atol, rtol=rtol
+  )
+  if c.FIXED_BUDGET in expected_data.attrs:
+    np.testing.assert_equal(
+        actual_data.attrs[c.FIXED_BUDGET],
+        expected_data.attrs[c.FIXED_BUDGET],
+    )
+
+
+class WeeklyOptimizationGridTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+
+    self.input_data_media_and_rf = (
+        data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+            n_geos=_N_GEOS,
+            n_times=_N_TIMES,
+            n_media_times=_N_MEDIA_TIMES,
+            n_media_channels=_N_MEDIA_CHANNELS,
+            n_rf_channels=_N_RF_CHANNELS,
+            n_controls=_N_CONTROLS,
+            seed=0,
+        )
+    )
+    self.input_data_media_only = (
+        data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+            n_geos=_N_GEOS,
+            n_times=_N_TIMES,
+            n_media_times=_N_MEDIA_TIMES,
+            n_media_channels=_N_MEDIA_CHANNELS,
+            n_controls=_N_CONTROLS,
+            seed=0,
+        )
+    )
+
+    self.inference_data_media_and_rf = az.InferenceData(
+        prior=xr.open_dataset(
+            os.path.join(_TEST_DATA_DIR, 'sample_prior_media_and_rf.nc')
+        ),
+        posterior=xr.open_dataset(
+            os.path.join(_TEST_DATA_DIR, 'sample_posterior_media_and_rf.nc')
+        ),
+    )
+    self.inference_data_media_only = az.InferenceData(
+        prior=xr.open_dataset(
+            os.path.join(_TEST_DATA_DIR, 'sample_prior_media_only.nc')
+        ),
+        posterior=xr.open_dataset(
+            os.path.join(_TEST_DATA_DIR, 'sample_posterior_media_only.nc')
+        ),
+    )
+
+    self.meridian_media_and_rf = model.Meridian(
+        input_data=self.input_data_media_and_rf
+    )
+    self.meridian_media_only = model.Meridian(
+        input_data=self.input_data_media_only
+    )
+
+    self.budget_optimizer_media_and_rf = optimizer.BudgetOptimizer(
+        self.meridian_media_and_rf
+    )
+    self.budget_optimizer_media_only = optimizer.BudgetOptimizer(
+        self.meridian_media_only
+    )
+
+    self.enter_context(
+        mock.patch.object(
+            model.Meridian,
+            'inference_data',
+            new=property(lambda unused_self: self.inference_data_media_and_rf),
+        )
+    )
+    self.enter_context(
+        mock.patch.object(
+            analyzer.Analyzer,
+            'inference_data',
+            new=property(lambda unused_self: self.inference_data_media_and_rf),
+        )
+    )
+    self.enter_context(
+        mock.patch.object(
+            analyzer.Analyzer,
+            'summary_metrics',
+            return_value=analysis_test_utils.generate_paid_summary_metrics(),
+            autospec=True,
+        )
+    )
+
+  def test_create_with_changepoints_raises(self):
+    data = self.input_data_media_only
+    assert data.media_channel is not None
+    model_context = context.ModelContext(
+        input_data=data,
+        model_spec=spec._ModelSpecWithChangepoints(  # pylint: disable=protected-access
+            changepoints={
+                str(data.media_channel.values[0]): [
+                    data.time_coordinates.all_dates[2]
+                ]
+            }
+        ),
+    )
+    with self.assertRaisesRegex(
+        NotImplementedError,
+        '`WeeklyOptimizationGrid` does not support models with `changepoints`'
+        ' yet: its results would not reflect the time-varying effects.',
+    ):
+      weekly_optimization_grid.WeeklyOptimizationGrid.create(
+          analyzer.Analyzer(
+              model_context=model_context, inference_data=az.InferenceData()
+          )
+      )
+
+  def test_create(self):
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+    )
+    self.assertIsInstance(
+        weekly_grid, weekly_optimization_grid.WeeklyOptimizationGrid
+    )
+    assert weekly_grid is not None
+    self.assertIsInstance(weekly_grid.nonoptimized_spend, xr.DataArray)
+    self.assertEqual(
+        list(weekly_grid.nonoptimized_spend.dims),
+        [c.CHANNEL, c.TIME],
+    )
+    self.assertIsInstance(weekly_grid.incremental_outcome, xr.DataArray)
+    self.assertEqual(
+        list(weekly_grid.incremental_outcome.dims),
+        [c.CHANNEL, c.SPEND_MULTIPLIER, c.TIME],
+    )
+
+  def test_create_with_new_data(self):
+    model_times = (
+        np.asarray(self.meridian_media_only.input_data.time)
+        .astype(str)
+        .tolist()
+    )
+    new_times = model_times
+    new_data = analyzer.DataTensors(
+        media=self.meridian_media_only.media_tensors.media,
+        media_spend=self.meridian_media_only.media_tensors.media_spend,
+        revenue_per_kpi=self.meridian_media_only.revenue_per_kpi,
+        time=new_times,
+    )
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        new_data=new_data,
+        multiplier_step=0.5,
+        use_posterior=True,
+    )
+    self.assertIsInstance(
+        weekly_grid, weekly_optimization_grid.WeeklyOptimizationGrid
+    )
+    assert weekly_grid is not None
+    assert weekly_grid.incremental_outcome is not None
+    self.assertEqual(
+        list(weekly_grid.incremental_outcome.dims),
+        [c.CHANNEL, c.SPEND_MULTIPLIER, c.TIME],
+    )
+    self.assertEqual(
+        weekly_grid.incremental_outcome[c.TIME].data.tolist(),
+        new_times,
+    )
+
+  def test_weekly_grid_constraint_validation_warns(self):
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        max_constraint_variation=0.1,
+        use_posterior=True,
+    )
+    assert weekly_grid is not None
+    model_times = (
+        np.asarray(self.meridian_media_only.input_data.time)
+        .astype(str)
+        .tolist()
+    )
+    first_time = model_times[0]
+    last_time = model_times[-1]
+
+    grid = weekly_grid.to_optimization_grid(
+        start_date=first_time,
+        end_date=last_time,
+    )
+    with self.assertWarnsRegex(
+        UserWarning,
+        'Optimization called with bounds that are not within the grid',
+    ):
+      self.budget_optimizer_media_only.optimize(
+          optimization_grid=grid,
+          spend_constraint_lower=0.2,
+          spend_constraint_upper=0.0,
+          start_date=first_time,
+          end_date=last_time,
+      )
+
+    with self.assertWarnsRegex(
+        UserWarning,
+        'Optimization called with bounds that are not within the grid',
+    ):
+      self.budget_optimizer_media_only.optimize(
+          optimization_grid=grid,
+          spend_constraint_lower=0.0,
+          spend_constraint_upper=0.2,
+          start_date=first_time,
+          end_date=last_time,
+      )
+
+  def test_weekly_grid_budget_validation_warns(self):
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        max_budget_percent_decrease=0.1,
+        max_budget_percent_increase=0.1,
+        use_posterior=True,
+    )
+    assert weekly_grid is not None
+    model_times = (
+        np.asarray(self.meridian_media_only.input_data.time)
+        .astype(str)
+        .tolist()
+    )
+    first_time = model_times[0]
+    last_time = model_times[-1]
+
+    grid = weekly_grid.to_optimization_grid(
+        start_date=first_time,
+        end_date=last_time,
+    )
+    assert grid is not None
+    hist_spend = np.sum(grid.historical_spend)
+    with self.assertWarnsRegex(
+        UserWarning,
+        'Optimization called with bounds that are not within the grid',
+    ):
+      results = self.budget_optimizer_media_only.optimize(
+          optimization_grid=grid,
+          start_date=first_time,
+          end_date=last_time,
+          budget=hist_spend * 2.0,
+      )
+    self.assertIsNotNone(results)
+
+  def test_weekly_grid_channels_property(self):
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+    )
+    self.assertIsNotNone(weekly_grid)
+    assert weekly_grid is not None
+    expected_channels = list(
+        self.meridian_media_only.input_data.get_all_paid_channels()
+    )
+    self.assertEqual(weekly_grid.channels, expected_channels)
+
+  def test_weekly_grid_time_property(self):
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+    )
+    self.assertIsNotNone(weekly_grid)
+    assert weekly_grid is not None
+    expected_times = (
+        np.asarray(self.meridian_media_only.input_data.time)
+        .astype(str)
+        .tolist()
+    )
+    self.assertEqual(weekly_grid.time, expected_times)
+
+  def test_weekly_grid_validate_dates(self):
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+    )
+    self.assertIsNotNone(weekly_grid)
+    assert weekly_grid is not None
+    self.assertTrue(weekly_grid._validate_dates())
+
+  def test_weekly_grid_date_validation_warns(self):
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+    )
+    self.assertIsNotNone(weekly_grid)
+    assert weekly_grid is not None
+    model_times = (
+        np.asarray(self.meridian_media_only.input_data.time)
+        .astype(str)
+        .tolist()
+    )
+    first_time = model_times[0]
+    last_time = model_times[-1]
+    assert weekly_grid.incremental_outcome is not None
+
+    # Shorten time by removing the first week so start date is missing
+    times_without_first = weekly_grid.incremental_outcome.time[1:]
+    invalid_weekly_grid_start = dataclasses.replace(
+        weekly_grid,
+        incremental_outcome=weekly_grid.incremental_outcome.sel(
+            time=times_without_first
+        ),
+        nonoptimized_spend=weekly_grid.nonoptimized_spend.sel(
+            time=times_without_first
+        ),
+    )
+    with self.assertWarnsRegex(
+        UserWarning,
+        'Given weekly grid does not cover start_date',
+    ):
+      grid = invalid_weekly_grid_start.to_optimization_grid(
+          start_date=first_time,
+      )
+    results = self.budget_optimizer_media_only.optimize(
+        optimization_grid=grid,
+    )
+    self.assertIsNotNone(results)
+
+    # Shorten time by removing the last week so end date is missing
+    times_without_last = weekly_grid.incremental_outcome.time[:-1]
+    invalid_weekly_grid_end = dataclasses.replace(
+        weekly_grid,
+        incremental_outcome=weekly_grid.incremental_outcome.sel(
+            time=times_without_last
+        ),
+        nonoptimized_spend=weekly_grid.nonoptimized_spend.sel(
+            time=times_without_last
+        ),
+    )
+    with self.assertWarnsRegex(
+        UserWarning,
+        'Given weekly grid does not cover end_date',
+    ):
+      grid = invalid_weekly_grid_end.to_optimization_grid(
+          end_date=last_time,
+      )
+    results = self.budget_optimizer_media_only.optimize(
+        optimization_grid=grid,
+    )
+    self.assertIsNotNone(results)
+
+  def test_create_with_rf_succeeds(self):
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_and_rf._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+    )
+    self.assertIsNotNone(weekly_grid)
+    self.assertEqual(weekly_grid.n_rf_channels, _N_RF_CHANNELS)
+    grid = weekly_grid.to_optimization_grid()
+    self.assertIsNotNone(grid)
+    results = self.budget_optimizer_media_and_rf.optimize(
+        optimization_grid=grid,
+    )
+    self.assertIsNotNone(results)
+
+  def test_to_optimization_grid_rf_stabilization(self):
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_and_rf._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+    )
+    self.assertIsNotNone(weekly_grid)
+    grid = weekly_grid.to_optimization_grid()
+    self.assertIsNotNone(grid)
+
+    spend_grid = grid.spend_grid.values
+    outcome_grid = grid.incremental_outcome_grid.values
+
+    for i in range(-_N_RF_CHANNELS, 0):
+      spend_col = spend_grid[:, i]
+      outcome_col = outcome_grid[:, i]
+      valid_mask = ~np.isnan(spend_col)
+
+      valid_spend = spend_col[valid_mask]
+      valid_outcome = outcome_col[valid_mask]
+
+      non_zero_mask = valid_spend != 0
+      if np.sum(non_zero_mask) > 1:
+        slopes = valid_outcome[non_zero_mask] / valid_spend[non_zero_mask]
+        # All slopes should be almost identical due to stabilization
+        np.testing.assert_allclose(slopes, slopes[0], rtol=1e-5)
+
+  def test_create_with_rf_use_optimal_frequency(self):
+    # Case 1: use_optimal_frequency=True (default)
+    weekly_grid_opt = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_and_rf._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+        use_optimal_frequency=True,
+    )
+    self.assertIsNotNone(weekly_grid_opt)
+    self.assertTrue(weekly_grid_opt.use_optimal_frequency)
+    self.assertIsInstance(weekly_grid_opt.rf_incremental_outcome, xr.DataArray)
+    self.assertEqual(
+        list(weekly_grid_opt.rf_incremental_outcome.dims),
+        [c.CHANNEL, c.FREQUENCY, c.TIME],
+    )
+    max_freq = np.max(
+        np.array(self.meridian_media_and_rf.model_context.rf_tensors.frequency)
+    )
+    np.testing.assert_allclose(
+        weekly_grid_opt.rf_incremental_outcome[c.FREQUENCY].values,
+        np.arange(1, max_freq, 0.1),
+    )
+    paid_channels = list(
+        self.meridian_media_and_rf.input_data.get_all_paid_channels()
+    )
+    self.assertEqual(
+        weekly_grid_opt.media_channels, paid_channels[:_N_MEDIA_CHANNELS]
+    )
+    self.assertEqual(
+        weekly_grid_opt.rf_channels, paid_channels[_N_MEDIA_CHANNELS:]
+    )
+    self.assertEqual(weekly_grid_opt.channels, paid_channels)
+    grid_opt = weekly_grid_opt.to_optimization_grid()
+    self.assertIsNotNone(grid_opt)
+    self.assertIsNotNone(grid_opt.optimal_frequency)
+    self.assertLen(grid_opt.optimal_frequency, _N_RF_CHANNELS)
+
+    # Case 2: use_optimal_frequency=False
+    weekly_grid_no_opt = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_and_rf._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+        use_optimal_frequency=False,
+    )
+    self.assertIsNotNone(weekly_grid_no_opt)
+    self.assertFalse(weekly_grid_no_opt.use_optimal_frequency)
+    assert weekly_grid_no_opt.rf_incremental_outcome is not None
+    self.assertEqual(
+        weekly_grid_no_opt.rf_incremental_outcome.sizes[c.FREQUENCY], 1
+    )
+    grid_no_opt = weekly_grid_no_opt.to_optimization_grid()
+    self.assertIsNotNone(grid_no_opt)
+    self.assertIsNone(grid_no_opt.optimal_frequency)
+    self.assertIsNone(weekly_grid_no_opt.opt_freq_ds)
+
+  def test_create_media_only_has_no_rf_outcome(self):
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+    )
+    self.assertIsNone(weekly_grid.rf_incremental_outcome)
+    self.assertEqual(weekly_grid.rf_channels, [])
+    self.assertIsNone(weekly_grid.opt_freq_ds)
+
+  def test_rf_only_grid_channels(self):
+    times = ['2024-01-01', '2024-01-08']
+    rf_channels = ['rf_ch_0', 'rf_ch_1']
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid(
+        incremental_outcome=None,
+        rf_incremental_outcome=xr.DataArray(
+            np.ones((len(rf_channels), 2, len(times))),
+            coords={
+                c.CHANNEL: rf_channels,
+                c.FREQUENCY: [1.0, 2.0],
+                c.TIME: times,
+            },
+            dims=[c.CHANNEL, c.FREQUENCY, c.TIME],
+        ),
+        nonoptimized_spend=xr.DataArray(
+            np.ones((len(rf_channels), len(times))),
+            coords={c.CHANNEL: rf_channels, c.TIME: times},
+            dims=[c.CHANNEL, c.TIME],
+        ),
+        use_kpi=False,
+        use_posterior=True,
+        multiplier_step=0.5,
+        max_budget_percent_decrease=0.3,
+        max_budget_percent_increase=0.3,
+        max_constraint_variation=0.3,
+    )
+    self.assertEqual(weekly_grid.media_channels, [])
+    self.assertEqual(weekly_grid.rf_channels, rf_channels)
+    self.assertEqual(weekly_grid.channels, rf_channels)
+    self.assertLen(rf_channels, weekly_grid.n_rf_channels)
+    self.assertEqual(weekly_grid.time, times)
+
+  def test_create_rf_without_reach_transformer_uses_unscaled_impressions(self):
+    meridian_analyzer = self.budget_optimizer_media_and_rf._analyzer
+    model_context = meridian_analyzer.model_context
+    scaled_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        meridian_analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+    )
+    with mock.patch.object(
+        model_context,
+        'rf_tensors',
+        dataclasses.replace(model_context.rf_tensors, reach_transformer=None),
+    ):
+      unscaled_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+          meridian_analyzer,
+          multiplier_step=0.5,
+          use_posterior=True,
+      )
+
+    assert scaled_grid.rf_incremental_outcome is not None
+    assert unscaled_grid.rf_incremental_outcome is not None
+    self.assertEqual(
+        unscaled_grid.rf_incremental_outcome.shape,
+        scaled_grid.rf_incremental_outcome.shape,
+    )
+    self.assertTrue(np.all(np.isfinite(unscaled_grid.rf_incremental_outcome)))
+    # Without the reach transformer, impressions enter the model unscaled.
+    self.assertFalse(
+        np.allclose(
+            unscaled_grid.rf_incremental_outcome,
+            scaled_grid.rf_incremental_outcome,
+        )
+    )
+    # Media channels don't depend on the reach transformer.
+    xr.testing.assert_allclose(
+        unscaled_grid.incremental_outcome, scaled_grid.incremental_outcome
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='posterior_revenue',
+          use_posterior=True,
+          use_kpi=False,
+          max_frequency=None,
+      ),
+      dict(
+          testcase_name='prior',
+          use_posterior=False,
+          use_kpi=False,
+          max_frequency=None,
+      ),
+      dict(
+          testcase_name='kpi',
+          use_posterior=True,
+          use_kpi=True,
+          max_frequency=None,
+      ),
+      dict(
+          testcase_name='custom_max_frequency',
+          use_posterior=True,
+          use_kpi=False,
+          max_frequency=4.0,
+      ),
+  )
+  def test_opt_freq_ds_matches_analyzer(
+      self,
+      use_posterior: bool,
+      use_kpi: bool,
+      max_frequency: float | None,
+  ):
+    meridian_analyzer = self.budget_optimizer_media_and_rf._analyzer
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        meridian_analyzer,
+        multiplier_step=0.5,
+        use_posterior=use_posterior,
+        use_kpi=use_kpi,
+        max_frequency=max_frequency,
+    )
+    opt_freq_ds = weekly_grid.opt_freq_ds
+    assert opt_freq_ds is not None
+    expected = meridian_analyzer.optimal_freq(
+        use_posterior=use_posterior,
+        use_kpi=use_kpi,
+        max_frequency=max_frequency,
+    ).sel(metric=c.MEAN)
+
+    self.assertEqual(
+        list(opt_freq_ds[c.ROI].dims), [c.FREQUENCY, c.RF_CHANNEL, c.METRIC]
+    )
+    self.assertEqual(opt_freq_ds[c.METRIC].values.tolist(), [c.MEAN])
+    np.testing.assert_array_equal(
+        opt_freq_ds[c.RF_CHANNEL].values, expected[c.RF_CHANNEL].values
+    )
+    np.testing.assert_allclose(
+        opt_freq_ds[c.FREQUENCY].values, expected[c.FREQUENCY].values
+    )
+    np.testing.assert_allclose(
+        opt_freq_ds.optimal_frequency.values,
+        expected.optimal_frequency.values,
+    )
+    np.testing.assert_allclose(
+        opt_freq_ds[c.ROI].sel(metric=c.MEAN).values,
+        expected[c.ROI].values,
+        rtol=1e-4,
+    )
+    # `Analyzer.optimal_freq` computes `optimized_*` via `summary_metrics`,
+    # which is mocked in this test class, so compare against its ROI curve.
+    expected_optimized_roi = (
+        expected[c.ROI].sel(frequency=expected.optimal_frequency).values
+    )
+    np.testing.assert_allclose(
+        opt_freq_ds.optimized_roi.sel(metric=c.MEAN).values,
+        expected_optimized_roi,
+        rtol=1e-4,
+    )
+    rf_spend = (
+        weekly_grid.nonoptimized_spend.sel(channel=weekly_grid.rf_channels)
+        .sum(dim=c.TIME)
+        .values
+    )
+    np.testing.assert_allclose(
+        opt_freq_ds.optimized_incremental_outcome.sel(metric=c.MEAN).values,
+        expected_optimized_roi * rf_spend,
+        rtol=1e-4,
+    )
+    self.assertEqual(opt_freq_ds.attrs[c.IS_REVENUE_KPI], not use_kpi)
+    self.assertEqual(opt_freq_ds.attrs[c.USE_POSTERIOR], use_posterior)
+
+  @parameterized.named_parameters(
+      dict(testcase_name='all_dates', start_offset=0, end_offset=-1),
+      dict(testcase_name='custom_dates', start_offset=5, end_offset=-10),
+  )
+  def test_rf_optimal_frequency_matches_analyzer(
+      self, start_offset: int, end_offset: int
+  ):
+    times = self.meridian_media_and_rf.input_data.time.to_numpy().tolist()
+    start_date = times[start_offset]
+    end_date = times[end_offset]
+    selected_times = times[
+        start_offset : (None if end_offset == -1 else end_offset + 1)
+    ]
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_and_rf._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+    )
+    grid = weekly_grid.to_optimization_grid(
+        start_date=start_date, end_date=end_date
+    )
+    assert grid is not None
+    expected = self.budget_optimizer_media_and_rf._analyzer.optimal_freq(
+        use_posterior=True,
+        selected_times=selected_times,
+    ).optimal_frequency.values
+    assert grid.optimal_frequency is not None
+    np.testing.assert_allclose(grid.optimal_frequency, expected)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='default_dates_default_budget',
+          start_offset=0,
+          end_offset=-1,
+          budget_factor=1.0,
+      ),
+      dict(
+          testcase_name='custom_dates_reduced_budget',
+          start_offset=5,
+          end_offset=-5,
+          budget_factor=0.9,
+      ),
+  )
+  def test_compare_weekly_and_standard_grid_optimization_with_rf(
+      self, start_offset: int, end_offset: int, budget_factor: float
+  ):
+    times = self.meridian_media_and_rf.input_data.time.to_numpy().tolist()
+    start_date = times[start_offset] if start_offset > 0 else None
+    end_date = times[end_offset] if end_offset < -1 else None
+
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_and_rf._analyzer,
+        multiplier_step=0.0001,
+        use_posterior=True,
+        batch_size=10,
+    )
+    hist_spend = np.sum(
+        self.budget_optimizer_media_and_rf.create_optimization_grid(
+            start_date=start_date, end_date=end_date
+        ).historical_spend
+    )
+    budget = hist_spend * budget_factor
+
+    grid = weekly_grid.to_optimization_grid(
+        start_date=start_date,
+        end_date=end_date,
+    )
+    results_weekly = self.budget_optimizer_media_and_rf.optimize(
+        optimization_grid=grid,
+        spend_constraint_lower=0.1,
+        spend_constraint_upper=0.1,
+        start_date=start_date,
+        end_date=end_date,
+        budget=budget,
+    )
+    results_standard = self.budget_optimizer_media_and_rf.optimize(
+        spend_constraint_lower=0.1,
+        spend_constraint_upper=0.1,
+        start_date=start_date,
+        end_date=end_date,
+        budget=budget,
+    )
+    weekly_opt_freq = results_weekly.optimization_grid.optimal_frequency
+    standard_opt_freq = results_standard.optimization_grid.optimal_frequency
+    assert weekly_opt_freq is not None
+    assert standard_opt_freq is not None
+    np.testing.assert_allclose(weekly_opt_freq, standard_opt_freq)
+    _verify_actual_vs_expected_budget_data(
+        results_weekly.optimized_data,
+        results_standard.optimized_data,
+        rtol=0.05,
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='negative_decrease',
+          max_budget_percent_decrease=-0.1,
+      ),
+      dict(
+          testcase_name='decrease_equals_one',
+          max_budget_percent_decrease=1.0,
+      ),
+      dict(
+          testcase_name='decrease_greater_than_one',
+          max_budget_percent_decrease=1.5,
+      ),
+  )
+  def test_create_invalid_max_budget_percent_decrease_raises_error(
+      self, max_budget_percent_decrease
+  ):
+    with self.assertRaisesRegex(
+        ValueError,
+        '`max_budget_percent_decrease` must be in the range \\[0, 1\\)\\.',
+    ):
+      weekly_optimization_grid.WeeklyOptimizationGrid.create(
+          self.budget_optimizer_media_only._analyzer,
+          max_budget_percent_decrease=max_budget_percent_decrease,
+      )
+
+  def test_create_invalid_max_budget_percent_increase_raises_error(
+      self,
+  ):
+    with self.assertRaisesRegex(
+        ValueError,
+        '`max_budget_percent_increase` must be non-negative\\.',
+    ):
+      weekly_optimization_grid.WeeklyOptimizationGrid.create(
+          self.budget_optimizer_media_only._analyzer,
+          max_budget_percent_increase=-0.1,
+      )
+
+  def test_create_invalid_max_constraint_variation_raises_error(
+      self,
+  ):
+    with self.assertRaisesRegex(
+        ValueError,
+        '`max_constraint_variation` must be non-negative\\.',
+    ):
+      weekly_optimization_grid.WeeklyOptimizationGrid.create(
+          self.budget_optimizer_media_only._analyzer,
+          max_constraint_variation=-0.1,
+      )
+
+  def test_create_invalid_chains_per_batch_raises_error(self):
+    with self.assertRaisesRegex(
+        ValueError,
+        '`chains_per_batch` must be positive\\.',
+    ):
+      weekly_optimization_grid.WeeklyOptimizationGrid.create(
+          self.budget_optimizer_media_only._analyzer,
+          chains_per_batch=0,
+      )
+
+  @parameterized.named_parameters(
+      dict(testcase_name='one_chain_per_batch', chains_per_batch=1),
+      dict(testcase_name='all_chains_per_batch', chains_per_batch=2),
+      dict(testcase_name='more_than_all_chains_per_batch', chains_per_batch=3),
+  )
+  def test_create_with_chains_per_batch_matches_full_computation(
+      self, chains_per_batch
+  ):
+    for optimizer_instance in (
+        self.budget_optimizer_media_only,
+        self.budget_optimizer_media_and_rf,
+    ):
+      expected_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+          optimizer_instance._analyzer,
+          multiplier_step=0.5,
+          use_posterior=True,
+      )
+      batched_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+          optimizer_instance._analyzer,
+          multiplier_step=0.5,
+          use_posterior=True,
+          chains_per_batch=chains_per_batch,
+      )
+      xr.testing.assert_allclose(
+          batched_grid.incremental_outcome,
+          expected_grid.incremental_outcome,
+      )
+      if expected_grid.rf_incremental_outcome is not None:
+        xr.testing.assert_allclose(
+            batched_grid.rf_incremental_outcome,
+            expected_grid.rf_incremental_outcome,
+        )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='default_dates_default_budget',
+          start_offset=0,
+          end_offset=-1,
+          budget_factor=1.0,
+      ),
+      dict(
+          testcase_name='custom_dates_reduced_budget',
+          start_offset=5,
+          end_offset=-5,
+          budget_factor=0.9,
+      ),
+      dict(
+          testcase_name='custom_dates_increased_budget',
+          start_offset=10,
+          end_offset=-10,
+          budget_factor=1.1,
+      ),
+  )
+  def test_compare_weekly_and_standard_grid_optimization(
+      self, start_offset: int, end_offset: int, budget_factor: float
+  ):
+    times = self.meridian_media_only.input_data.time.to_numpy().tolist()
+    start_date = times[start_offset] if start_offset > 0 else None
+    end_date = times[end_offset] if end_offset < -1 else None
+
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.0001,
+        use_posterior=True,
+        batch_size=10,
+    )
+    assert weekly_grid is not None
+    hist_spend = np.sum(
+        self.budget_optimizer_media_only.create_optimization_grid(
+            start_date=start_date, end_date=end_date
+        ).historical_spend
+    )
+    budget = hist_spend * budget_factor
+
+    results_weekly = None
+    with mock.patch.object(
+        weekly_optimization_grid.WeeklyOptimizationGrid,
+        '_create_grids',
+        wraps=weekly_optimization_grid.WeeklyOptimizationGrid._create_grids,
+        autospec=True,
+    ) as mock_create_grids:
+      grid = weekly_grid.to_optimization_grid(
+          start_date=start_date,
+          end_date=end_date,
+      )
+      results_weekly = self.budget_optimizer_media_only.optimize(
+          optimization_grid=grid,
+          spend_constraint_lower=0.1,
+          spend_constraint_upper=0.1,
+          start_date=start_date,
+          end_date=end_date,
+          budget=budget,
+      )
+      mock_create_grids.assert_called_once()
+    results_standard = self.budget_optimizer_media_only.optimize(
+        spend_constraint_lower=0.1,
+        spend_constraint_upper=0.1,
+        start_date=start_date,
+        end_date=end_date,
+        budget=budget,
+    )
+    _verify_actual_vs_expected_budget_data(
+        results_weekly.optimized_data,
+        results_standard.optimized_data,
+        rtol=0.05,
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='default_dates_default_budget',
+          start_offset=0,
+          end_offset=-1,
+          budget_factor=1.0,
+      ),
+      dict(
+          testcase_name='custom_dates_reduced_budget',
+          start_offset=1,
+          end_offset=-2,
+          budget_factor=0.9,
+      ),
+      dict(
+          testcase_name='custom_dates_increased_budget',
+          start_offset=2,
+          end_offset=-1,
+          budget_factor=1.1,
+      ),
+  )
+  def test_compare_weekly_and_standard_grid_optimization_with_new_data(
+      self, start_offset: int, end_offset: int, budget_factor: float
+  ):
+    model_times = (
+        np.asarray(self.meridian_media_only.input_data.time)
+        .astype(str)
+        .tolist()
+    )
+    new_times = model_times
+    start_date = new_times[start_offset] if start_offset > 0 else None
+    end_date = new_times[end_offset] if end_offset < -1 else None
+    new_data = analyzer.DataTensors(
+        media=self.meridian_media_only.media_tensors.media,
+        media_spend=self.meridian_media_only.media_tensors.media_spend,
+        revenue_per_kpi=self.meridian_media_only.revenue_per_kpi,
+        time=new_times,
+    )
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        new_data=new_data,
+        multiplier_step=0.0001,
+        use_posterior=True,
+        batch_size=10,
+    )
+    assert weekly_grid is not None
+    hist_spend = np.sum(
+        self.budget_optimizer_media_only.create_optimization_grid(
+            new_data=new_data, start_date=start_date, end_date=end_date
+        ).historical_spend
+    )
+    budget = hist_spend * budget_factor
+
+    results_weekly = None
+    with mock.patch.object(
+        weekly_optimization_grid.WeeklyOptimizationGrid,
+        '_create_grids',
+        wraps=weekly_optimization_grid.WeeklyOptimizationGrid._create_grids,
+        autospec=True,
+    ) as mock_create_grids:
+      grid = weekly_grid.to_optimization_grid(
+          start_date=start_date,
+          end_date=end_date,
+      )
+      results_weekly = self.budget_optimizer_media_only.optimize(
+          new_data=new_data,
+          optimization_grid=grid,
+          spend_constraint_lower=0.1,
+          spend_constraint_upper=0.1,
+          start_date=start_date,
+          end_date=end_date,
+          budget=budget,
+      )
+      mock_create_grids.assert_called_once()
+    results_standard = self.budget_optimizer_media_only.optimize(
+        new_data=new_data,
+        spend_constraint_lower=0.1,
+        spend_constraint_upper=0.1,
+        start_date=start_date,
+        end_date=end_date,
+        budget=budget,
+    )
+    _verify_actual_vs_expected_budget_data(
+        results_weekly.optimized_data,
+        results_standard.optimized_data,
+        rtol=0.1,
+    )
+
+  def test_create_not_fitted_model_raises_error(self):
+    with mock.patch.object(
+        self.budget_optimizer_media_only._analyzer.inference_data,
+        'groups',
+        return_value=[],
+        autospec=True,
+    ):
+      with self.assertRaisesRegex(
+          common_errors.NotFittedModelError,
+          'Running budget optimization scenarios requires fitting the model.',
+      ):
+        weekly_optimization_grid.WeeklyOptimizationGrid.create(
+            self.budget_optimizer_media_only._analyzer,
+        )
+
+  def test_create_default_multiplier_step(self):
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        use_posterior=True,
+    )
+    self.assertIsNotNone(weekly_grid)
+    self.assertIsNotNone(weekly_grid.multiplier_step)
+
+  def test_create_prior(self):
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        use_posterior=False,
+    )
+    self.assertIsNotNone(weekly_grid)
+    self.assertFalse(weekly_grid.use_posterior)
+
+  def test_create_no_revenue_per_kpi(self):
+    with mock.patch.object(
+        model.Meridian, '_validate_injected_inference_data', autospec=True
+    ):
+      input_data_non_revenue = (
+          data_test_utils.sample_input_data_non_revenue_no_revenue_per_kpi(
+              n_geos=_N_GEOS,
+              n_times=_N_TIMES,
+              n_media_times=_N_MEDIA_TIMES,
+              n_controls=_N_CONTROLS,
+              n_media_channels=_N_MEDIA_CHANNELS,
+              n_rf_channels=0,
+              seed=0,
+          )
+      )
+      meridian_no_rev = model.Meridian(input_data=input_data_non_revenue)
+    meridian_analyzer = analyzer.Analyzer(
+        model_context=meridian_no_rev.model_context,
+        inference_data=self.inference_data_media_only,
+    )
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        meridian_analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+    )
+    self.assertIsNotNone(weekly_grid)
+
+  def test_create_media_transformer_none(self):
+    new_media_tensors = dataclasses.replace(
+        self.budget_optimizer_media_only._analyzer.model_context.media_tensors,
+        media_transformer=None,
+    )
+    with mock.patch.object(
+        self.budget_optimizer_media_only._analyzer.model_context.__class__,
+        'media_tensors',
+        new_callable=mock.PropertyMock,
+        return_value=new_media_tensors,
+    ):
+      weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+          self.budget_optimizer_media_only._analyzer,
+          multiplier_step=0.5,
+          use_posterior=True,
+      )
+      self.assertIsNotNone(weekly_grid)
+
+  def test_create_grids_channel_spend_zero(self):
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+    )
+    self.assertIsNotNone(weekly_grid)
+
+    # Set spend of first channel to 0
+    zero_spend = weekly_grid.nonoptimized_spend.copy()
+    zero_spend[0, :] = 0.0
+    weekly_grid_zero = dataclasses.replace(
+        weekly_grid, nonoptimized_spend=zero_spend
+    )
+
+    grid = weekly_grid_zero.to_optimization_grid()
+    self.assertIsNotNone(grid)
+
+    spend_grid = grid.spend_grid.values
+    outcome_grid = grid.incremental_outcome_grid.values
+
+    valid_mask_zero_spend = ~np.isnan(spend_grid[:, 0])
+    self.assertTrue(np.any(valid_mask_zero_spend))
+    self.assertTrue(np.any(np.isnan(spend_grid[:, 0])))
+    np.testing.assert_array_equal(outcome_grid[valid_mask_zero_spend, 0], 0.0)
+    np.testing.assert_array_equal(np.isnan(outcome_grid), np.isnan(spend_grid))
+
+  def test_to_optimization_grid_custom_budget_and_constraints(self):
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.1,
+        use_posterior=True,
+    )
+    self.assertIsNotNone(weekly_grid)
+
+    # Valid custom budget and constraints
+    grid = weekly_grid.to_optimization_grid(
+        budget=1000.0,
+        spend_constraint_lower=0.1,
+        spend_constraint_upper=0.1,
+    )
+    self.assertIsNotNone(grid)
+
+    # Constraints exceed grid coverage
+    with self.assertWarnsRegex(
+        UserWarning,
+        'Bounds are not within the grid',
+    ):
+      invalid_grid = weekly_grid.to_optimization_grid(
+          budget=100000.0,
+          spend_constraint_lower=0.1,
+          spend_constraint_upper=0.1,
+      )
+      self.assertIsNone(invalid_grid)
+
+  def test_create_with_start_end_date(self):
+    model_times = (
+        np.asarray(self.meridian_media_only.input_data.time)
+        .astype(str)
+        .tolist()
+    )
+    start_date = model_times[0]
+    end_date = model_times[3]
+    weekly_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    self.assertIsNotNone(weekly_grid)
+    expected_times = model_times[:4]
+    self.assertEqual(weekly_grid.time, expected_times)
+    self.assertEqual(
+        weekly_grid.nonoptimized_spend[c.TIME].data.tolist(), expected_times
+    )
+
+  def test_combine_weekly_grids(self):
+    model_times = (
+        np.asarray(self.meridian_media_only.input_data.time)
+        .astype(str)
+        .tolist()
+    )
+    grid1 = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+        start_date=model_times[0],
+        end_date=model_times[2],
+    )
+    grid2 = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+        start_date=model_times[3],
+        end_date=model_times[5],
+    )
+    combined = weekly_optimization_grid.WeeklyOptimizationGrid.combine(
+        [grid1, grid2]
+    )
+    self.assertIsNotNone(combined)
+    expected_times = model_times[:6]
+    self.assertEqual(combined.time, expected_times)
+    self.assertEqual(
+        combined.nonoptimized_spend[c.TIME].data.tolist(), expected_times
+    )
+
+    # Test empty grids
+    with self.assertRaisesRegex(ValueError, 'must not be empty'):
+      weekly_optimization_grid.WeeklyOptimizationGrid.combine([])
+
+    # Test single grid
+    self.assertEqual(
+        weekly_optimization_grid.WeeklyOptimizationGrid.combine([grid1]), grid1
+    )
+
+    # Test duplicate dates
+    with self.assertRaisesRegex(ValueError, 'duplicate dates'):
+      weekly_optimization_grid.WeeklyOptimizationGrid.combine([grid1, grid1])
+
+    # Test non-contiguous gap
+    grid_gap = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+        start_date=model_times[4],
+        end_date=model_times[5],
+    )
+    with self.assertRaisesRegex(ValueError, 'contiguous'):
+      weekly_optimization_grid.WeeklyOptimizationGrid.combine([grid1, grid_gap])
+
+    # Test mismatched attributes
+    grid_mismatch = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.2,
+        use_posterior=True,
+        start_date=model_times[3],
+        end_date=model_times[5],
+    )
+    with self.assertRaisesRegex(ValueError, 'multiplier_step'):
+      weekly_optimization_grid.WeeklyOptimizationGrid.combine(
+          [grid1, grid_mismatch]
+      )
+
+  def test_combine_three_weekly_grids(self):
+    model_times = (
+        np.asarray(self.meridian_media_only.input_data.time)
+        .astype(str)
+        .tolist()
+    )
+    grid1 = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+        start_date=model_times[0],
+        end_date=model_times[1],
+    )
+    grid2 = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+        start_date=model_times[2],
+        end_date=model_times[3],
+    )
+    grid3 = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_only._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+        start_date=model_times[4],
+        end_date=model_times[5],
+    )
+    combined = weekly_optimization_grid.WeeklyOptimizationGrid.combine(
+        [grid1, grid2, grid3]
+    )
+    self.assertIsNotNone(combined)
+    expected_times = model_times[:6]
+    self.assertEqual(combined.time, expected_times)
+    self.assertEqual(
+        combined.nonoptimized_spend[c.TIME].data.tolist(), expected_times
+    )
+
+  def test_combine_weekly_grids_with_rf(self):
+    model_times = (
+        np.asarray(self.meridian_media_and_rf.input_data.time)
+        .astype(str)
+        .tolist()
+    )
+    grid1 = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_and_rf._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+        start_date=model_times[0],
+        end_date=model_times[2],
+    )
+    grid2 = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_and_rf._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+        start_date=model_times[3],
+        end_date=model_times[5],
+    )
+    self.assertIsNotNone(grid1.rf_incremental_outcome)
+    self.assertIsNotNone(grid2.rf_incremental_outcome)
+
+    combined = weekly_optimization_grid.WeeklyOptimizationGrid.combine(
+        [grid1, grid2]
+    )
+    self.assertIsNotNone(combined)
+    expected_times = model_times[:6]
+    self.assertEqual(combined.time, expected_times)
+    self.assertEqual(
+        combined.nonoptimized_spend[c.TIME].data.tolist(), expected_times
+    )
+    assert combined.rf_incremental_outcome is not None
+    assert grid1.rf_incremental_outcome is not None
+    assert grid2.rf_incremental_outcome is not None
+    self.assertEqual(
+        combined.rf_incremental_outcome[c.TIME].data.tolist(), expected_times
+    )
+    xr.testing.assert_allclose(
+        combined.rf_incremental_outcome.isel({c.TIME: slice(0, 3)}),
+        grid1.rf_incremental_outcome,
+    )
+
+    # Combined grid resolves the same optimal frequency as a single grid
+    # computed over the full period.
+    full_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        self.budget_optimizer_media_and_rf._analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+        start_date=model_times[0],
+        end_date=model_times[5],
+    )
+    combined_opt_grid = combined.to_optimization_grid()
+    full_opt_grid = full_grid.to_optimization_grid()
+    assert combined_opt_grid is not None
+    assert full_opt_grid is not None
+    assert combined_opt_grid.optimal_frequency is not None
+    assert full_opt_grid.optimal_frequency is not None
+    np.testing.assert_allclose(
+        combined_opt_grid.optimal_frequency,
+        full_opt_grid.optimal_frequency,
+    )
+
+    # Test mismatched rf_incremental_outcome presence.
+    grid2_no_rf = dataclasses.replace(grid2, rf_incremental_outcome=None)
+    with self.assertRaisesRegex(
+        ValueError, 'different rf_incremental_outcome presence'
+    ):
+      weekly_optimization_grid.WeeklyOptimizationGrid.combine(
+          [grid1, grid2_no_rf]
+      )
+
+    # Test mismatched frequency grids.
+    grid2_diff_freq = dataclasses.replace(
+        grid2,
+        rf_incremental_outcome=grid2.rf_incremental_outcome.assign_coords({
+            c.FREQUENCY: grid2.rf_incremental_outcome[c.FREQUENCY].values + 0.05
+        }),
+    )
+    with self.assertRaisesRegex(ValueError, 'different frequency grids'):
+      weekly_optimization_grid.WeeklyOptimizationGrid.combine(
+          [grid1, grid2_diff_freq]
+      )
+
+  @parameterized.named_parameters(
+      dict(testcase_name='geo', is_national=False),
+      dict(testcase_name='national', is_national=True),
+  )
+  def test_create_avoids_float32_cancellation(self, is_national: bool):
+    if is_national:
+      dataset = data_test_utils.random_dataset(
+          n_geos=1,
+          n_times=_N_TIMES,
+          n_media_times=_N_MEDIA_TIMES,
+          n_controls=_N_CONTROLS,
+          n_media_channels=_N_MEDIA_CHANNELS,
+          seed=0,
+          constant_population_value=1.0,
+      )
+      input_data_national = data_test_utils.sample_input_data_from_dataset(
+          dataset, c.NON_REVENUE
+      )
+      inference_data_national = az.InferenceData(
+          prior=xr.open_dataset(
+              os.path.join(_TEST_DATA_DIR, 'sample_prior_national.nc')
+          ),
+          posterior=xr.open_dataset(
+              os.path.join(_TEST_DATA_DIR, 'sample_posterior_national.nc')
+          ),
+      )
+      with mock.patch.object(
+          model.Meridian, '_validate_injected_inference_data', autospec=True
+      ):
+        meridian_national = model.Meridian(input_data=input_data_national)
+      self.enter_context(
+          mock.patch.object(
+              analyzer.Analyzer,
+              'inference_data',
+              new=property(lambda unused_self: inference_data_national),
+          )
+      )
+      target_analyzer = analyzer.Analyzer(
+          model_context=meridian_national.model_context,
+          inference_data=inference_data_national,
+      )
+    else:
+      target_analyzer = self.budget_optimizer_media_only._analyzer
+
+    model_context = target_analyzer.model_context
+    baseline_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+        target_analyzer,
+        multiplier_step=0.5,
+        use_posterior=True,
+        use_kpi=True,
+    )
+
+    large_mean_transformer = copy.copy(model_context.kpi_transformer)
+    large_mean_transformer._population_scaled_mean = backend.to_tensor(
+        1e9, dtype=np.float32
+    )
+
+    with mock.patch.object(
+        model_context, 'kpi_transformer', large_mean_transformer
+    ):
+      large_mean_grid = weekly_optimization_grid.WeeklyOptimizationGrid.create(
+          target_analyzer,
+          multiplier_step=0.5,
+          use_posterior=True,
+          use_kpi=True,
+      )
+
+    xr.testing.assert_allclose(
+        large_mean_grid.incremental_outcome,
+        baseline_grid.incremental_outcome,
+        rtol=1e-6,
+        atol=0.0,
+    )
+
+
+if __name__ == '__main__':
+  absltest.main()

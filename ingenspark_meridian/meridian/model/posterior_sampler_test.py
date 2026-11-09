@@ -1,0 +1,3606 @@
+# Copyright 2026 The Meridian Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import collections
+from typing import cast
+from unittest import mock
+import warnings
+
+from absl.testing import absltest
+from absl.testing import parameterized
+import arviz as az
+from ingenspark_meridian.meridian import backend
+from ingenspark_meridian.meridian import constants
+from ingenspark_meridian.meridian.backend import test_utils
+from ingenspark_meridian.meridian.data import test_utils as data_test_utils
+from ingenspark_meridian.meridian.model import equations
+from ingenspark_meridian.meridian.model import model
+from ingenspark_meridian.meridian.model import model_test_data
+from ingenspark_meridian.meridian.model import posterior_sampler
+from ingenspark_meridian.meridian.model import prior_distribution
+from ingenspark_meridian.meridian.model import progress
+from ingenspark_meridian.meridian.model import spec
+import numpy as np
+
+
+def _no_op_progress_callback(
+    snapshot: progress.PosteriorSamplingProgress,
+) -> None:
+  del snapshot
+
+
+class PosteriorMCMCSamplerTest(
+    test_utils.MeridianTestCase,
+    model_test_data.WithInputDataSamples,
+):
+
+  input_data_samples = model_test_data.WithInputDataSamples
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    model_test_data.WithInputDataSamples.setup()
+
+  def setUp(self):
+    super().setUp()
+    self.enter_context(
+        mock.patch.object(
+            model.Meridian,
+            "_run_model_fitting_guardrail",
+            autospec=True,
+            return_value=None,
+        )
+    )
+
+  def _assert_seeds_equal(self, seed1, seed2):
+    if backend.config.get_backend() == backend.config.Backend.JAX:
+      self.assertEqual(seed1, seed2)
+    else:
+      test_utils.assert_seed_allequal(seed1, seed2)
+
+  def _assert_seeds_not_equal(self, seed1, seed2):
+    if backend.config.get_backend() == backend.config.Backend.JAX:
+      self.assertNotEqual(seed1, seed2)
+    else:
+      test_utils.assert_seed_not_allequal(seed1, seed2)
+
+  def test_get_joint_dist_zeros(self):
+    zero = backend.np_float_dtype(0.0)
+    model_spec = spec.ModelSpec(
+        prior=prior_distribution.PriorDistribution(
+            knot_values=backend.tfd.Deterministic(zero),
+            tau_g_excl_baseline=backend.tfd.Deterministic(zero),
+            beta_m=backend.tfd.Deterministic(zero),
+            beta_rf=backend.tfd.Deterministic(zero),
+            eta_m=backend.tfd.Deterministic(zero),
+            eta_rf=backend.tfd.Deterministic(zero),
+            gamma_c=backend.tfd.Deterministic(zero),
+            xi_c=backend.tfd.Deterministic(zero),
+            alpha_m=backend.tfd.Deterministic(zero),
+            alpha_rf=backend.tfd.Deterministic(zero),
+            sigma=backend.tfd.Deterministic(zero),
+            roi_m=backend.tfd.Deterministic(zero),
+            roi_rf=backend.tfd.Deterministic(zero),
+        ),
+        media_effects_dist=constants.MEDIA_EFFECTS_NORMAL,
+    )
+    input_data = self.short_input_data_with_media_and_rf
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+    sample = (
+        meridian.posterior_sampler_callable._get_joint_dist_unpinned().sample(
+            self._N_DRAWS, seed=self.get_next_rng_seed_or_key()
+        )
+    )
+    test_utils.assert_allequal(
+        sample.y,
+        backend.zeros(shape=(self._N_DRAWS, self._N_GEOS, self._N_TIMES_SHORT)),
+    )
+
+  def test_get_joint_dist_zeros_no_controls_data(self):
+    zero = backend.np_float_dtype(0.0)
+    model_spec = spec.ModelSpec(
+        prior=prior_distribution.PriorDistribution(
+            knot_values=backend.tfd.Deterministic(zero),
+            tau_g_excl_baseline=backend.tfd.Deterministic(zero),
+            beta_m=backend.tfd.Deterministic(zero),
+            beta_rf=backend.tfd.Deterministic(zero),
+            eta_m=backend.tfd.Deterministic(zero),
+            eta_rf=backend.tfd.Deterministic(zero),
+            gamma_c=backend.tfd.Deterministic(zero),
+            xi_c=backend.tfd.Deterministic(zero),
+            alpha_m=backend.tfd.Deterministic(zero),
+            alpha_rf=backend.tfd.Deterministic(zero),
+            sigma=backend.tfd.Deterministic(zero),
+            roi_m=backend.tfd.Deterministic(zero),
+            roi_rf=backend.tfd.Deterministic(zero),
+        ),
+        media_effects_dist=constants.MEDIA_EFFECTS_NORMAL,
+    )
+    input_data = self.short_input_data_with_media_only_no_controls
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+    sample = (
+        meridian.posterior_sampler_callable._get_joint_dist_unpinned().sample(
+            self._N_DRAWS, seed=self.get_next_rng_seed_or_key()
+        )
+    )
+    test_utils.assert_allequal(
+        sample.y,
+        backend.zeros(shape=(self._N_DRAWS, self._N_GEOS, self._N_TIMES_SHORT)),
+    )
+
+    # Without controls data, controls-related distributions should be absent.
+    with self.assertRaises(AttributeError):
+      _ = sample.gamma_gc
+    with self.assertRaises(AttributeError):
+      _ = sample.xi_c
+    with self.assertRaises(AttributeError):
+      _ = sample.gamma_gc_dev
+    with self.assertRaises(AttributeError):
+      _ = sample.gamma_gc
+
+  def test_get_joint_dist_sampling_structure(self):
+    """Verifies that the sampling graph excludes deterministic variables."""
+    model_spec = spec.ModelSpec(
+        # Use ROI priors to ensure beta_m is deterministic (calculated)
+        media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+        rf_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+    )
+    input_data = self.short_input_data_with_media_and_rf
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+
+    # Get the sampling-optimized distribution (unpinned for inspection)
+    sampling_dist = (
+        meridian.posterior_sampler_callable._get_joint_dist_sampling_unpinned()
+    )
+
+    sample = sampling_dist.sample(seed=self.get_next_rng_seed_or_key())
+    sample_dict = sample._asdict()
+
+    # Latent variables MUST be present
+    with self.subTest("latent_variables_present"):
+      self.assertIn(constants.ALPHA_M, sample_dict)
+      self.assertIn(constants.SIGMA, sample_dict)
+      self.assertIn(constants.KNOT_VALUES, sample_dict)
+      self.assertIn(constants.ROI_M, sample_dict)  # ROI is latent
+      self.assertIn(constants.BETA_GM_DEV, sample_dict)
+
+    # Deterministic variables MUST be absent (they are computed in full graph)
+    with self.subTest("deterministic_variables_absent"):
+      self.assertNotIn(constants.BETA_M, sample_dict)  # Calculated from ROI
+      self.assertNotIn(constants.BETA_GM, sample_dict)
+      self.assertNotIn(constants.TAU_G, sample_dict)
+      self.assertNotIn(constants.MU_T, sample_dict)
+      self.assertNotIn(constants.GAMMA_GC, sample_dict)
+
+    with self.subTest("y_is_present"):
+      self.assertIn("y", sample_dict)
+
+  def test_sampling_log_prob_matches_full_distribution(self):
+    """Verifies that sampling and full graphs produce the same log probability."""
+    model_spec = spec.ModelSpec(
+        media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+    )
+    input_data = self.short_input_data_with_media_only
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+    sampler = meridian.posterior_sampler_callable
+
+    # Generate a valid state from the full unpinned distribution.
+    # This state includes both latent and deterministic variables, ensuring
+    # consistency for the subsequent log_prob check.
+    full_unpinned = sampler._get_joint_dist_unpinned()
+    full_sample = full_unpinned.sample(seed=self.get_next_rng_seed_or_key())
+    full_state = full_sample._asdict()
+
+    # Extract the subset of parameters required for the sampling distribution.
+    # The sampling graph is optimized to operate solely on latent variables.
+    sampling_unpinned = sampler._get_joint_dist_sampling_unpinned()
+    sampling_keys = sampling_unpinned.dtype._fields
+    sampling_state = {k: full_state[k] for k in sampling_keys}
+
+    # Remove the observed variable 'y' from the state dictionaries.
+    # The distributions are already conditioned on the observed data via
+    # `experimental_pin`, so 'y' should not be passed as an input parameter.
+    del full_state["y"]
+    del sampling_state["y"]
+
+    # Calculate and compare log probabilities.
+    full_dist = sampler._get_joint_dist()
+    log_prob_full = full_dist.log_prob(full_state)
+
+    sampling_dist = sampler._get_joint_dist_sampling()
+    log_prob_sampling = sampling_dist.log_prob(sampling_state)
+
+    # The sampling graph (latents only) and full graph (latents +
+    # deterministics) must yield mathematically identical log probabilities.
+    test_utils.assert_allclose(log_prob_full, log_prob_sampling, atol=1e-5)
+
+  def test_get_joint_dist_with_holdout_id_log_prob(self):
+    """Verifies that held-out observations do not contribute to log_prob.
+
+    For a holdout mask `A`, the likelihood term of the pinned joint distribution
+    only sums over the observations not in `A`. Hence for complementary masks
+    `A` and `B`, `lp(A) + lp(B) == lp(no holdout) + lp(all held out)`, and with
+    every observation held out, the log_prob equals the prior log_prob alone.
+    """
+    input_data = self.short_input_data_with_media_only
+    shape = (self._N_GEOS, self._N_TIMES_SHORT)
+    rng = np.random.default_rng(0)
+    mask_a = rng.random(shape) < 0.5
+    mask_b = ~mask_a
+
+    def _sampler(holdout_id):
+      with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        model_spec = spec.ModelSpec(holdout_id=holdout_id)
+      return model.Meridian(
+          input_data=input_data, model_spec=model_spec
+      ).posterior_sampler_callable
+
+    sampler_none = _sampler(None)
+    sampler_a = _sampler(mask_a)
+    sampler_b = _sampler(mask_b)
+    sampler_all = _sampler(np.ones(shape, dtype=bool))
+
+    state = sampler_none._get_joint_dist_unpinned().sample(
+        seed=self.get_next_rng_seed_or_key()
+    )._asdict()
+    del state["y"]
+
+    lp_none = sampler_none._get_joint_dist().log_prob(state)
+    lp_a = sampler_a._get_joint_dist().log_prob(state)
+    lp_b = sampler_b._get_joint_dist().log_prob(state)
+    lp_all = sampler_all._get_joint_dist().log_prob(state)
+
+    # With everything held out, only the prior terms remain.
+    unpinned = sampler_none._get_joint_dist_unpinned()
+    prior_parts = unpinned.log_prob_parts(
+        **state, y=sampler_none._model_context.kpi_scaled
+    )
+    lp_prior = backend.reduce_sum(
+        backend.stack([
+            v for k, v in prior_parts._asdict().items() if k != "y"
+        ])
+    )
+    test_utils.assert_allclose(lp_all, lp_prior, rtol=1e-5, atol=1e-3)
+    test_utils.assert_allclose(
+        lp_a + lp_b, lp_none + lp_all, rtol=1e-5, atol=1e-3
+    )
+    # A partial holdout must actually change the log_prob.
+    self.assertFalse(np.allclose(lp_a, lp_none))
+    # Sampling graph agrees with the full graph under holdout.
+    sampling_keys = (
+        sampler_a._get_joint_dist_sampling_unpinned().dtype._fields
+    )
+    sampling_state = {k: state[k] for k in sampling_keys if k != "y"}
+    test_utils.assert_allclose(
+        sampler_a._get_joint_dist_sampling().log_prob(sampling_state),
+        lp_a,
+        atol=1e-5,
+    )
+
+  def test_get_joint_dist_sampling_structure_with_allows_negative_aggregate_baseline_false(
+      self,
+  ):
+    """Verifies that the sampling graph uses rotated knot latents."""
+    model_spec = spec.ModelSpec(
+        allows_negative_aggregate_baseline=False,
+        media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+    )
+    input_data = self.short_input_data_with_media_only
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+
+    sampling_dist = (
+        meridian.posterior_sampler_callable._get_joint_dist_sampling_unpinned()
+    )
+    sample = sampling_dist.sample(seed=self.get_next_rng_seed_or_key())
+    sample_dict = sample._asdict()
+
+    # Rotated latent parameters must be present.
+    with self.subTest("rotated_knot_latents_present"):
+      self.assertIn(constants.ROTATED_KNOT_0, sample_dict)
+      self.assertIn(constants.ROTATED_KNOT_REST, sample_dict)
+      self.assertIn(constants.SIGMA, sample_dict)
+
+    # Deterministic knot values and mu_t must be absent in sampling graph.
+    with self.subTest("deterministic_knot_variables_absent"):
+      self.assertNotIn(constants.KNOT_VALUES, sample_dict)
+      self.assertNotIn(constants.MU_T, sample_dict)
+
+    # Full unpinned distribution includes both rotated latents and
+    # deterministics.
+    full_dist = meridian.posterior_sampler_callable._get_joint_dist_unpinned()
+    full_sample = full_dist.sample(seed=self.get_next_rng_seed_or_key())
+    full_sample_dict = full_sample._asdict()
+    with self.subTest("full_distribution_includes_rotated_and_knots"):
+      self.assertIn(constants.ROTATED_KNOT_0, full_sample_dict)
+      self.assertIn(constants.ROTATED_KNOT_REST, full_sample_dict)
+      self.assertIn(constants.KNOT_VALUES, full_sample_dict)
+      self.assertIn(constants.MU_T, full_sample_dict)
+
+  def test_sampling_log_prob_matches_full_distribution_with_allows_negative_aggregate_baseline_false(
+      self,
+  ):
+    """Verifies sampling and full graphs produce identical log prob."""
+    model_spec = spec.ModelSpec(
+        allows_negative_aggregate_baseline=False,
+        media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+    )
+    input_data = self.short_input_data_with_media_only
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+    sampler = meridian.posterior_sampler_callable
+
+    full_unpinned = sampler._get_joint_dist_unpinned()
+    full_sample = full_unpinned.sample(seed=self.get_next_rng_seed_or_key())
+    full_state = full_sample._asdict()
+
+    sampling_unpinned = sampler._get_joint_dist_sampling_unpinned()
+    sampling_keys = sampling_unpinned.dtype._fields
+    sampling_state = {k: full_state[k] for k in sampling_keys}
+
+    del full_state["y"]
+    del sampling_state["y"]
+
+    full_dist = sampler._get_joint_dist()
+    log_prob_full = full_dist.log_prob(full_state)
+
+    sampling_dist = sampler._get_joint_dist_sampling()
+    log_prob_sampling = sampling_dist.log_prob(sampling_state)
+
+    test_utils.assert_allclose(log_prob_full, log_prob_sampling, atol=1e-5)
+
+  def test_sampling_bijector_and_latent_dtypes_with_allows_negative_aggregate_baseline_false(
+      self,
+  ):
+    """Verifies uniform latent dtypes and bijector functions without error."""
+    model_spec = spec.ModelSpec(
+        allows_negative_aggregate_baseline=False,
+        media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+        knots=5,
+    )
+    input_data = self.short_input_data_with_media_only
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+    sampler = meridian.posterior_sampler_callable
+    sampling_dist = sampler._get_joint_dist_sampling_unpinned()
+    sample = sampling_dist.sample(seed=self.get_next_rng_seed_or_key())
+    sample_dict = sample._asdict()
+
+    for k, v in sample_dict.items():
+      self.assertEqual(
+          v.dtype,
+          backend.float_dtype,
+          f"Latent '{k}' has dtype {v.dtype} but expected"
+          f" {backend.float_dtype}",
+      )
+
+    pinned_sampling_dist = sampler._get_joint_dist_sampling()
+    bijector = pinned_sampling_dist.experimental_default_event_space_bijector()
+    latent_sample = {k: v for k, v in sample_dict.items() if k != "y"}
+    ldj = bijector.inverse_log_det_jacobian(
+        latent_sample, event_ndims=bijector.inverse_min_event_ndims
+    )
+    self.assertIsNotNone(ldj)
+
+  def test_get_joint_dist_allows_negative_aggregate_baseline_false_population_scaled_non_media(
+      self,
+  ):
+    """Verifies the truncation binds at zero with population-scaled non-media.
+
+    Geo and control coefficients are fixed at zero, and `gamma_gn` is fixed so
+    that the non-media treatments at their population-scaled baseline values
+    offset the mean population-scaled KPI. The aggregate baseline is then
+    proportional to the outcome-weighted sum of `mu_t`, which the constraint
+    must truncate exactly at zero.
+    """
+    input_data = self.short_input_data_non_media_and_organic
+    non_media_treatments = input_data.non_media_treatments
+    revenue_per_kpi = input_data.revenue_per_kpi
+    assert non_media_treatments is not None and revenue_per_kpi is not None
+    population = np.asarray(input_data.population)[:, np.newaxis]
+    kpi_scaled = np.asarray(input_data.kpi) / population
+    non_media_scaled = np.asarray(non_media_treatments) / population[..., None]
+    # Default (minimum) baseline value of each non-media channel, normalized.
+    non_media_baseline = (
+        non_media_scaled.min(axis=(0, 1)) - non_media_scaled.mean(axis=(0, 1))
+    ) / non_media_scaled.std(axis=(0, 1))
+    gamma_n = -kpi_scaled.mean() / kpi_scaled.std() / np.sum(non_media_baseline)
+    zero = backend.np_float_dtype(0.0)
+    model_spec = spec.ModelSpec(
+        allows_negative_aggregate_baseline=False,
+        population_scaled_non_media_channels=[
+            str(channel)
+            for channel in non_media_treatments[
+                constants.NON_MEDIA_CHANNEL
+            ].values
+        ],
+        non_media_treatments_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+        prior=prior_distribution.PriorDistribution(
+            tau_g_excl_baseline=backend.tfd.Deterministic(zero),
+            gamma_c=backend.tfd.Deterministic(zero),
+            xi_c=backend.tfd.Deterministic(zero),
+            gamma_n=backend.tfd.Deterministic(backend.np_float_dtype(gamma_n)),
+            xi_n=backend.tfd.Deterministic(zero),
+        ),
+    )
+    meridian = model.Meridian(input_data=input_data, model_spec=model_spec)
+    sample = (
+        meridian.posterior_sampler_callable._get_joint_dist_unpinned().sample(
+            200, seed=self.get_next_rng_seed_or_key()
+        )
+    )
+
+    mu_t = np.asarray(sample.mu_t)  # (n_draws, n_times)
+    outcome_weights = population * np.asarray(revenue_per_kpi)
+    aggregate_baseline = np.einsum("gt,dt->d", outcome_weights, mu_t)
+    median = np.median(aggregate_baseline)
+    self.assertGreaterEqual(np.min(aggregate_baseline), -1e-3 * median)
+    self.assertLess(np.min(aggregate_baseline), 0.2 * median)
+
+  @parameterized.product(
+      paid_media_prior_type=[
+          constants.TREATMENT_PRIOR_TYPE_ROI,
+          constants.TREATMENT_PRIOR_TYPE_MROI,
+          constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+      ],
+      media_effects_dist=[
+          constants.MEDIA_EFFECTS_NORMAL,
+          constants.MEDIA_EFFECTS_LOG_NORMAL,
+      ],
+  )
+  def test_get_joint_dist_with_log_prob_media_only(
+      self,
+      paid_media_prior_type: str,
+      media_effects_dist: str,
+  ):
+    model_spec = spec.ModelSpec(
+        media_prior_type=paid_media_prior_type,
+        rf_prior_type=paid_media_prior_type,
+        media_effects_dist=media_effects_dist,
+    )
+    input_data = self.short_input_data_with_media_only
+    meridian = model.Meridian(
+        model_spec=model_spec,
+        input_data=input_data,
+    )
+
+    # Take a single draw of all parameters from the prior distribution.
+    par_structtuple = (
+        meridian.posterior_sampler_callable._get_joint_dist_unpinned().sample(
+            1, seed=self.get_next_rng_seed_or_key()
+        )
+    )
+    par = par_structtuple._asdict()
+
+    # Note that "y" is a draw from the prior predictive (transformed) outcome
+    # distribution. We drop it because "y" is already "pinned" in
+    # meridian._get_joint_dist() and is not actually a parameter.
+    del par["y"]
+
+    # Note that the actual (transformed) outcome data is "pinned" as "y".
+    log_prob_parts_structtuple = (
+        meridian.posterior_sampler_callable._get_joint_dist().log_prob_parts(
+            par
+        )
+    )
+    log_prob_parts = {
+        k: v._asdict() for k, v in log_prob_parts_structtuple._asdict().items()
+    }
+
+    derived_params = [
+        constants.BETA_GM,
+        constants.GAMMA_GC,
+        constants.MU_T,
+        constants.TAU_G,
+    ]
+    prior_distribution_params = [
+        constants.KNOT_VALUES,
+        constants.ETA_M,
+        constants.GAMMA_C,
+        constants.XI_C,
+        constants.ALPHA_M,
+        constants.EC_M,
+        constants.SLOPE_M,
+        constants.SIGMA,
+    ]
+
+    if paid_media_prior_type == constants.TREATMENT_PRIOR_TYPE_ROI:
+      derived_params.append(constants.BETA_M)
+      prior_distribution_params.append(constants.ROI_M)
+    elif paid_media_prior_type == constants.TREATMENT_PRIOR_TYPE_MROI:
+      derived_params.append(constants.BETA_M)
+      prior_distribution_params.append(constants.MROI_M)
+    else:
+      prior_distribution_params.append(constants.BETA_M)
+
+    # Parameters that are derived from other parameters via Deterministic()
+    # should have zero contribution to log_prob.
+    for parname in derived_params:
+      test_utils.assert_allequal(log_prob_parts["unpinned"][parname][0], 0)
+
+    prior_distribution_logprobs = {}
+    for parname in prior_distribution_params:
+      prior_distribution_logprobs[parname] = backend.reduce_sum(
+          getattr(meridian.prior_broadcast, parname).log_prob(par[parname])
+      )
+      test_utils.assert_allclose(
+          prior_distribution_logprobs[parname],
+          log_prob_parts["unpinned"][parname][0],
+      )
+
+    coef_params = [
+        constants.BETA_GM_DEV,
+        constants.GAMMA_GC_DEV,
+    ]
+    coef_logprobs = {}
+    for parname in coef_params:
+      coef_logprobs[parname] = backend.reduce_sum(
+          backend.tfd.Normal(
+              backend.np_float_dtype(0), backend.np_float_dtype(1)
+          ).log_prob(par[parname])
+      )
+      test_utils.assert_allclose(
+          coef_logprobs[parname], log_prob_parts["unpinned"][parname][0]
+      )
+    transformed_media = meridian.adstock_hill_media(
+        media=meridian.media_tensors.media_scaled,  # pyrefly: ignore[bad-argument-type]
+        alpha=par[constants.ALPHA_M],
+        ec=par[constants.EC_M],
+        slope=par[constants.SLOPE_M],
+        decay_functions=meridian.adstock_decay_spec.media,
+    )[0, :, :, :]
+    beta_m = par[constants.BETA_GM][0, :, :]
+    y_means = (
+        par[constants.TAU_G][0, :, None]
+        + par[constants.MU_T][0, None, :]
+        + backend.einsum("gtm,gm->gt", transformed_media, beta_m)
+        + backend.einsum(
+            "gtc,gc->gt",
+            meridian.controls_scaled,
+            par[constants.GAMMA_GC][0, :, :],
+        )
+    )
+    y_means_logprob = backend.reduce_sum(
+        backend.tfd.Normal(y_means, par[constants.SIGMA]).log_prob(
+            meridian.kpi_scaled
+        )
+    )
+    test_utils.assert_allclose(
+        y_means_logprob, log_prob_parts["pinned"]["y"][0]
+    )
+
+    tau_g_logprob = backend.reduce_sum(
+        getattr(
+            meridian.prior_broadcast, constants.TAU_G_EXCL_BASELINE
+        ).log_prob(par[constants.TAU_G_EXCL_BASELINE])
+    )
+    test_utils.assert_allclose(
+        tau_g_logprob,
+        log_prob_parts["unpinned"][constants.TAU_G_EXCL_BASELINE][0],
+    )
+
+    posterior_unnormalized_logprob = (
+        sum(prior_distribution_logprobs.values())
+        + sum(coef_logprobs.values())
+        + y_means_logprob
+        + tau_g_logprob
+    )
+    test_utils.assert_allclose(
+        posterior_unnormalized_logprob,
+        meridian.posterior_sampler_callable._get_joint_dist().log_prob(par)[0],
+    )
+
+  @parameterized.product(
+      paid_media_prior_type=[
+          constants.TREATMENT_PRIOR_TYPE_ROI,
+          constants.TREATMENT_PRIOR_TYPE_MROI,
+          constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+      ],
+      media_effects_dist=[
+          constants.MEDIA_EFFECTS_NORMAL,
+          constants.MEDIA_EFFECTS_LOG_NORMAL,
+      ],
+  )
+  def test_get_joint_dist_with_log_prob_rf_only(
+      self,
+      paid_media_prior_type: str,
+      media_effects_dist: str,
+  ):
+    model_spec = spec.ModelSpec(
+        rf_prior_type=paid_media_prior_type,
+        media_effects_dist=media_effects_dist,
+    )
+    input_data = self.short_input_data_with_rf_only
+    meridian = model.Meridian(
+        model_spec=model_spec,
+        input_data=input_data,
+    )
+
+    # Take a single draw of all parameters from the prior distribution.
+    par_structtuple = (
+        meridian.posterior_sampler_callable._get_joint_dist_unpinned().sample(
+            1, seed=self.get_next_rng_seed_or_key()
+        )
+    )
+    par = par_structtuple._asdict()
+
+    # Note that "y" is a draw from the prior predictive (transformed) outcome
+    # distribution. We drop it because "y" is already "pinned" in
+    # meridian._get_joint_dist() and is not actually a parameter.
+    del par["y"]
+
+    # Note that the actual (transformed) outcome data is "pinned" as "y".
+    log_prob_parts_structtuple = (
+        meridian.posterior_sampler_callable._get_joint_dist().log_prob_parts(
+            par
+        )
+    )
+    log_prob_parts = {
+        k: v._asdict() for k, v in log_prob_parts_structtuple._asdict().items()
+    }
+
+    derived_params = [
+        constants.BETA_GRF,
+        constants.GAMMA_GC,
+        constants.MU_T,
+        constants.TAU_G,
+    ]
+    prior_distribution_params = [
+        constants.KNOT_VALUES,
+        constants.ETA_RF,
+        constants.GAMMA_C,
+        constants.XI_C,
+        constants.ALPHA_RF,
+        constants.EC_RF,
+        constants.SLOPE_RF,
+        constants.SIGMA,
+    ]
+
+    if paid_media_prior_type == constants.TREATMENT_PRIOR_TYPE_ROI:
+      derived_params.append(constants.BETA_RF)
+      prior_distribution_params.append(constants.ROI_RF)
+    elif paid_media_prior_type == constants.TREATMENT_PRIOR_TYPE_MROI:
+      derived_params.append(constants.BETA_RF)
+      prior_distribution_params.append(constants.MROI_RF)
+    else:
+      prior_distribution_params.append(constants.BETA_RF)
+
+    # Parameters that are derived from other parameters via Deterministic()
+    # should have zero contribution to log_prob.
+    for parname in derived_params:
+      test_utils.assert_allequal(log_prob_parts["unpinned"][parname][0], 0)
+
+    prior_distribution_logprobs = {}
+    for parname in prior_distribution_params:
+      prior_distribution_logprobs[parname] = backend.reduce_sum(
+          getattr(meridian.prior_broadcast, parname).log_prob(par[parname])
+      )
+      test_utils.assert_allclose(
+          prior_distribution_logprobs[parname],
+          log_prob_parts["unpinned"][parname][0],
+      )
+
+    coef_params = [
+        constants.BETA_GRF_DEV,
+        constants.GAMMA_GC_DEV,
+    ]
+    coef_logprobs = {}
+    for parname in coef_params:
+      coef_logprobs[parname] = backend.reduce_sum(
+          backend.tfd.Normal(
+              backend.np_float_dtype(0), backend.np_float_dtype(1)
+          ).log_prob(par[parname])
+      )
+      test_utils.assert_allclose(
+          coef_logprobs[parname], log_prob_parts["unpinned"][parname][0]
+      )
+    transformed_reach = meridian.adstock_hill_rf(
+        reach=meridian.rf_tensors.reach_scaled,  # pyrefly: ignore[bad-argument-type]
+        frequency=meridian.rf_tensors.frequency,  # pyrefly: ignore[bad-argument-type]
+        alpha=par[constants.ALPHA_RF],
+        ec=par[constants.EC_RF],
+        slope=par[constants.SLOPE_RF],
+        decay_functions=meridian.adstock_decay_spec.rf,
+    )[0, :, :, :]
+    beta_rf = par[constants.BETA_GRF][0, :, :]
+    y_means = (
+        par[constants.TAU_G][0, :, None]
+        + par[constants.MU_T][0, None, :]
+        + backend.einsum("gtm,gm->gt", transformed_reach, beta_rf)
+        + backend.einsum(
+            "gtc,gc->gt",
+            meridian.controls_scaled,
+            par[constants.GAMMA_GC][0, :, :],
+        )
+    )
+    y_means_logprob = backend.reduce_sum(
+        backend.tfd.Normal(y_means, par[constants.SIGMA]).log_prob(
+            meridian.kpi_scaled
+        )
+    )
+    test_utils.assert_allclose(
+        y_means_logprob, log_prob_parts["pinned"]["y"][0]
+    )
+
+    tau_g_logprob = backend.reduce_sum(
+        getattr(
+            meridian.prior_broadcast, constants.TAU_G_EXCL_BASELINE
+        ).log_prob(par[constants.TAU_G_EXCL_BASELINE])
+    )
+    test_utils.assert_allclose(
+        tau_g_logprob,
+        log_prob_parts["unpinned"][constants.TAU_G_EXCL_BASELINE][0],
+    )
+
+    posterior_unnormalized_logprob = (
+        sum(prior_distribution_logprobs.values())
+        + sum(coef_logprobs.values())
+        + y_means_logprob
+        + tau_g_logprob
+    )
+    test_utils.assert_allclose(
+        posterior_unnormalized_logprob,
+        meridian.posterior_sampler_callable._get_joint_dist().log_prob(par)[0],
+    )
+
+  @parameterized.product(
+      paid_media_prior_type=[
+          constants.TREATMENT_PRIOR_TYPE_ROI,
+          constants.TREATMENT_PRIOR_TYPE_MROI,
+          constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+      ],
+      media_effects_dist=[
+          constants.MEDIA_EFFECTS_NORMAL,
+          constants.MEDIA_EFFECTS_LOG_NORMAL,
+      ],
+  )
+  def test_get_joint_dist_with_log_prob_media_and_rf(
+      self,
+      paid_media_prior_type: str,
+      media_effects_dist: str,
+  ):
+    model_spec = spec.ModelSpec(
+        media_prior_type=paid_media_prior_type,
+        rf_prior_type=paid_media_prior_type,
+        media_effects_dist=media_effects_dist,
+    )
+    input_data = self.short_input_data_with_media_and_rf
+    meridian = model.Meridian(
+        model_spec=model_spec,
+        input_data=input_data,
+    )
+
+    # Take a single draw of all parameters from the prior distribution.
+    par_structtuple = (
+        meridian.posterior_sampler_callable._get_joint_dist_unpinned().sample(
+            1, seed=self.get_next_rng_seed_or_key()
+        )
+    )
+    par = par_structtuple._asdict()
+
+    # Note that "y" is a draw from the prior predictive (transformed) outcome
+    # distribution. We drop it because "y" is already "pinned" in
+    # meridian._get_joint_dist() and is not actually a parameter.
+    del par["y"]
+
+    # Note that the actual (transformed) outcome data is "pinned" as "y".
+    log_prob_parts_structtuple = (
+        meridian.posterior_sampler_callable._get_joint_dist().log_prob_parts(
+            par
+        )
+    )
+    log_prob_parts = {
+        k: v._asdict() for k, v in log_prob_parts_structtuple._asdict().items()
+    }
+
+    derived_params = [
+        constants.BETA_GM,
+        constants.BETA_GRF,
+        constants.GAMMA_GC,
+        constants.MU_T,
+        constants.TAU_G,
+    ]
+    prior_distribution_params = [
+        constants.KNOT_VALUES,
+        constants.ETA_M,
+        constants.ETA_RF,
+        constants.GAMMA_C,
+        constants.XI_C,
+        constants.ALPHA_M,
+        constants.ALPHA_RF,
+        constants.EC_M,
+        constants.EC_RF,
+        constants.SLOPE_M,
+        constants.SLOPE_RF,
+        constants.SIGMA,
+    ]
+
+    if paid_media_prior_type in constants.TREATMENT_PRIOR_TYPE_ROI:
+      derived_params.append(constants.BETA_M)
+      derived_params.append(constants.BETA_RF)
+      prior_distribution_params.append(constants.ROI_M)
+      prior_distribution_params.append(constants.ROI_RF)
+    elif paid_media_prior_type == constants.TREATMENT_PRIOR_TYPE_MROI:
+      derived_params.append(constants.BETA_M)
+      derived_params.append(constants.BETA_RF)
+      prior_distribution_params.append(constants.MROI_M)
+      prior_distribution_params.append(constants.MROI_RF)
+    else:
+      prior_distribution_params.append(constants.BETA_M)
+      prior_distribution_params.append(constants.BETA_RF)
+
+    # Parameters that are derived from other parameters via Deterministic()
+    # should have zero contribution to log_prob.
+    for parname in derived_params:
+      test_utils.assert_allequal(log_prob_parts["unpinned"][parname][0], 0)
+
+    prior_distribution_logprobs = {}
+    for parname in prior_distribution_params:
+      prior_distribution_logprobs[parname] = backend.reduce_sum(
+          getattr(meridian.prior_broadcast, parname).log_prob(par[parname])
+      )
+      test_utils.assert_allclose(
+          prior_distribution_logprobs[parname],
+          log_prob_parts["unpinned"][parname][0],
+      )
+
+    coef_params = [
+        constants.BETA_GM_DEV,
+        constants.BETA_GRF_DEV,
+        constants.GAMMA_GC_DEV,
+    ]
+    coef_logprobs = {}
+    for parname in coef_params:
+      coef_logprobs[parname] = backend.reduce_sum(
+          backend.tfd.Normal(
+              backend.np_float_dtype(0), backend.np_float_dtype(1)
+          ).log_prob(par[parname])
+      )
+      test_utils.assert_allclose(
+          coef_logprobs[parname], log_prob_parts["unpinned"][parname][0]
+      )
+    transformed_media = meridian.adstock_hill_media(
+        media=meridian.media_tensors.media_scaled,  # pyrefly: ignore[bad-argument-type]
+        alpha=par[constants.ALPHA_M],
+        ec=par[constants.EC_M],
+        slope=par[constants.SLOPE_M],
+        decay_functions=meridian.adstock_decay_spec.media,
+    )[0, :, :, :]
+    transformed_reach = meridian.adstock_hill_rf(
+        reach=meridian.rf_tensors.reach_scaled,  # pyrefly: ignore[bad-argument-type]
+        frequency=meridian.rf_tensors.frequency,  # pyrefly: ignore[bad-argument-type]
+        alpha=par[constants.ALPHA_RF],
+        ec=par[constants.EC_RF],
+        slope=par[constants.SLOPE_RF],
+        decay_functions=meridian.adstock_decay_spec.rf,
+    )[0, :, :, :]
+    combined_transformed_media = backend.concatenate(
+        [transformed_media, transformed_reach], axis=-1
+    )
+
+    combined_beta = backend.concatenate(
+        [par[constants.BETA_GM][0, :, :], par[constants.BETA_GRF][0, :, :]],
+        axis=-1,
+    )
+    y_means = (
+        par[constants.TAU_G][0, :, None]
+        + par[constants.MU_T][0, None, :]
+        + backend.einsum(
+            "gtm,gm->gt", combined_transformed_media, combined_beta
+        )
+        + backend.einsum(
+            "gtc,gc->gt",
+            meridian.controls_scaled,
+            par[constants.GAMMA_GC][0, :, :],
+        )
+    )
+    y_means_logprob = backend.reduce_sum(
+        backend.tfd.Normal(y_means, par[constants.SIGMA]).log_prob(
+            meridian.kpi_scaled
+        )
+    )
+    test_utils.assert_allclose(
+        y_means_logprob, log_prob_parts["pinned"]["y"][0]
+    )
+
+    tau_g_logprob = backend.reduce_sum(
+        getattr(
+            meridian.prior_broadcast, constants.TAU_G_EXCL_BASELINE
+        ).log_prob(par[constants.TAU_G_EXCL_BASELINE])
+    )
+    test_utils.assert_allclose(
+        tau_g_logprob,
+        log_prob_parts["unpinned"][constants.TAU_G_EXCL_BASELINE][0],
+    )
+
+    posterior_unnormalized_logprob = (
+        sum(prior_distribution_logprobs.values())
+        + sum(coef_logprobs.values())
+        + y_means_logprob
+        + tau_g_logprob
+    )
+    test_utils.assert_allclose(
+        posterior_unnormalized_logprob,
+        meridian.posterior_sampler_callable._get_joint_dist().log_prob(par)[0],
+    )
+
+  def test_sample_posterior_reconstructs_deterministics_from_latents(self):
+    """Checks that deterministics are correctly reconstructed from NUTS latents."""
+    # We create a mock state containing ONLY latent variables to simulate
+    # the output of the NUTS sampler without deterministics.
+
+    # Filter the standard test states to remove deterministics
+    full_states = self.test_posterior_states_media_and_rf
+    # Known deterministics in the test data (assuming ROI prior which is
+    # default/common in tests)
+    deterministics_to_remove = [
+        constants.TAU_G,
+        constants.MU_T,
+        constants.BETA_M,
+        constants.BETA_RF,
+        constants.BETA_GM,
+        constants.BETA_GRF,
+        constants.GAMMA_GC,
+    ]
+    latents_only_states = {
+        k: v
+        for k, v in full_states._asdict().items()
+        if k not in deterministics_to_remove
+    }
+    self.assertNotIn(constants.BETA_GM, latents_only_states)
+
+    # Convert the dictionary back to a NamedTuple to match TFP's typical output
+    # structure
+    latents_tuple_class = collections.namedtuple(  # pyrefly: ignore[bad-class-definition]
+        "LatentsTuple", latents_only_states.keys()
+    )
+    latents_only_tuple = latents_tuple_class(**latents_only_states)
+
+    self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            autospec=True,
+            return_value=collections.namedtuple(
+                "StatesAndTrace", ["all_states", "trace"]
+            )(
+                all_states=latents_only_tuple,
+                trace=self.test_trace,
+            ),
+        )
+    )
+
+    model_spec = spec.ModelSpec(
+        roi_calibration_period=self._ROI_CALIBRATION_PERIOD,  # pyrefly: ignore[bad-argument-type]
+        rf_roi_calibration_period=self._RF_ROI_CALIBRATION_PERIOD,  # pyrefly: ignore[bad-argument-type]
+    )
+    input_data = self.short_input_data_with_media_and_rf
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+
+    meridian.sample_posterior(
+        n_chains=self._N_CHAINS,
+        n_adapt=self._N_ADAPT,
+        n_burnin=self._N_BURNIN,
+        n_keep=self._N_KEEP,
+        seed=123,
+    )
+
+    # Verify that InferenceData DOES contain the deterministics
+    posterior = meridian.inference_data.posterior  # pyrefly: ignore[missing-attribute]
+
+    self.assertIn(constants.BETA_GM, posterior)
+    self.assertIn(constants.TAU_G, posterior)
+    self.assertIn(constants.MU_T, posterior)
+    self.assertEqual(
+        posterior[constants.BETA_GM].shape,
+        (self._N_CHAINS, self._N_KEEP, self._N_GEOS, self._N_MEDIA_CHANNELS),
+    )
+
+  def test_sample_posterior_media_and_rf_returns_correct_shape(self):
+    mock_sample_posterior = self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            autospec=True,
+            return_value=collections.namedtuple(
+                "StatesAndTrace", ["all_states", "trace"]
+            )(
+                all_states=self.test_posterior_states_media_and_rf,
+                trace=self.test_trace,
+            ),
+        )
+    )
+    model_spec = spec.ModelSpec(
+        roi_calibration_period=self._ROI_CALIBRATION_PERIOD,  # pyrefly: ignore[bad-argument-type]
+        rf_roi_calibration_period=self._RF_ROI_CALIBRATION_PERIOD,  # pyrefly: ignore[bad-argument-type]
+    )
+    input_data = self.short_input_data_with_media_and_rf
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+
+    meridian.sample_posterior(
+        n_chains=self._N_CHAINS,
+        n_adapt=self._N_ADAPT,
+        n_burnin=self._N_BURNIN,
+        n_keep=self._N_KEEP,
+        seed=123,
+    )
+
+    expected_seed = backend.RNGHandler(123).get_kernel_seed()
+    mock_sample_posterior.assert_called_with(
+        n_draws=self._N_BURNIN + self._N_KEEP,
+        joint_dist=mock.ANY,
+        n_chains=self._N_CHAINS,
+        num_adaptation_steps=self._N_ADAPT,
+        current_state=None,
+        init_step_size=None,
+        dual_averaging_kwargs=None,
+        max_tree_depth=10,
+        max_energy_diff=500.0,
+        unrolled_leapfrog_steps=1,
+        parallel_iterations=10,
+        seed=mock.ANY,
+        step_callback=None,
+    )
+    actual_seed = mock_sample_posterior.call_args.kwargs["seed"]
+    self._assert_seeds_equal(actual_seed, expected_seed)
+    knots_shape = (self._N_CHAINS, self._N_KEEP, self._N_TIMES_SHORT)
+    control_shape = (self._N_CHAINS, self._N_KEEP, self._N_CONTROLS)
+    media_channel_shape = (self._N_CHAINS, self._N_KEEP, self._N_MEDIA_CHANNELS)
+    rf_channel_shape = (self._N_CHAINS, self._N_KEEP, self._N_RF_CHANNELS)
+    sigma_shape = (
+        (self._N_CHAINS, self._N_KEEP, self._N_GEOS)
+        if meridian.unique_sigma_for_each_geo
+        else (self._N_CHAINS, self._N_KEEP)
+    )
+    geo_shape = (self._N_CHAINS, self._N_KEEP, self._N_GEOS)
+    time_shape = (self._N_CHAINS, self._N_KEEP, self._N_TIMES_SHORT)
+    geo_control_shape = geo_shape + (self._N_CONTROLS,)
+    geo_media_channel_shape = geo_shape + (self._N_MEDIA_CHANNELS,)
+    geo_rf_channel_shape = geo_shape + (self._N_RF_CHANNELS,)
+
+    media_parameters = list(constants.MEDIA_PARAMETER_NAMES)
+    media_parameters.remove(constants.BETA_GM)
+    rf_parameters = list(constants.RF_PARAMETER_NAMES)
+    rf_parameters.remove(constants.BETA_GRF)
+
+    posterior = meridian.inference_data.posterior  # pyrefly: ignore[missing-attribute]
+    shape_to_params = {
+        knots_shape: [
+            getattr(posterior, attr) for attr in constants.KNOTS_PARAMETERS
+        ],
+        control_shape: [
+            getattr(posterior, attr) for attr in constants.CONTROL_PARAMETERS
+        ],
+        media_channel_shape: [
+            getattr(posterior, attr) for attr in media_parameters
+        ],
+        rf_channel_shape: [getattr(posterior, attr) for attr in rf_parameters],
+        sigma_shape: [
+            getattr(posterior, attr) for attr in constants.SIGMA_PARAMETERS
+        ],
+        geo_shape: [
+            getattr(posterior, attr) for attr in constants.GEO_PARAMETERS
+        ],
+        time_shape: [
+            getattr(posterior, attr) for attr in constants.TIME_PARAMETERS
+        ],
+        geo_control_shape: [
+            getattr(posterior, attr)
+            for attr in constants.GEO_CONTROL_PARAMETERS
+        ],
+        geo_media_channel_shape: [
+            getattr(posterior, attr) for attr in constants.GEO_MEDIA_PARAMETERS
+        ],
+        geo_rf_channel_shape: [
+            getattr(posterior, attr) for attr in constants.GEO_RF_PARAMETERS
+        ],
+    }
+    for shape, params in shape_to_params.items():
+      for param in params:
+        self.assertEqual(param.shape, shape)
+
+    for attr in [
+        constants.STEP_SIZE,
+        constants.TARGET_LOG_PROBABILITY_ARVIZ,
+        constants.DIVERGING,
+        constants.N_STEPS,
+    ]:
+      self.assertEqual(
+          getattr(meridian.inference_data.sample_stats, attr).shape,  # pyrefly: ignore[missing-attribute]
+          (
+              self._N_CHAINS,
+              self._N_KEEP,
+          ),
+      )
+    for attr in [
+        constants.STEP_SIZE,
+        constants.TUNE,
+        constants.TARGET_LOG_PROBABILITY_TF,
+        constants.DIVERGING,
+        constants.ACCEPT_RATIO,
+        constants.N_STEPS,
+    ]:
+      self.assertEqual(
+          getattr(meridian.inference_data.trace, attr).shape,  # pyrefly: ignore[missing-attribute]
+          (
+              self._N_CHAINS,
+              self._N_KEEP,
+          ),
+      )
+
+  def test_sample_posterior_media_only_returns_correct_shape(self):
+    mock_sample_posterior = self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            autospec=True,
+            return_value=collections.namedtuple(
+                "StatesAndTrace", ["all_states", "trace"]
+            )(
+                all_states=self.test_posterior_states_media_only,
+                trace=self.test_trace,
+            ),
+        )
+    )
+    model_spec = spec.ModelSpec(
+        roi_calibration_period=self._ROI_CALIBRATION_PERIOD,  # pyrefly: ignore[bad-argument-type]
+    )
+    input_data = self.short_input_data_with_media_only
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+
+    meridian.sample_posterior(
+        n_chains=self._N_CHAINS,
+        n_adapt=self._N_ADAPT,
+        n_burnin=self._N_BURNIN,
+        n_keep=self._N_KEEP,
+        seed=123,
+    )
+
+    expected_seed = backend.RNGHandler(123).get_kernel_seed()
+    mock_sample_posterior.assert_called_with(
+        n_draws=self._N_BURNIN + self._N_KEEP,
+        joint_dist=mock.ANY,
+        n_chains=self._N_CHAINS,
+        num_adaptation_steps=self._N_ADAPT,
+        current_state=None,
+        init_step_size=None,
+        dual_averaging_kwargs=None,
+        max_tree_depth=10,
+        max_energy_diff=500.0,
+        unrolled_leapfrog_steps=1,
+        parallel_iterations=10,
+        seed=mock.ANY,
+        step_callback=None,
+    )
+    actual_seed = mock_sample_posterior.call_args.kwargs["seed"]
+    self._assert_seeds_equal(actual_seed, expected_seed)
+    knots_shape = (self._N_CHAINS, self._N_KEEP, self._N_TIMES_SHORT)
+    control_shape = (self._N_CHAINS, self._N_KEEP, self._N_CONTROLS)
+    media_channel_shape = (self._N_CHAINS, self._N_KEEP, self._N_MEDIA_CHANNELS)
+    sigma_shape = (
+        (self._N_CHAINS, self._N_KEEP, self._N_GEOS)
+        if meridian.unique_sigma_for_each_geo
+        else (self._N_CHAINS, self._N_KEEP)
+    )
+    geo_shape = (self._N_CHAINS, self._N_KEEP, self._N_GEOS)
+    time_shape = (self._N_CHAINS, self._N_KEEP, self._N_TIMES_SHORT)
+    geo_control_shape = geo_shape + (self._N_CONTROLS,)
+    geo_media_channel_shape = geo_shape + (self._N_MEDIA_CHANNELS,)
+
+    media_parameters = list(constants.MEDIA_PARAMETER_NAMES)
+    media_parameters.remove(constants.BETA_GM)
+
+    posterior = meridian.inference_data.posterior  # pyrefly: ignore[missing-attribute]
+    shape_to_params = {
+        knots_shape: [
+            getattr(posterior, attr) for attr in constants.KNOTS_PARAMETERS
+        ],
+        control_shape: [
+            getattr(posterior, attr) for attr in constants.CONTROL_PARAMETERS
+        ],
+        media_channel_shape: [
+            getattr(posterior, attr) for attr in media_parameters
+        ],
+        sigma_shape: [
+            getattr(posterior, attr) for attr in constants.SIGMA_PARAMETERS
+        ],
+        geo_shape: [
+            getattr(posterior, attr) for attr in constants.GEO_PARAMETERS
+        ],
+        time_shape: [
+            getattr(posterior, attr) for attr in constants.TIME_PARAMETERS
+        ],
+        geo_control_shape: [
+            getattr(posterior, attr)
+            for attr in constants.GEO_CONTROL_PARAMETERS
+        ],
+        geo_media_channel_shape: [
+            getattr(posterior, attr) for attr in constants.GEO_MEDIA_PARAMETERS
+        ],
+    }
+    for shape, params in shape_to_params.items():
+      for param in params:
+        self.assertEqual(param.shape, shape)
+
+    for attr in [
+        constants.STEP_SIZE,
+        constants.TARGET_LOG_PROBABILITY_ARVIZ,
+        constants.DIVERGING,
+        constants.N_STEPS,
+    ]:
+      self.assertEqual(
+          getattr(meridian.inference_data.sample_stats, attr).shape,  # pyrefly: ignore[missing-attribute]
+          (
+              self._N_CHAINS,
+              self._N_KEEP,
+          ),
+      )
+    for attr in [
+        constants.STEP_SIZE,
+        constants.TUNE,
+        constants.TARGET_LOG_PROBABILITY_TF,
+        constants.DIVERGING,
+        constants.ACCEPT_RATIO,
+        constants.N_STEPS,
+    ]:
+      self.assertEqual(
+          getattr(meridian.inference_data.trace, attr).shape,  # pyrefly: ignore[missing-attribute]
+          (
+              self._N_CHAINS,
+              self._N_KEEP,
+          ),
+      )
+
+  def test_sample_posterior_media_only_no_controls_returns_correct_shape(self):
+    mock_sample_posterior = self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            autospec=True,
+            return_value=collections.namedtuple(
+                "StatesAndTrace", ["all_states", "trace"]
+            )(
+                all_states=self.test_posterior_states_media_only_no_controls,
+                trace=self.test_trace,
+            ),
+        )
+    )
+    model_spec = spec.ModelSpec(
+        roi_calibration_period=self._ROI_CALIBRATION_PERIOD,  # pyrefly: ignore[bad-argument-type]
+    )
+    input_data = self.short_input_data_with_media_only_no_controls
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+
+    meridian.sample_posterior(
+        n_chains=self._N_CHAINS,
+        n_adapt=self._N_ADAPT,
+        n_burnin=self._N_BURNIN,
+        n_keep=self._N_KEEP,
+        seed=123,
+    )
+
+    expected_seed = backend.RNGHandler(123).get_kernel_seed()
+    mock_sample_posterior.assert_called_with(
+        n_draws=self._N_BURNIN + self._N_KEEP,
+        joint_dist=mock.ANY,
+        n_chains=self._N_CHAINS,
+        num_adaptation_steps=self._N_ADAPT,
+        current_state=None,
+        init_step_size=None,
+        dual_averaging_kwargs=None,
+        max_tree_depth=10,
+        max_energy_diff=500.0,
+        unrolled_leapfrog_steps=1,
+        parallel_iterations=10,
+        seed=mock.ANY,
+        step_callback=None,
+    )
+    actual_seed = mock_sample_posterior.call_args.kwargs["seed"]
+    self._assert_seeds_equal(actual_seed, expected_seed)
+
+    # Control parameters should not exist in the inference data posteriors.
+    for param in (
+        constants.CONTROL_PARAMETERS + constants.GEO_CONTROL_PARAMETERS
+    ):
+      with self.assertRaises(AttributeError):
+        getattr(meridian.inference_data.posterior, param)  # pyrefly: ignore[missing-attribute]
+
+  def test_sample_posterior_rf_only_returns_correct_shape(self):
+    mock_sample_posterior = self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            autospec=True,
+            return_value=collections.namedtuple(
+                "StatesAndTrace", ["all_states", "trace"]
+            )(
+                all_states=self.test_posterior_states_rf_only,
+                trace=self.test_trace,
+            ),
+        )
+    )
+    model_spec = spec.ModelSpec(
+        rf_roi_calibration_period=self._RF_ROI_CALIBRATION_PERIOD,  # pyrefly: ignore[bad-argument-type]
+    )
+    input_data = self.short_input_data_with_rf_only
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+
+    meridian.sample_posterior(
+        n_chains=self._N_CHAINS,
+        n_adapt=self._N_ADAPT,
+        n_burnin=self._N_BURNIN,
+        n_keep=self._N_KEEP,
+        seed=123,
+    )
+
+    expected_seed = backend.RNGHandler(123).get_kernel_seed()
+    mock_sample_posterior.assert_called_with(
+        n_draws=self._N_BURNIN + self._N_KEEP,
+        joint_dist=mock.ANY,
+        n_chains=self._N_CHAINS,
+        num_adaptation_steps=self._N_ADAPT,
+        current_state=None,
+        init_step_size=None,
+        dual_averaging_kwargs=None,
+        max_tree_depth=10,
+        max_energy_diff=500.0,
+        unrolled_leapfrog_steps=1,
+        parallel_iterations=10,
+        seed=mock.ANY,
+        step_callback=None,
+    )
+    actual_seed = mock_sample_posterior.call_args.kwargs["seed"]
+    self._assert_seeds_equal(actual_seed, expected_seed)
+    knots_shape = (self._N_CHAINS, self._N_KEEP, self._N_TIMES_SHORT)
+    control_shape = (self._N_CHAINS, self._N_KEEP, self._N_CONTROLS)
+    rf_channel_shape = (self._N_CHAINS, self._N_KEEP, self._N_RF_CHANNELS)
+    sigma_shape = (
+        (self._N_CHAINS, self._N_KEEP, self._N_GEOS)
+        if meridian.unique_sigma_for_each_geo
+        else (self._N_CHAINS, self._N_KEEP)
+    )
+    geo_shape = (self._N_CHAINS, self._N_KEEP, self._N_GEOS)
+    time_shape = (self._N_CHAINS, self._N_KEEP, self._N_TIMES_SHORT)
+    geo_control_shape = geo_shape + (self._N_CONTROLS,)
+    geo_rf_channel_shape = geo_shape + (self._N_RF_CHANNELS,)
+
+    rf_parameters = list(constants.RF_PARAMETER_NAMES)
+    rf_parameters.remove(constants.BETA_GRF)
+
+    posterior = meridian.inference_data.posterior  # pyrefly: ignore[missing-attribute]
+    shape_to_params = {
+        knots_shape: [
+            getattr(posterior, attr) for attr in constants.KNOTS_PARAMETERS
+        ],
+        control_shape: [
+            getattr(posterior, attr) for attr in constants.CONTROL_PARAMETERS
+        ],
+        rf_channel_shape: [getattr(posterior, attr) for attr in rf_parameters],
+        sigma_shape: [
+            getattr(posterior, attr) for attr in constants.SIGMA_PARAMETERS
+        ],
+        geo_shape: [
+            getattr(posterior, attr) for attr in constants.GEO_PARAMETERS
+        ],
+        time_shape: [
+            getattr(posterior, attr) for attr in constants.TIME_PARAMETERS
+        ],
+        geo_control_shape: [
+            getattr(posterior, attr)
+            for attr in constants.GEO_CONTROL_PARAMETERS
+        ],
+        geo_rf_channel_shape: [
+            getattr(posterior, attr) for attr in constants.GEO_RF_PARAMETERS
+        ],
+    }
+    for shape, params in shape_to_params.items():
+      for param in params:
+        self.assertEqual(param.shape, shape)
+
+    for attr in [
+        constants.STEP_SIZE,
+        constants.TARGET_LOG_PROBABILITY_ARVIZ,
+        constants.DIVERGING,
+        constants.N_STEPS,
+    ]:
+      self.assertEqual(
+          getattr(meridian.inference_data.sample_stats, attr).shape,  # pyrefly: ignore[missing-attribute]
+          (
+              self._N_CHAINS,
+              self._N_KEEP,
+          ),
+      )
+    for attr in [
+        constants.STEP_SIZE,
+        constants.TUNE,
+        constants.TARGET_LOG_PROBABILITY_TF,
+        constants.DIVERGING,
+        constants.ACCEPT_RATIO,
+        constants.N_STEPS,
+    ]:
+      self.assertEqual(
+          getattr(meridian.inference_data.trace, attr).shape,  # pyrefly: ignore[missing-attribute]
+          (
+              self._N_CHAINS,
+              self._N_KEEP,
+          ),
+      )
+
+  def test_sample_posterior_media_and_rf_sequential_returns_correct_shape(self):
+    mock_sample_posterior = self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            autospec=True,
+            return_value=collections.namedtuple(
+                "StatesAndTrace", ["all_states", "trace"]
+            )(
+                all_states=self.test_posterior_states_media_and_rf,
+                trace=self.test_trace,
+            ),
+        )
+    )
+    model_spec = spec.ModelSpec(
+        roi_calibration_period=self._ROI_CALIBRATION_PERIOD,  # pyrefly: ignore[bad-argument-type]
+        rf_roi_calibration_period=self._RF_ROI_CALIBRATION_PERIOD,  # pyrefly: ignore[bad-argument-type]
+    )
+    input_data = self.short_input_data_with_media_and_rf
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+
+    meridian.sample_posterior(
+        n_chains=[self._N_CHAINS, self._N_CHAINS],
+        n_adapt=self._N_ADAPT,
+        n_burnin=self._N_BURNIN,
+        n_keep=self._N_KEEP,
+        seed=123,
+    )
+
+    handler = backend.RNGHandler(123)
+    expected_seed_1 = handler.get_kernel_seed()
+    handler = handler.advance_handler()
+    expected_seed_2 = handler.get_kernel_seed()
+
+    self.assertEqual(mock_sample_posterior.call_count, 2)
+    first_call_args = mock_sample_posterior.call_args_list[0].kwargs
+    second_call_args = mock_sample_posterior.call_args_list[1].kwargs
+
+    self._assert_seeds_equal(first_call_args["seed"], expected_seed_1)
+    self._assert_seeds_equal(second_call_args["seed"], expected_seed_2)
+
+    n_total_chains = self._N_CHAINS * 2
+    knots_shape = (n_total_chains, self._N_KEEP, self._N_TIMES_SHORT)
+    control_shape = (n_total_chains, self._N_KEEP, self._N_CONTROLS)
+    media_channel_shape = (n_total_chains, self._N_KEEP, self._N_MEDIA_CHANNELS)
+    rf_channel_shape = (n_total_chains, self._N_KEEP, self._N_RF_CHANNELS)
+    sigma_shape = (
+        (n_total_chains, self._N_KEEP, self._N_GEOS)
+        if meridian.unique_sigma_for_each_geo
+        else (n_total_chains, self._N_KEEP)
+    )
+    geo_shape = (n_total_chains, self._N_KEEP, self._N_GEOS)
+    time_shape = (n_total_chains, self._N_KEEP, self._N_TIMES_SHORT)
+    geo_control_shape = geo_shape + (self._N_CONTROLS,)
+    geo_media_channel_shape = geo_shape + (self._N_MEDIA_CHANNELS,)
+    geo_rf_channel_shape = geo_shape + (self._N_RF_CHANNELS,)
+
+    media_parameters = list(constants.MEDIA_PARAMETER_NAMES)
+    media_parameters.remove(constants.BETA_GM)
+    rf_parameters = list(constants.RF_PARAMETER_NAMES)
+    rf_parameters.remove(constants.BETA_GRF)
+
+    posterior = meridian.inference_data.posterior  # pyrefly: ignore[missing-attribute]
+    shape_to_params = {
+        knots_shape: [
+            getattr(posterior, attr) for attr in constants.KNOTS_PARAMETERS
+        ],
+        control_shape: [
+            getattr(posterior, attr) for attr in constants.CONTROL_PARAMETERS
+        ],
+        media_channel_shape: [
+            getattr(posterior, attr) for attr in media_parameters
+        ],
+        rf_channel_shape: [getattr(posterior, attr) for attr in rf_parameters],
+        sigma_shape: [
+            getattr(posterior, attr) for attr in constants.SIGMA_PARAMETERS
+        ],
+        geo_shape: [
+            getattr(posterior, attr) for attr in constants.GEO_PARAMETERS
+        ],
+        time_shape: [
+            getattr(posterior, attr) for attr in constants.TIME_PARAMETERS
+        ],
+        geo_control_shape: [
+            getattr(posterior, attr)
+            for attr in constants.GEO_CONTROL_PARAMETERS
+        ],
+        geo_media_channel_shape: [
+            getattr(posterior, attr) for attr in constants.GEO_MEDIA_PARAMETERS
+        ],
+        geo_rf_channel_shape: [
+            getattr(posterior, attr) for attr in constants.GEO_RF_PARAMETERS
+        ],
+    }
+    for shape, params in shape_to_params.items():
+      for param in params:
+        self.assertEqual(param.shape, shape)
+
+    for attr in [
+        constants.STEP_SIZE,
+        constants.TARGET_LOG_PROBABILITY_ARVIZ,
+        constants.DIVERGING,
+        constants.N_STEPS,
+    ]:
+      self.assertEqual(
+          getattr(meridian.inference_data.sample_stats, attr).shape,  # pyrefly: ignore[missing-attribute]
+          (
+              n_total_chains,
+              self._N_KEEP,
+          ),
+      )
+    for attr in [
+        constants.STEP_SIZE,
+        constants.TUNE,
+        constants.TARGET_LOG_PROBABILITY_TF,
+        constants.DIVERGING,
+        constants.ACCEPT_RATIO,
+        constants.N_STEPS,
+    ]:
+      self.assertEqual(
+          getattr(meridian.inference_data.trace, attr).shape,  # pyrefly: ignore[missing-attribute]
+          (
+              n_total_chains,
+              self._N_KEEP,
+          ),
+      )
+
+  def test_sample_posterior_raises_oom_error_when_limits_exceeded(self):
+    self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            autospec=True,
+            side_effect=backend.errors.ResourceExhaustedError(
+                None, None, "Resource exhausted"
+            ),
+        )
+    )
+    input_data = self.short_input_data_with_media_and_rf
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=spec.ModelSpec(),
+    )
+
+    with self.assertRaises(posterior_sampler.MCMCOOMError):
+      meridian.sample_posterior(
+          n_chains=self._N_CHAINS,
+          n_adapt=self._N_ADAPT,
+          n_burnin=self._N_BURNIN,
+          n_keep=self._N_KEEP,
+      )
+
+  def test_injected_sample_posterior_media_and_rf_returns_correct_shape(self):
+    """Checks validation passes with correct shapes."""
+    self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            autospec=True,
+            return_value=collections.namedtuple(
+                "StatesAndTrace", ["all_states", "trace"]
+            )(
+                all_states=self.test_posterior_states_media_and_rf,
+                trace=self.test_trace,
+            ),
+        )
+    )
+    model_spec = spec.ModelSpec(
+        roi_calibration_period=self._ROI_CALIBRATION_PERIOD,  # pyrefly: ignore[bad-argument-type]
+        rf_roi_calibration_period=self._RF_ROI_CALIBRATION_PERIOD,  # pyrefly: ignore[bad-argument-type]
+    )
+    input_data = self.short_input_data_with_media_and_rf
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+
+    meridian.sample_posterior(
+        n_chains=self._N_CHAINS,
+        n_adapt=self._N_ADAPT,
+        n_burnin=self._N_BURNIN,
+        n_keep=self._N_KEEP,
+    )
+    inference_data = meridian.inference_data
+    meridian_with_inference_data = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+        inference_data=inference_data,
+    )
+
+    self.assertEqual(
+        meridian_with_inference_data.inference_data, inference_data
+    )
+
+  def test_injected_sample_posterior_media_only_returns_correct_shape(self):
+    """Checks validation passes with correct shapes."""
+    self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            autospec=True,
+            return_value=collections.namedtuple(
+                "StatesAndTrace", ["all_states", "trace"]
+            )(
+                all_states=self.test_posterior_states_media_only,
+                trace=self.test_trace,
+            ),
+        )
+    )
+    model_spec = spec.ModelSpec(
+        roi_calibration_period=self._ROI_CALIBRATION_PERIOD,  # pyrefly: ignore[bad-argument-type]
+    )
+    input_data = self.short_input_data_with_media_only
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+
+    meridian.sample_posterior(
+        n_chains=self._N_CHAINS,
+        n_adapt=self._N_ADAPT,
+        n_burnin=self._N_BURNIN,
+        n_keep=self._N_KEEP,
+    )
+    inference_data = meridian.inference_data
+    meridian_with_inference_data = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+        inference_data=inference_data,
+    )
+
+    self.assertEqual(
+        meridian_with_inference_data.inference_data, inference_data
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="control_variables",
+          coord=constants.CONTROL_VARIABLE,
+          mismatched_posteriors={
+              constants.GAMMA_C: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_CONTROLS + 1,
+              ),
+              constants.GAMMA_GC: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_GEOS,
+                  input_data_samples._N_CONTROLS + 1,
+              ),
+              constants.XI_C: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_CONTROLS + 1,
+              ),
+          },
+          mismatched_coord_size=input_data_samples._N_CONTROLS + 1,
+          expected_coord_size=input_data_samples._N_CONTROLS,
+      ),
+      dict(
+          testcase_name="geos",
+          coord=constants.GEO,
+          mismatched_posteriors={
+              constants.BETA_GM: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_GEOS + 1,
+                  input_data_samples._N_MEDIA_CHANNELS,
+              ),
+              constants.BETA_GRF: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_GEOS + 1,
+                  input_data_samples._N_RF_CHANNELS,
+              ),
+              constants.GAMMA_GC: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_GEOS + 1,
+                  input_data_samples._N_CONTROLS,
+              ),
+              constants.TAU_G: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_GEOS + 1,
+              ),
+          },
+          mismatched_coord_size=input_data_samples._N_GEOS + 1,
+          expected_coord_size=input_data_samples._N_GEOS,
+      ),
+      dict(
+          testcase_name="knots",
+          coord=constants.KNOTS,
+          mismatched_posteriors={
+              constants.KNOT_VALUES: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_TIMES_SHORT + 1,
+              ),
+          },
+          mismatched_coord_size=input_data_samples._N_TIMES_SHORT + 1,
+          expected_coord_size=input_data_samples._N_TIMES_SHORT,
+      ),
+      dict(
+          testcase_name="times",
+          coord=constants.TIME,
+          mismatched_posteriors={
+              constants.MU_T: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_TIMES_SHORT + 1,
+              ),
+          },
+          mismatched_coord_size=input_data_samples._N_TIMES_SHORT + 1,
+          expected_coord_size=input_data_samples._N_TIMES_SHORT,
+      ),
+      dict(
+          testcase_name="media_channels",
+          coord=constants.MEDIA_CHANNEL,
+          mismatched_posteriors={
+              constants.ALPHA_M: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_MEDIA_CHANNELS + 1,
+              ),
+              constants.BETA_GM: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_GEOS,
+                  input_data_samples._N_MEDIA_CHANNELS + 1,
+              ),
+              constants.BETA_M: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_MEDIA_CHANNELS + 1,
+              ),
+              constants.EC_M: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_MEDIA_CHANNELS + 1,
+              ),
+              constants.ETA_M: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_MEDIA_CHANNELS + 1,
+              ),
+              constants.ROI_M: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_MEDIA_CHANNELS + 1,
+              ),
+              constants.SLOPE_M: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_MEDIA_CHANNELS + 1,
+              ),
+          },
+          mismatched_coord_size=input_data_samples._N_MEDIA_CHANNELS + 1,
+          expected_coord_size=input_data_samples._N_MEDIA_CHANNELS,
+      ),
+      dict(
+          testcase_name="rf_channels",
+          coord=constants.RF_CHANNEL,
+          mismatched_posteriors={
+              constants.ALPHA_RF: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_RF_CHANNELS + 1,
+              ),
+              constants.BETA_GRF: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_GEOS,
+                  input_data_samples._N_RF_CHANNELS + 1,
+              ),
+              constants.BETA_RF: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_RF_CHANNELS + 1,
+              ),
+              constants.EC_RF: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_RF_CHANNELS + 1,
+              ),
+              constants.ETA_RF: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_RF_CHANNELS + 1,
+              ),
+              constants.ROI_RF: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_RF_CHANNELS + 1,
+              ),
+              constants.SLOPE_RF: (
+                  input_data_samples._N_CHAINS,
+                  input_data_samples._N_KEEP,
+                  input_data_samples._N_RF_CHANNELS + 1,
+              ),
+          },
+          mismatched_coord_size=input_data_samples._N_RF_CHANNELS + 1,
+          expected_coord_size=input_data_samples._N_RF_CHANNELS,
+      ),
+  )
+  def test_validate_injected_inference_data_posterior_incorrect_coordinates(
+      self,
+      coord,
+      mismatched_posteriors,
+      mismatched_coord_size,
+      expected_coord_size,
+  ):
+    """Checks posterior validation fails with incorrect coordinates."""
+    self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            autospec=True,
+            return_value=collections.namedtuple(
+                "StatesAndTrace", ["all_states", "trace"]
+            )(
+                all_states=self.test_posterior_states_media_and_rf,
+                trace=self.test_trace,
+            ),
+        )
+    )
+    model_spec = spec.ModelSpec(
+        roi_calibration_period=self._ROI_CALIBRATION_PERIOD,  # pyrefly: ignore[bad-argument-type]
+        rf_roi_calibration_period=self._RF_ROI_CALIBRATION_PERIOD,  # pyrefly: ignore[bad-argument-type]
+    )
+    input_data = self.short_input_data_with_media_and_rf
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+
+    meridian.sample_posterior(
+        n_chains=self._N_CHAINS,
+        n_adapt=self._N_ADAPT,
+        n_burnin=self._N_BURNIN,
+        n_keep=self._N_KEEP,
+    )
+
+    posterior_coords = meridian.create_inference_data_coords(
+        self._N_CHAINS, self._N_KEEP
+    )
+    posterior_dims = meridian.create_inference_data_dims()
+    posterior_samples = dict(meridian.inference_data.posterior)  # pyrefly: ignore[missing-attribute]
+    for posterior in mismatched_posteriors:
+      posterior_samples[posterior] = backend.zeros(
+          mismatched_posteriors[posterior]
+      )
+
+    posterior_coords = dict(posterior_coords)
+    posterior_coords[coord] = np.arange(mismatched_coord_size)
+
+    inference_data = az.convert_to_inference_data(
+        posterior_samples,
+        coords=posterior_coords,
+        dims=posterior_dims,
+        group=constants.POSTERIOR,
+    )
+
+    with self.assertRaisesRegex(
+        ValueError,
+        f"Injected inference data {constants.POSTERIOR} has incorrect"
+        f" coordinate '{coord}': expected"
+        f" {expected_coord_size}, got {mismatched_coord_size}",
+    ):
+      _ = model.Meridian(
+          input_data=input_data,
+          model_spec=model_spec,
+          inference_data=inference_data,
+      )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="seed_is_int", seed=42),
+      dict(testcase_name="seed_is_pair", seed=[42, 123]),
+  )
+  def test_sample_posterior_with_seed_not_none(self, seed):
+    if (
+        backend.config.get_backend() == backend.config.Backend.JAX
+        and isinstance(seed, list)
+    ):
+      self.skipTest("JAX backend does not support sequence seeds.")
+
+    mock_sample_posterior = self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            autospec=True,
+            return_value=collections.namedtuple(
+                "StatesAndTrace", ["all_states", "trace"]
+            )(
+                all_states=self.test_posterior_states_media_and_rf,
+                trace=self.test_trace,
+            ),
+        )
+    )
+    model_spec = spec.ModelSpec()
+    input_data = self.short_input_data_with_media_and_rf
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+    meridian.sample_posterior(
+        n_chains=self._N_CHAINS,
+        n_adapt=self._N_ADAPT,
+        n_burnin=self._N_BURNIN,
+        n_keep=self._N_KEEP,
+        seed=seed,
+    )
+
+    expected_seed = backend.RNGHandler(seed).get_kernel_seed()
+    actual_seed = mock_sample_posterior.call_args.kwargs["seed"]
+    self._assert_seeds_equal(actual_seed, expected_seed)
+
+    mock_sample_posterior.assert_called_with(
+        n_draws=self._N_BURNIN + self._N_KEEP,
+        joint_dist=mock.ANY,
+        n_chains=self._N_CHAINS,
+        num_adaptation_steps=self._N_ADAPT,
+        current_state=None,
+        init_step_size=None,
+        dual_averaging_kwargs=None,
+        max_tree_depth=10,
+        max_energy_diff=500.0,
+        unrolled_leapfrog_steps=1,
+        parallel_iterations=10,
+        seed=mock.ANY,
+        step_callback=None,
+    )
+
+  def test_sample_posterior_with_none_seed_jax(self):
+    if backend.config.get_backend() != backend.config.Backend.JAX:
+      self.skipTest("JAX specific test for seed=None.")
+    seed = None
+    mock_sample_posterior = self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            autospec=True,
+            return_value=collections.namedtuple(
+                "StatesAndTrace", ["all_states", "trace"]
+            )(
+                all_states=self.test_posterior_states_media_and_rf,
+                trace=self.test_trace,
+            ),
+        )
+    )
+    model_spec = spec.ModelSpec()
+    input_data = self.short_input_data_with_media_and_rf
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+    meridian.sample_posterior(
+        n_chains=self._N_CHAINS,
+        n_adapt=self._N_ADAPT,
+        n_burnin=self._N_BURNIN,
+        n_keep=self._N_KEEP,
+        seed=seed,
+    )
+
+    actual_seed = mock_sample_posterior.call_args.kwargs["seed"]
+    self.assertIsInstance(actual_seed, int)
+
+    mock_sample_posterior.assert_called_with(
+        n_draws=self._N_BURNIN + self._N_KEEP,
+        joint_dist=mock.ANY,
+        n_chains=self._N_CHAINS,
+        num_adaptation_steps=self._N_ADAPT,
+        current_state=None,
+        init_step_size=None,
+        dual_averaging_kwargs=None,
+        max_tree_depth=10,
+        max_energy_diff=500.0,
+        unrolled_leapfrog_steps=1,
+        parallel_iterations=10,
+        seed=mock.ANY,
+        step_callback=None,
+    )
+
+  def test_sample_posterior_with_none_seed_tf(self):
+    if backend.config.get_backend() == backend.config.Backend.JAX:
+      self.skipTest("TF specific test for seed=None.")
+    seed = None
+    mock_sample_posterior = self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            autospec=True,
+            return_value=collections.namedtuple(
+                "StatesAndTrace", ["all_states", "trace"]
+            )(
+                all_states=self.test_posterior_states_media_and_rf,
+                trace=self.test_trace,
+            ),
+        )
+    )
+    model_spec = spec.ModelSpec()
+    input_data = self.short_input_data_with_media_and_rf
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+    meridian.sample_posterior(
+        n_chains=self._N_CHAINS,
+        n_adapt=self._N_ADAPT,
+        n_burnin=self._N_BURNIN,
+        n_keep=self._N_KEEP,
+        seed=seed,
+    )
+
+    actual_seed = mock_sample_posterior.call_args.kwargs["seed"]
+    expected_seed = backend.RNGHandler(seed).get_kernel_seed()
+    self._assert_seeds_equal(actual_seed, expected_seed)
+
+    mock_sample_posterior.assert_called_with(
+        n_draws=self._N_BURNIN + self._N_KEEP,
+        joint_dist=mock.ANY,
+        n_chains=self._N_CHAINS,
+        num_adaptation_steps=self._N_ADAPT,
+        current_state=None,
+        init_step_size=None,
+        dual_averaging_kwargs=None,
+        max_tree_depth=10,
+        max_energy_diff=500.0,
+        unrolled_leapfrog_steps=1,
+        parallel_iterations=10,
+        seed=mock.ANY,
+        step_callback=None,
+    )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="seed_is_invalid_sequence", seed=[1, 2, 3]),
+  )
+  def test_sample_posterior_with_invalid_seed_sequence(self, seed):
+    if backend.config.get_backend() == backend.config.Backend.JAX:
+      self.skipTest(
+          "JAX backend validates integer seed, so this TF-specific"
+          " sequence-length test is not applicable."
+      )
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "Invalid seed: Must be either a single integer (stateful seed) or a"
+        " pair of two integers (stateless seed). See"
+        " [tfp.random.sanitize_seed](https://www.tensorflow.org/probability/api_docs/python/tfp/random/sanitize_seed)"
+        " for details.",
+    ):
+      model_spec = spec.ModelSpec()
+      input_data = self.short_input_data_with_media_and_rf
+      meridian = model.Meridian(
+          input_data=input_data,
+          model_spec=model_spec,
+      )
+      meridian.sample_posterior(
+          n_chains=self._N_CHAINS,
+          n_adapt=self._N_ADAPT,
+          n_burnin=self._N_BURNIN,
+          n_keep=self._N_KEEP,
+          seed=seed,
+      )
+
+  def _assert_jax_seed_is_int(self, seed):
+    """Asserts that the seed is an integer for JAX backend."""
+    self.assertIsInstance(seed, int)
+
+  def _assert_tf_seed_is_none(self, seed):
+    """Asserts that the seed is None for TensorFlow backend."""
+    self.assertIsNone(seed)
+
+  def test_sample_posterior_with_none_seed_propagates_correctly(self):
+    """Validates that seed=None is correctly propagated to the MCMC kernel."""
+    n_chains_list = [self._N_CHAINS, self._N_CHAINS]
+    mock_return = collections.namedtuple(
+        "StatesAndTrace", ["all_states", "trace"]
+    )(
+        all_states=self.test_posterior_states_media_and_rf,
+        trace=self.test_trace,
+    )
+    with mock.patch.object(
+        backend, "xla_windowed_adaptive_nuts", return_value=mock_return
+    ) as mock_nuts:
+      meridian = model.Meridian(
+          input_data=self.short_input_data_with_media_and_rf,
+          model_spec=spec.ModelSpec(),
+      )
+      meridian.sample_posterior(
+          n_chains=n_chains_list,
+          n_adapt=self._N_ADAPT,
+          n_burnin=self._N_BURNIN,
+          n_keep=self._N_KEEP,
+          seed=None,
+      )
+
+      calls = mock_nuts.call_args_list
+      self.assertLen(calls, len(n_chains_list))
+
+      # Determine the expected assertion function based on the backend.
+      # JAX backend via RNGHandler ensures a valid integer seed is generated.
+      # TF backend propagates None (relying on global state or TF internal
+      # handling).
+      seed_assertion_fn = (
+          self._assert_jax_seed_is_int
+          if backend.config.get_backend() == backend.config.Backend.JAX
+          else self._assert_tf_seed_is_none
+      )
+      seed_assertion_fn(calls[0].kwargs["seed"])
+      seed_assertion_fn(calls[1].kwargs["seed"])
+
+  @parameterized.named_parameters(
+      dict(testcase_name="seed_is_int", initial_seed=123),
+      dict(testcase_name="seed_is_pair", initial_seed=[123, 456]),
+  )
+  def test_posterior_sequential_batches_are_reproducible_and_independent(
+      self, initial_seed
+  ):
+    """Tests that sequential MCMC batches get independent but reproducible seeds."""
+    if (
+        backend.config.get_backend() == backend.config.Backend.JAX
+        and isinstance(initial_seed, list)
+    ):
+      self.skipTest("JAX backend does not support sequence seeds.")
+
+    n_chains_list = [self._N_CHAINS, self._N_CHAINS]
+    mock_return = collections.namedtuple(
+        "StatesAndTrace", ["all_states", "trace"]
+    )(
+        all_states=self.test_posterior_states_media_and_rf,
+        trace=self.test_trace,
+    )
+
+    def run_sampling(seed):
+      """Helper to run sampling and return the seeds passed to the kernel."""
+      with mock.patch.object(
+          backend, "xla_windowed_adaptive_nuts", return_value=mock_return
+      ) as mock_nuts:
+        meridian = model.Meridian(
+            input_data=self.short_input_data_with_media_and_rf,
+            model_spec=spec.ModelSpec(),
+        )
+        meridian.sample_posterior(
+            n_chains=n_chains_list,
+            n_adapt=self._N_ADAPT,
+            n_burnin=self._N_BURNIN,
+            n_keep=self._N_KEEP,
+            seed=seed,
+        )
+        return [call.kwargs["seed"] for call in mock_nuts.call_args_list]
+
+    seeds1 = run_sampling(initial_seed)
+    seeds2 = run_sampling(initial_seed)
+
+    self.assertLen(seeds1, 2)
+    self._assert_seeds_equal(seeds1[0], seeds2[0])
+    self._assert_seeds_equal(seeds1[1], seeds2[1])
+
+    self._assert_seeds_not_equal(seeds1[0], seeds1[1])
+
+  @parameterized.named_parameters(
+      dict(testcase_name="n_chains_is_list", n_chains_type=list),
+      dict(testcase_name="n_chains_is_int", n_chains_type=int),
+  )
+  def test_sample_posterior_joint_distribution_cached(self, n_chains_type):
+    n_chains = (
+        [self._N_CHAINS, self._N_CHAINS]
+        if n_chains_type == list
+        else self._N_CHAINS
+    )
+    self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            autospec=True,
+            return_value=collections.namedtuple(
+                "StatesAndTrace", ["all_states", "trace"]
+            )(
+                all_states=self.test_posterior_states_media_and_rf,
+                trace=self.test_trace,
+            ),
+        )
+    )
+    mock_dist = mock.create_autospec(backend.tfd.Distribution, instance=True)
+    mock_dist.sample.return_value = self.test_posterior_states_media_and_rf
+    mock_dist.experimental_pin = mock.MagicMock(return_value=mock_dist)
+
+    self.enter_context(
+        mock.patch.object(
+            az,
+            "convert_to_inference_data",
+            autospec=True,
+            return_value=az.InferenceData(),
+        )
+    )
+    self.enter_context(
+        mock.patch.object(
+            az,
+            "concat",
+            autospec=True,
+            return_value=az.InferenceData(),
+        )
+    )
+
+    mock_get_joint_dist_unpinned = self.enter_context(
+        mock.patch.object(
+            posterior_sampler.PosteriorMCMCSampler,
+            "_get_joint_dist_unpinned",
+            autospec=True,
+            return_value=mock_dist,
+        )
+    )
+    model_spec = spec.ModelSpec()
+    input_data = self.short_input_data_with_media_and_rf
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec,
+    )
+
+    meridian.sample_posterior(
+        n_chains=n_chains,
+        n_adapt=self._N_ADAPT,
+        n_burnin=self._N_BURNIN,
+        n_keep=self._N_KEEP,
+        seed=123,
+    )
+    mock_get_joint_dist_unpinned.assert_called_once()
+
+  def test_sample_posterior_strictly_excludes_unmapped_variables(self):
+    """Ensures internal nodes like 'y' never leak into InferenceData."""
+    n_chains = 2
+    n_keep = 10
+    n_burnin = 1
+    total_mcmc_draws = n_burnin + n_keep  # 11
+
+    # Raw NUTS output is (Draws, Chains, ...)
+    latent_raw_samples = {
+        constants.ALPHA_M: backend.zeros((total_mcmc_draws, n_chains, 3))
+    }
+
+    # Reconstruction logic happens AFTER slicing/transposing.
+    # So the reconstruction mock should be (Chains, Draws, ...)
+    reconstructed_samples = {
+        constants.ALPHA_M: backend.zeros((n_chains, n_keep, 3)),  # Overlap
+        constants.BETA_M: backend.zeros((n_chains, n_keep, 3)),  # Deterministic
+        "y": backend.zeros((n_chains, n_keep, 3, 100)),  # The Leak
+    }
+
+    mock_trace = {
+        k: backend.zeros((total_mcmc_draws, n_chains))
+        for k in [
+            "target_log_prob",
+            "diverging",
+            "accept_ratio",
+            "variance_scaling",
+            "n_steps",
+            "is_accepted",
+        ]
+    }
+    mock_trace["step_size"] = backend.ones((total_mcmc_draws, n_chains))
+    mock_trace["tune"] = backend.zeros((total_mcmc_draws, n_chains))
+
+    self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            return_value=collections.namedtuple(
+                "States", ["all_states", "trace"]
+            )(
+                all_states=collections.namedtuple(
+                    "L", latent_raw_samples.keys()  # pyrefly: ignore[bad-class-definition]
+                )(**latent_raw_samples),
+                trace=mock_trace,
+            ),
+        )
+    )
+
+    self.enter_context(
+        mock.patch.object(
+            posterior_sampler.PosteriorMCMCSampler,
+            "_reconstruct_posteriors",
+            return_value=reconstructed_samples,
+        )
+    )
+
+    meridian = model.Meridian(
+        input_data=self.short_input_data_with_media_only,
+        model_spec=spec.ModelSpec(),
+    )
+
+    meridian.sample_posterior(
+        n_chains=n_chains, n_adapt=1, n_burnin=n_burnin, n_keep=n_keep
+    )
+
+    posterior = meridian.inference_data.posterior  # pyrefly: ignore[missing-attribute]
+    self.assertIn(
+        constants.BETA_M, posterior, "Deterministics should be present."
+    )
+    self.assertNotIn(
+        "y", posterior, "Likelihood node 'y' must be filtered out."
+    )
+    self.assertNotIn("log_likelihood", posterior)
+
+  def test_sample_posterior_with_allows_negative_aggregate_baseline_false_reconstructs_knots(
+      self,
+  ):
+    """Ensures rotated knots are reconstructed and excluded from output."""
+    n_chains = 2
+    n_keep = 10
+    n_burnin = 1
+    total_mcmc_draws = n_burnin + n_keep
+
+    latent_raw_samples = {
+        constants.ROTATED_KNOT_0: backend.zeros(
+            (total_mcmc_draws, n_chains, 1)
+        ),
+        constants.ROTATED_KNOT_REST: backend.zeros(
+            (total_mcmc_draws, n_chains, self._N_TIMES_SHORT - 1)
+        ),
+    }
+
+    reconstructed_samples = {
+        constants.KNOT_VALUES: backend.zeros(
+            (n_chains, n_keep, self._N_TIMES_SHORT)
+        ),
+        constants.MU_T: backend.zeros((n_chains, n_keep, self._N_TIMES_SHORT)),
+        constants.ROTATED_KNOT_0: backend.zeros((n_chains, n_keep, 1)),
+        constants.ROTATED_KNOT_REST: backend.zeros(
+            (n_chains, n_keep, self._N_TIMES_SHORT - 1)
+        ),
+    }
+
+    mock_trace = {
+        k: backend.zeros((total_mcmc_draws, n_chains))
+        for k in [
+            "target_log_prob",
+            "diverging",
+            "accept_ratio",
+            "variance_scaling",
+            "n_steps",
+            "is_accepted",
+        ]
+    }
+    mock_trace["step_size"] = backend.ones((total_mcmc_draws, n_chains))
+    mock_trace["tune"] = backend.zeros((total_mcmc_draws, n_chains))
+
+    self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            return_value=collections.namedtuple(
+                "States", ["all_states", "trace"]
+            )(
+                all_states=collections.namedtuple(
+                    "L", latent_raw_samples.keys()  # pyrefly: ignore[bad-class-definition]
+                )(**latent_raw_samples),
+                trace=mock_trace,
+            ),
+        )
+    )
+
+    self.enter_context(
+        mock.patch.object(
+            posterior_sampler.PosteriorMCMCSampler,
+            "_reconstruct_posteriors",
+            return_value=reconstructed_samples,
+        )
+    )
+
+    meridian = model.Meridian(
+        input_data=self.short_input_data_with_media_only,
+        model_spec=spec.ModelSpec(allows_negative_aggregate_baseline=False),
+    )
+
+    meridian.sample_posterior(
+        n_chains=n_chains, n_adapt=1, n_burnin=n_burnin, n_keep=n_keep
+    )
+
+    posterior = meridian.inference_data.posterior  # pyrefly: ignore[missing-attribute]
+    self.assertIn(
+        constants.KNOT_VALUES,
+        posterior,
+        "knot_values must be present in posterior.",
+    )
+    self.assertIn(
+        constants.MU_T, posterior, "mu_t must be present in posterior."
+    )
+    self.assertNotIn(
+        constants.ROTATED_KNOT_0,
+        posterior,
+        "rotated_knot_0 must not be saved to InferenceData.",
+    )
+    self.assertNotIn(
+        constants.ROTATED_KNOT_REST,
+        posterior,
+        "rotated_knot_rest must not be saved to InferenceData.",
+    )
+
+  def _mock_xla_windowed_adaptive_nuts(self) -> mock.MagicMock:
+    return self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            autospec=True,
+            return_value=backend.mcmc.StatesAndTrace(
+                all_states=self.test_posterior_states_media_and_rf,
+                trace=self.test_trace,
+            ),
+        )
+    )
+
+  def test_sample_posterior_without_progress_callback_passes_no_step_callback(
+      self,
+  ):
+    mock_sample_posterior = self._mock_xla_windowed_adaptive_nuts()
+    meridian = model.Meridian(
+        input_data=self.short_input_data_with_media_and_rf,
+        model_spec=spec.ModelSpec(),
+    )
+
+    meridian.sample_posterior(
+        n_chains=self._N_CHAINS,
+        n_adapt=self._N_ADAPT,
+        n_burnin=self._N_BURNIN,
+        n_keep=self._N_KEEP,
+    )
+
+    self.assertIsNone(mock_sample_posterior.call_args.kwargs["step_callback"])
+
+  def test_sample_posterior_reports_progress(self):
+    mock_sample_posterior = self._mock_xla_windowed_adaptive_nuts()
+    meridian = model.Meridian(
+        input_data=self.short_input_data_with_media_and_rf,
+        model_spec=spec.ModelSpec(),
+    )
+    snapshots = []
+    n_chain_batches = 2
+    # 2 batches x 2 chains x 10 kept draws = 40 draws to reconstruct.
+    reconstruction_batch_size = 15
+
+    meridian.sample_posterior(
+        n_chains=[self._N_CHAINS] * n_chain_batches,
+        n_adapt=self._N_ADAPT,
+        n_burnin=self._N_BURNIN,
+        n_keep=self._N_KEEP,
+        seed=1,
+        reconstruction_batch_size=reconstruction_batch_size,
+        progress_callback=snapshots.append,
+    )
+
+    # The mocked sampler reports no steps, so progress advances per batch.
+    for call in mock_sample_posterior.call_args_list:
+      self.assertIsNotNone(call.kwargs["step_callback"])
+    n_draws = self._N_ADAPT + self._N_BURNIN + self._N_KEEP
+    n_divergent_per_batch = int(
+        np.count_nonzero(
+            np.asarray(self.test_trace[constants.DIVERGING])[self._N_BURNIN :]
+        )
+    )
+    common = dict(
+        n_chain_batches=n_chain_batches,
+        n_adapt=self._N_ADAPT,
+        n_burnin=self._N_BURNIN,
+        n_keep=self._N_KEEP,
+        n_reconstruction_batches=3,
+    )
+    expected = [
+        progress.PosteriorSamplingProgress(
+            stage=progress.PosteriorSamplingStage.ADAPTATION,
+            chain_batch=0,
+            draw=0,
+            n_divergent=0,
+            reconstruction_batch=0,
+            **common,
+        ),
+        progress.PosteriorSamplingProgress(
+            stage=progress.PosteriorSamplingStage.KEEP,
+            chain_batch=0,
+            draw=n_draws,
+            n_divergent=n_divergent_per_batch,
+            reconstruction_batch=0,
+            **common,
+        ),
+        progress.PosteriorSamplingProgress(
+            stage=progress.PosteriorSamplingStage.ADAPTATION,
+            chain_batch=1,
+            draw=0,
+            n_divergent=n_divergent_per_batch,
+            reconstruction_batch=0,
+            **common,
+        ),
+        progress.PosteriorSamplingProgress(
+            stage=progress.PosteriorSamplingStage.KEEP,
+            chain_batch=1,
+            draw=n_draws,
+            n_divergent=2 * n_divergent_per_batch,
+            reconstruction_batch=0,
+            **common,
+        ),
+    ] + [
+        progress.PosteriorSamplingProgress(
+            stage=progress.PosteriorSamplingStage.RECONSTRUCTION,
+            chain_batch=1,
+            draw=n_draws,
+            n_divergent=2 * n_divergent_per_batch,
+            reconstruction_batch=batch,
+            **common,
+        )
+        for batch in (1, 2, 3)
+    ]
+    self.assertEqual(snapshots, expected)
+    self.assertEqual(
+        snapshots[-1].n_divergent,
+        int(meridian.inference_data.sample_stats.diverging.sum()),  # pyrefly: ignore[missing-attribute]
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="zero_adapt",
+          n_adapt=0,
+          n_burnin=2,
+          n_keep=2,
+          expected_stages=[
+              progress.PosteriorSamplingStage.BURNIN,
+              progress.PosteriorSamplingStage.BURNIN,
+              progress.PosteriorSamplingStage.BURNIN,
+              progress.PosteriorSamplingStage.KEEP,
+              progress.PosteriorSamplingStage.KEEP,
+          ],
+      ),
+      dict(
+          testcase_name="zero_adapt_and_burnin",
+          n_adapt=0,
+          n_burnin=0,
+          n_keep=2,
+          expected_stages=[
+              progress.PosteriorSamplingStage.KEEP,
+              progress.PosteriorSamplingStage.KEEP,
+              progress.PosteriorSamplingStage.KEEP,
+          ],
+      ),
+  )
+  def test_sample_posterior_progress_skips_empty_initial_stages(
+      self,
+      n_adapt: int,
+      n_burnin: int,
+      n_keep: int,
+      expected_stages: list[progress.PosteriorSamplingStage],
+  ):
+    n_draws = n_burnin + n_keep
+    base_states = self.test_posterior_states_media_and_rf
+    states = base_states._replace(
+        **{k: v[:n_draws] for k, v in base_states._asdict().items()}
+    )
+    trace = {k: v[:n_draws] for k, v in self.test_trace.items()}
+    trace[constants.DIVERGING] = backend.to_tensor(
+        np.ones((n_draws, self._N_CHAINS), dtype=bool)
+    )
+
+    def run_nuts(*, step_callback=None, **kwargs):
+      del kwargs
+      assert step_callback is not None
+      for _ in range(n_adapt + n_draws):
+        step_callback(self._N_CHAINS)
+      return backend.mcmc.StatesAndTrace(all_states=states, trace=trace)
+
+    self.enter_context(
+        mock.patch.object(
+            backend,
+            "xla_windowed_adaptive_nuts",
+            autospec=True,
+            side_effect=run_nuts,
+        )
+    )
+    meridian = model.Meridian(
+        input_data=self.short_input_data_with_media_and_rf,
+        model_spec=spec.ModelSpec(),
+    )
+    snapshots = []
+
+    meridian.sample_posterior(
+        n_chains=self._N_CHAINS,
+        n_adapt=n_adapt,
+        n_burnin=n_burnin,
+        n_keep=n_keep,
+        seed=1,
+        progress_callback=snapshots.append,
+    )
+
+    sampling_snapshots = [
+        s
+        for s in snapshots
+        if s.stage is not progress.PosteriorSamplingStage.RECONSTRUCTION
+    ]
+    self.assertEqual([s.stage for s in sampling_snapshots], expected_stages)
+    self.assertEqual(
+        [s.draw for s in sampling_snapshots],
+        list(range(n_adapt + n_draws + 1)),
+    )
+    # Divergences are counted only during KEEP draws, never during BURNIN.
+    expected_divergent = [
+        self._N_CHAINS * max(draw - n_adapt - n_burnin, 0)
+        for draw in range(n_adapt + n_draws + 1)
+    ]
+    self.assertEqual(
+        [s.n_divergent for s in sampling_snapshots], expected_divergent
+    )
+
+  def test_sample_posterior_progress_callback_exception_warns(self):
+    self._mock_xla_windowed_adaptive_nuts()
+    meridian = model.Meridian(
+        input_data=self.short_input_data_with_media_and_rf,
+        model_spec=spec.ModelSpec(),
+    )
+    progress_callback = mock.create_autospec(
+        _no_op_progress_callback, side_effect=ValueError("sink unavailable")
+    )
+
+    with self.assertWarnsRegex(RuntimeWarning, "sink unavailable"):
+      meridian.sample_posterior(
+          n_chains=self._N_CHAINS,
+          n_adapt=self._N_ADAPT,
+          n_burnin=self._N_BURNIN,
+          n_keep=self._N_KEEP,
+          progress_callback=progress_callback,
+      )
+
+    # Sampling completed, and the callback kept being called after failing.
+    self.assertTrue(hasattr(meridian.inference_data, constants.POSTERIOR))
+    self.assertGreater(progress_callback.call_count, 1)
+
+  def test_sample_posterior_progress_reports_every_draw_jax(self):
+    if backend.config.get_backend() != backend.config.Backend.JAX:
+      self.skipTest("Only the JAX backend reports every MCMC draw.")
+
+    input_data = data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+        n_geos=3,
+        n_times=20,
+        n_media_times=23,
+        n_controls=1,
+        n_media_channels=2,
+        seed=0,
+    )
+    n_chains = [1, 1]
+    n_adapt, n_burnin, n_keep = 3, 2, 4
+    n_draws = n_adapt + n_burnin + n_keep
+    sampling_kwargs = dict(
+        n_chains=n_chains,
+        n_adapt=n_adapt,
+        n_burnin=n_burnin,
+        n_keep=n_keep,
+        seed=1,
+    )
+
+    expected_meridian = model.Meridian(input_data=input_data)
+    expected_meridian.sample_posterior(**sampling_kwargs)
+    snapshots = []
+    meridian = model.Meridian(input_data=input_data)
+    meridian.sample_posterior(
+        progress_callback=snapshots.append, **sampling_kwargs
+    )
+
+    # Reporting progress does not change the draws.
+    for group in (constants.POSTERIOR, "sample_stats", "trace"):
+      expected_group = getattr(expected_meridian.inference_data, group)
+      actual_group = getattr(meridian.inference_data, group)
+      self.assertCountEqual(actual_group.data_vars, expected_group.data_vars)
+      for name in expected_group.data_vars:
+        test_utils.assert_allequal(
+            actual_group[name].values,
+            expected_group[name].values,
+            err_msg=f"{group}.{name}",
+        )
+
+    def expected_stage(draw: int) -> progress.PosteriorSamplingStage:
+      if max(draw, 1) <= n_adapt:
+        return progress.PosteriorSamplingStage.ADAPTATION
+      if draw <= n_adapt + n_burnin:
+        return progress.PosteriorSamplingStage.BURNIN
+      return progress.PosteriorSamplingStage.KEEP
+
+    sampling_snapshots = [
+        snapshot
+        for snapshot in snapshots
+        if snapshot.stage is not progress.PosteriorSamplingStage.RECONSTRUCTION
+    ]
+    # Each chain batch reports its start, then every single draw.
+    expected_sampling_events = []
+    for chain_batch in range(len(n_chains)):
+      for draw in range(n_draws + 1):
+        expected_sampling_events.append(
+            (chain_batch, draw, expected_stage(draw))
+        )
+    self.assertEqual(
+        [(s.chain_batch, s.draw, s.stage) for s in sampling_snapshots],
+        expected_sampling_events,
+    )
+    reconstruction_snapshots = snapshots[len(sampling_snapshots) :]
+    self.assertEqual(
+        [
+            (s.reconstruction_batch, s.n_reconstruction_batches)
+            for s in reconstruction_snapshots
+        ],
+        [(1, 1)],
+    )
+    self.assertEqual(
+        snapshots[-1].n_divergent,
+        int(meridian.inference_data.sample_stats.diverging.sum()),  # pyrefly: ignore[missing-attribute]
+    )
+
+
+class PosteriorMCMCSamplerInitTest(
+    parameterized.TestCase,
+    model_test_data.WithInputDataSamples,
+):
+  input_data_samples = model_test_data.WithInputDataSamples
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    model_test_data.WithInputDataSamples.setup()
+
+  def setUp(self):
+    super().setUp()
+    self.meridian = model.Meridian(
+        input_data=self.short_input_data_with_media_only,
+        model_spec=spec.ModelSpec(),
+    )
+
+  def test_init_with_meridian(self):
+    sampler = posterior_sampler.PosteriorMCMCSampler(self.meridian)
+    self.assertIs(sampler._meridian, self.meridian)
+    self.assertIs(sampler._model_context, self.meridian.model_context)
+    self.assertIsInstance(sampler._model_equations, equations.ModelEquations)
+
+  def test_init_with_model_context(self):
+    sampler = posterior_sampler.PosteriorMCMCSampler(
+        model_context=self.meridian.model_context,
+    )
+    self.assertIsNone(sampler._meridian)
+    self.assertIs(sampler._model_context, self.meridian.model_context)
+    self.assertIsInstance(sampler._model_equations, equations.ModelEquations)
+
+  def test_init_raises_error_if_meridian_and_context_are_none(
+      self,
+  ):
+    with self.assertRaisesRegex(
+        ValueError,
+        "Either `meridian` or `model_context` must be provided.",
+    ):
+      posterior_sampler.PosteriorMCMCSampler()
+
+
+class ReconstructionBatchingTest(
+    parameterized.TestCase,
+    model_test_data.WithInputDataSamples,
+):
+  input_data_samples = model_test_data.WithInputDataSamples
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    model_test_data.WithInputDataSamples.setup()
+
+  def setUp(self):
+    super().setUp()
+    self.meridian = model.Meridian(
+        input_data=self.short_input_data_with_media_only,
+        model_spec=spec.ModelSpec(),
+    )
+    self.n_chains = 2
+    self.n_keep = 10
+    self.n_burnin = 5
+    self.n_total = self.n_chains * self.n_keep
+
+    # Needs to match what is present in test_posterior_states_media_only
+    mock_states = collections.namedtuple(
+        "StatesAndTrace", ["all_states", "trace"]
+    )(
+        all_states=self.test_posterior_states_media_only,
+        trace=self.test_trace,
+    )
+    self.patch_nuts = mock.patch.object(
+        backend,
+        "xla_windowed_adaptive_nuts",
+        autospec=True,
+        return_value=mock_states,
+    )
+    self.mock_nuts = self.patch_nuts.start()
+
+  def tearDown(self):
+    self.patch_nuts.stop()
+    super().tearDown()
+
+  @parameterized.parameters(
+      {"batch_size": 1},
+      {"batch_size": 7},
+      {"batch_size": 20},  # n_total
+      {"batch_size": 33},  # n_total + 13
+  )
+  def test_equivalence_with_chunking(self, batch_size):
+    # Single-shot reference run
+    self.meridian._inference_data = az.InferenceData()
+    self.meridian.sample_posterior(
+        n_chains=self.n_chains,
+        n_adapt=0,
+        n_burnin=self.n_burnin,
+        n_keep=self.n_keep,
+        reconstruction_batch_size=self.n_total + 100,  # Single shot
+    )
+    posterior_ref = self.meridian.inference_data.posterior  # pyrefly: ignore[missing-attribute]
+
+    # Chunked run
+    meridian_chunked = model.Meridian(
+        input_data=self.short_input_data_with_media_only,
+        model_spec=spec.ModelSpec(),
+    )
+    meridian_chunked.sample_posterior(
+        n_chains=self.n_chains,
+        n_adapt=0,
+        n_burnin=self.n_burnin,
+        n_keep=self.n_keep,
+        reconstruction_batch_size=batch_size,
+    )
+    posterior_chunked = meridian_chunked.inference_data.posterior  # pyrefly: ignore[missing-attribute]
+
+    self.assertEqual(
+        set(posterior_ref.data_vars), set(posterior_chunked.data_vars)
+    )
+    for var_name in posterior_ref.data_vars:
+      np.testing.assert_allclose(
+          posterior_chunked[var_name].values,
+          posterior_ref[var_name].values,
+          err_msg=f"Mismatch for {var_name}",
+      )
+
+  def test_every_batch_has_the_same_size(self):
+    # 20 draws in batches of 7: the last batch covers draws 13-19, not 14-19.
+    with mock.patch.object(
+        posterior_sampler,
+        "_build_reconstruction_values",
+        wraps=posterior_sampler._build_reconstruction_values,
+    ) as mock_build_values:
+      self.meridian.sample_posterior(
+          n_chains=self.n_chains,
+          n_adapt=0,
+          n_burnin=self.n_burnin,
+          n_keep=self.n_keep,
+          reconstruction_batch_size=7,
+      )
+    mock_build_values.assert_called()
+    for call in mock_build_values.call_args_list:
+      _, latent_chunk, pinned_likelihood = call.args
+      self.assertEqual(pinned_likelihood.shape[0], 7)
+      for value in latent_chunk.values():
+        self.assertEqual(value.shape[0], 7)
+
+  def test_compiled_reconstruction_matches_uncompiled(self):
+    meridian_uncompiled = model.Meridian(
+        input_data=self.short_input_data_with_media_only,
+        model_spec=spec.ModelSpec(),
+    )
+    with mock.patch.object(
+        backend, "compile_temporary_function", side_effect=lambda func: func
+    ) as mock_compile:
+      meridian_uncompiled.sample_posterior(
+          n_chains=self.n_chains,
+          n_adapt=0,
+          n_burnin=self.n_burnin,
+          n_keep=self.n_keep,
+          reconstruction_batch_size=7,
+      )
+    mock_compile.assert_called_once()
+    posterior_uncompiled = meridian_uncompiled.inference_data.posterior  # pyrefly: ignore[missing-attribute]
+
+    self.meridian.sample_posterior(
+        n_chains=self.n_chains,
+        n_adapt=0,
+        n_burnin=self.n_burnin,
+        n_keep=self.n_keep,
+        reconstruction_batch_size=7,
+    )
+    posterior_compiled = self.meridian.inference_data.posterior  # pyrefly: ignore[missing-attribute]
+
+    self.assertEqual(
+        set(posterior_uncompiled.data_vars), set(posterior_compiled.data_vars)
+    )
+    for var_name in posterior_uncompiled.data_vars:
+      # Compilation can change the order of floating-point operations.
+      np.testing.assert_allclose(
+          posterior_compiled[var_name].values,
+          posterior_uncompiled[var_name].values,
+          rtol=1e-5,
+          atol=1e-6,
+          err_msg=f"Mismatch for {var_name}",
+      )
+
+  def test_reconstruct_posteriors_with_no_draws_returns_empty(self):
+    sampler = posterior_sampler.PosteriorMCMCSampler(
+        model_context=self.meridian.model_context
+    )
+    reconstructed = sampler._reconstruct_posteriors(
+        latents={constants.SIGMA: backend.zeros([2, 0])},
+        rng_handler=backend.RNGHandler(0),
+        batch_size=10,
+    )
+    self.assertEmpty(reconstructed)
+
+  def test_fail_fast_reconstruction_batch_size(self):
+    with self.assertRaisesRegex(ValueError, "must be a positive integer"):
+      self.meridian.sample_posterior(
+          n_chains=2,
+          n_adapt=0,
+          n_burnin=0,
+          n_keep=2,
+          reconstruction_batch_size=0,
+      )
+    self.mock_nuts.assert_not_called()
+
+  def test_oom_translation(self):
+    err = (
+        MemoryError("OOM")
+        if backend.errors.ResourceExhaustedError is MemoryError
+        else backend.errors.ResourceExhaustedError(None, None, "OOM")  # type: ignore
+    )
+    with mock.patch.object(
+        posterior_sampler.PosteriorMCMCSampler,
+        "_reconstruct_posteriors",
+        side_effect=err,
+    ):
+      with self.assertRaisesRegex(
+          posterior_sampler.MCMCOOMError,
+          "Reconstruction peak memory scales with `reconstruction_batch_size`",
+      ):
+        self.meridian.sample_posterior(
+            n_chains=2,
+            n_adapt=0,
+            n_burnin=self.n_burnin,
+            n_keep=self.n_keep,
+            reconstruction_batch_size=10,
+        )
+
+  def test_flatten_chain_and_draw_dims(self):
+    latents = {
+        "a": backend.zeros([2, 5, 3]),
+        "b": backend.ones([2, 5]),
+    }
+    flat, c, d = posterior_sampler._flatten_chain_and_draw_dims(latents)
+    self.assertEqual(c, 2)
+    self.assertEqual(d, 5)
+    self.assertEqual(flat["a"].shape, (10, 3))
+    self.assertEqual(flat["b"].shape, (10,))
+
+    with self.assertRaisesRegex(ValueError, "empty latents"):
+      posterior_sampler._flatten_chain_and_draw_dims({})
+
+  def test_build_reconstruction_values(self):
+    class MockDist:
+      dtype = collections.namedtuple("Structure", ["node1", "node2", "y"])(
+          None, None, None
+      )
+
+    values = posterior_sampler._build_reconstruction_values(
+        MockDist(),
+        {"node1": cast(backend.Tensor, np.array(1.0))},
+        cast(backend.Tensor, np.array(2.0)),
+    )
+    self.assertEqual(values, (np.array(1.0), None, np.array(2.0)))
+
+  def test_host_result_accumulator(self):
+    acc = posterior_sampler._HostResultAccumulator(total_size=10)
+    acc.write("a", np.ones((4, 2)), start=0)
+    acc.write("a", np.ones((6, 2)) * 2, start=4)
+    arrays = acc.to_arrays(leading_shape=(2, 5))
+    self.assertEqual(arrays["a"].shape, (2, 5, 2))
+    self.assertEqual(arrays["a"][0, 0, 0], 1.0)
+    self.assertEqual(arrays["a"][1, 4, 1], 2.0)
+
+
+_ModelSpecWithChangepoints = spec._ModelSpecWithChangepoints  # pylint: disable=protected-access
+_PriorDistributionWithChangepoints = (
+    prior_distribution._PriorDistributionWithChangepoints  # pylint: disable=protected-access
+)
+
+
+class TimeVaryingPosteriorTest(
+    test_utils.MeridianTestCase,
+    parameterized.TestCase,
+    model_test_data.WithInputDataSamples,
+):
+  """Tests posterior sampling of models with changepoints."""
+
+  input_data_samples = model_test_data.WithInputDataSamples
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    model_test_data.WithInputDataSamples.setup()
+
+  def setUp(self):
+    super().setUp()
+    self.enter_context(
+        mock.patch.object(
+            model.Meridian,
+            "_run_model_fitting_guardrail",
+            autospec=True,
+            spec_set=True,
+            return_value=None,
+        )
+    )
+    data = self.short_input_data_with_media_and_rf
+    assert data.media_channel is not None and data.rf_channel is not None
+    self._media = [str(name) for name in data.media_channel.values]
+    self._rf = [str(name) for name in data.rf_channel.values]
+    self._dates = data.time_coordinates.all_dates
+
+  def _meridian(self, **spec_kwargs) -> model.Meridian:
+    return model.Meridian(
+        input_data=self.short_input_data_with_media_and_rf,
+        model_spec=_ModelSpecWithChangepoints(
+            changepoints={
+                self._media[1]: [self._dates[20]],
+                self._rf[0]: [self._dates[10], self._dates[30]],
+            },
+            **spec_kwargs,
+        ),
+    )
+
+  @parameterized.named_parameters(
+      ("default_baseline", True), ("constrained_baseline", False)
+  )
+  def test_joint_dist_has_time_varying_parameters(
+      self, allows_negative_aggregate_baseline: bool
+  ):
+    meridian = self._meridian(
+        allows_negative_aggregate_baseline=allows_negative_aggregate_baseline
+    )
+    sample = (
+        meridian.posterior_sampler_callable._get_joint_dist_unpinned().sample(
+            self._N_DRAWS, seed=self.get_next_rng_seed_or_key()
+        )
+    )
+    # One media and one RF channel have changepoints; the RF channel has 3
+    # intervals, so both share an interval axis of length 3.
+    self.assertEqual(sample.zeta_m.shape, (self._N_DRAWS, 1))
+    self.assertEqual(sample.varphi_m.shape, (self._N_DRAWS, 1, 3))
+    self.assertEqual(sample.zeta_rf.shape, (self._N_DRAWS, 1))
+    self.assertEqual(sample.varphi_rf.shape, (self._N_DRAWS, 1, 3))
+    self.assertTrue(np.all(np.isfinite(np.asarray(sample.y))))
+
+  @parameterized.product(
+      data_name=(
+          "short_input_data_with_media_only",
+          "short_input_data_with_rf_only",
+          "national_input_data_media_and_rf",
+      ),
+      prior_type=(
+          constants.TREATMENT_PRIOR_TYPE_ROI,
+          constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+      ),
+  )
+  def test_joint_dist_for_each_channel_type(
+      self, data_name: str, prior_type: str
+  ):
+    data = getattr(self, data_name)
+    dates = data.time_coordinates.all_dates
+    changepoints_spec = {
+        str(names.values[0]): [dates[len(dates) // 2]]
+        for names in (data.media_channel, data.rf_channel)
+        if names is not None
+    }
+    meridian = model.Meridian(
+        input_data=data,
+        model_spec=_ModelSpecWithChangepoints(
+            changepoints=changepoints_spec,
+            media_prior_type=prior_type,
+            rf_prior_type=prior_type,
+            changepoint_media_prior_type=prior_type,
+            changepoint_rf_prior_type=prior_type,
+        ),
+    )
+    sample = (
+        meridian.posterior_sampler_callable._get_joint_dist_unpinned().sample(
+            self._N_DRAWS, seed=self.get_next_rng_seed_or_key()
+        )
+    )
+    for names, varphi in (
+        (data.media_channel, constants.VARPHI_M),
+        (data.rf_channel, constants.VARPHI_RF),
+    ):
+      if names is None:
+        self.assertFalse(hasattr(sample, varphi))
+      else:
+        self.assertEqual(getattr(sample, varphi).shape, (self._N_DRAWS, 1, 2))
+    self.assertTrue(np.all(np.isfinite(np.asarray(sample.y))))
+
+  @parameterized.product(
+      prior_type=(
+          constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          constants.TREATMENT_PRIOR_TYPE_ROI,
+      ),
+      allows_negative_aggregate_baseline=(True, False),
+      media_effects_dist=(
+          constants.MEDIA_EFFECTS_LOG_NORMAL,
+          constants.MEDIA_EFFECTS_NORMAL,
+      ),
+      changepoint_media_effects_dist=(
+          constants.MEDIA_EFFECTS_LOG_NORMAL,
+          constants.MEDIA_EFFECTS_NORMAL,
+      ),
+      is_rf=(False, True),
+  )
+  def test_outcome_uses_each_time_periods_coefficient(
+      self,
+      prior_type: str,
+      allows_negative_aggregate_baseline: bool,
+      media_effects_dist: str,
+      changepoint_media_effects_dist: str,
+      is_rf: bool,
+  ):
+    self._assert_outcome_uses_each_time_periods_coefficient(
+        prior_types=(prior_type, prior_type),
+        allows_negative_aggregate_baseline=allows_negative_aggregate_baseline,
+        media_effects_dist=media_effects_dist,
+        changepoint_media_effects_dist=changepoint_media_effects_dist,
+        is_rf=is_rf,
+    )
+
+  # Each order of the prior types is tested with both channel types and both
+  # random effects distributions, without all eight combinations, to keep the
+  # test's memory down.
+  @parameterized.named_parameters(
+      (
+          "coefficient_then_roi_media",
+          (
+              constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+              constants.TREATMENT_PRIOR_TYPE_ROI,
+          ),
+          constants.MEDIA_EFFECTS_LOG_NORMAL,
+          False,
+      ),
+      (
+          "roi_then_coefficient_media",
+          (
+              constants.TREATMENT_PRIOR_TYPE_ROI,
+              constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          ),
+          constants.MEDIA_EFFECTS_NORMAL,
+          False,
+      ),
+      (
+          "coefficient_then_roi_rf",
+          (
+              constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+              constants.TREATMENT_PRIOR_TYPE_ROI,
+          ),
+          constants.MEDIA_EFFECTS_NORMAL,
+          True,
+      ),
+      (
+          "roi_then_coefficient_rf",
+          (
+              constants.TREATMENT_PRIOR_TYPE_ROI,
+              constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          ),
+          constants.MEDIA_EFFECTS_LOG_NORMAL,
+          True,
+      ),
+  )
+  def test_outcome_with_other_changepoint_prior_type(
+      self, prior_types: tuple[str, str], media_effects_dist: str, is_rf: bool
+  ):
+    # The two channels also use different distributions, so the results that
+    # each channel discards are computed with the other channel's distribution.
+    self._assert_outcome_uses_each_time_periods_coefficient(
+        prior_types=prior_types,
+        allows_negative_aggregate_baseline=True,
+        media_effects_dist=media_effects_dist,
+        changepoint_media_effects_dist=(
+            constants.MEDIA_EFFECTS_NORMAL
+            if media_effects_dist == constants.MEDIA_EFFECTS_LOG_NORMAL
+            else constants.MEDIA_EFFECTS_LOG_NORMAL
+        ),
+        is_rf=is_rf,
+    )
+
+  def test_outcome_with_two_non_coefficient_prior_types(self):
+    # Each channel takes the coefficients of its own treatment parameter, so
+    # the ROI draw matches the channel with changepoints.
+    self._assert_outcome_uses_each_time_periods_coefficient(
+        prior_types=(
+            constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+            constants.TREATMENT_PRIOR_TYPE_ROI,
+        ),
+        allows_negative_aggregate_baseline=True,
+        media_effects_dist=constants.MEDIA_EFFECTS_LOG_NORMAL,
+        changepoint_media_effects_dist=constants.MEDIA_EFFECTS_LOG_NORMAL,
+        is_rf=False,
+    )
+
+  def _assert_outcome_uses_each_time_periods_coefficient(
+      self,
+      *,
+      prior_types: tuple[str, str],
+      allows_negative_aggregate_baseline: bool,
+      media_effects_dist: str,
+      changepoint_media_effects_dist: str,
+      is_rf: bool,
+  ):
+    """Checks `y` and the treatment parameters of a joint distribution sample.
+
+    Args:
+      prior_types: The prior types of the channels without and with
+        changepoints.
+      allows_negative_aggregate_baseline: As in `ModelSpec`.
+      media_effects_dist: As in `ModelSpec`.
+      changepoint_media_effects_dist: As in `_ModelSpecWithChangepoints`.
+      is_rf: Whether to use RF channels rather than media channels.
+    """
+    if is_rf:
+      input_data = self.short_input_data_with_rf_only
+      channels = input_data.rf_channel
+    else:
+      input_data = self.short_input_data_with_media_only_no_controls
+      channels = input_data.media_channel
+    assert channels is not None
+    meridian = model.Meridian(
+        input_data=input_data,
+        model_spec=_ModelSpecWithChangepoints(
+            changepoints={
+                str(channels.values[1]): [
+                    input_data.time_coordinates.all_dates[20]
+                ]
+            },
+            media_prior_type=prior_types[0],
+            rf_prior_type=prior_types[0],
+            changepoint_media_prior_type=prior_types[1],
+            changepoint_rf_prior_type=prior_types[1],
+            allows_negative_aggregate_baseline=(
+                allows_negative_aggregate_baseline
+            ),
+            media_effects_dist=media_effects_dist,
+            changepoint_media_effects_dist=changepoint_media_effects_dist,
+            # With no noise, `y` is the linear predictor.
+            prior=_PriorDistributionWithChangepoints(
+                sigma=backend.tfd.Deterministic(backend.np_float_dtype(0.0)),
+            ),
+        ),
+    )
+    model_context = meridian.model_context
+    sample = (
+        meridian.posterior_sampler_callable._get_joint_dist_unpinned().sample(
+            2, seed=self.get_next_rng_seed_or_key()
+        )
+    )
+
+    # Rebuild `y` as the baseline plus the paid channels' contribution, using
+    # each time period's coefficient for the channel with changepoints.
+    eqn = equations.ModelEquations(model_context)
+    if is_rf:
+      rf_tensors = model_context.rf_tensors
+      reach, frequency = rf_tensors.reach_scaled, rf_tensors.frequency
+      assert reach is not None and frequency is not None
+      transformed = eqn.adstock_hill_rf(
+          reach=reach,
+          frequency=frequency,
+          alpha=sample.alpha_rf,
+          ec=sample.ec_rf,
+          slope=sample.slope_rf,
+          decay_functions=model_context.adstock_decay_spec.rf,
+          saturation_spec=model_context.saturation_spec.rf,
+      )
+      counterfactual_difference = (
+          eqn.linear_predictor_counterfactual_difference_rf(
+              rf_transformed=transformed,
+              alpha_rf=sample.alpha_rf,
+              ec_rf=sample.ec_rf,
+              slope_rf=sample.slope_rf,
+          )
+      )
+      beta_gx, zeta, varphi = sample.beta_grf, sample.zeta_rf, sample.varphi_rf
+      roi_name, prior_denominator = "roi_rf", rf_tensors.prior_denominator
+      beta_from_prior_name = constants.BETA_RF_FROM_PRIOR
+    else:
+      media_tensors = model_context.media_tensors
+      assert media_tensors.media_scaled is not None
+      transformed = eqn.adstock_hill_media(
+          media=media_tensors.media_scaled,
+          alpha=sample.alpha_m,
+          ec=sample.ec_m,
+          slope=sample.slope_m,
+          decay_functions=model_context.adstock_decay_spec.media,
+          saturation_spec=model_context.saturation_spec.media,
+      )
+      counterfactual_difference = (
+          eqn.linear_predictor_counterfactual_difference_media(
+              media_transformed=transformed,
+              alpha_m=sample.alpha_m,
+              ec_m=sample.ec_m,
+              slope_m=sample.slope_m,
+          )
+      )
+      beta_gx, zeta, varphi = sample.beta_gm, sample.zeta_m, sample.varphi_m
+      roi_name, prior_denominator = "roi_m", media_tensors.prior_denominator
+      beta_from_prior_name = constants.BETA_M_FROM_PRIOR
+    # Each channel's coefficients use its random effects distribution.
+    beta_dev = sample.beta_grf_dev if is_rf else sample.beta_gm_dev
+    beta = sample.beta_rf if is_rf else sample.beta_m
+    eta = sample.eta_rf if is_rf else sample.eta_m
+    beta_eta_combined = (
+        np.asarray(beta)[:, np.newaxis, :]
+        + np.asarray(eta)[:, np.newaxis, :] * np.asarray(beta_dev)
+    )
+    expected_beta_gx = (
+        beta_eta_combined.copy()
+        if media_effects_dist == constants.MEDIA_EFFECTS_NORMAL
+        else np.exp(beta_eta_combined)
+    )
+    changepoint_normal = (
+        changepoint_media_effects_dist == constants.MEDIA_EFFECTS_NORMAL
+    )
+    expected_beta_gx[..., 1] = (
+        beta_eta_combined[..., 1]
+        if changepoint_normal
+        else np.exp(beta_eta_combined[..., 1])
+    )
+    test_utils.assert_allclose(beta_gx, expected_beta_gx, rtol=1e-5)
+
+    coefficients = np.broadcast_to(
+        np.asarray(beta_gx)[:, :, np.newaxis, :], transformed.shape
+    ).copy()
+    time_effect = (
+        np.where(
+            np.arange(self._N_TIMES_SHORT) < 20,
+            np.asarray(varphi)[:, 0, 0, np.newaxis],
+            np.asarray(varphi)[:, 0, 1, np.newaxis],
+        )
+        * np.asarray(zeta)[:, 0, np.newaxis]
+    )
+    if changepoint_normal:
+      coefficients[..., 1] += time_effect[:, np.newaxis, :]
+    else:
+      coefficients[..., 1] *= np.exp(time_effect)[:, np.newaxis, :]
+    expected_y = (
+        np.asarray(sample.tau_g)[:, :, np.newaxis]
+        + np.asarray(sample.mu_t)[:, np.newaxis, :]
+        + np.einsum("cgtm,cgtm->cgt", np.asarray(transformed), coefficients)
+    )
+    if model_context.controls_scaled is not None:
+      expected_y += np.einsum(
+          "gtk,dgk->dgt",
+          np.asarray(model_context.controls_scaled),
+          np.asarray(sample.gamma_gc),
+      )
+    test_utils.assert_allclose(sample.y, expected_y, rtol=1e-4, atol=1e-6)
+
+    revenue_per_kpi = (
+        np.ones((self._N_GEOS, self._N_TIMES_SHORT))
+        if model_context.revenue_per_kpi is None
+        else np.asarray(model_context.revenue_per_kpi)
+    )
+    # Channel 0 has no changepoints, and channel 1 has a changepoint.
+    for channel, prior_type in enumerate(prior_types):
+      if prior_type == constants.TREATMENT_PRIOR_TYPE_ROI:
+        # The incremental outcome over all geos and time periods, using each
+        # time period's coefficient, matches the ROI draw.
+        incremental_outcome = np.einsum(
+            "cgt,gt,g,cgt->c",
+            np.asarray(counterfactual_difference)[..., channel],
+            revenue_per_kpi,
+            np.asarray(model_context.population),
+            coefficients[..., channel],
+        ) * float(model_context.kpi_transformer.population_scaled_stdev)
+        test_utils.assert_allclose(
+            incremental_outcome,
+            np.asarray(getattr(sample, roi_name))[:, channel]
+            * np.asarray(prior_denominator)[channel],
+            rtol=1e-3,
+        )
+      elif (
+          prior_type == constants.TREATMENT_PRIOR_TYPE_COEFFICIENT
+          and prior_types[0] != prior_types[1]
+      ):
+        # The coefficient prior is sampled under another name.
+        test_utils.assert_allclose(
+            np.asarray(beta)[:, channel],
+            np.asarray(getattr(sample, beta_from_prior_name))[:, channel],
+        )
+
+  @parameterized.parameters(
+      # The prior types of the channels without and with changepoints. The two
+      # cases cover every prior type, one of them with a coefficient prior.
+      (
+          constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+          constants.TREATMENT_PRIOR_TYPE_ROI,
+      ),
+      (
+          constants.TREATMENT_PRIOR_TYPE_MROI,
+          constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+      ),
+  )
+  def test_joint_dist_samples_each_prior_type(self, *prior_types: str):
+    meridian = self._meridian(
+        media_prior_type=prior_types[0],
+        rf_prior_type=prior_types[0],
+        changepoint_media_prior_type=prior_types[1],
+        changepoint_rf_prior_type=prior_types[1],
+    )
+    sampler = meridian.posterior_sampler_callable
+    coefficient = constants.TREATMENT_PRIOR_TYPE_COEFFICIENT
+    for get_joint_dist in (
+        "_get_joint_dist_unpinned",
+        "_get_joint_dist_sampling_unpinned",
+    ):
+      joint_dist = getattr(sampler, get_joint_dist)()
+      sample = joint_dist.sample(
+          self._N_DRAWS, seed=self.get_next_rng_seed_or_key()
+      )._asdict()
+      for parameters, beta_from_prior in (
+          (constants.MEDIA_TREATMENT_PARAMETERS, constants.BETA_M_FROM_PRIOR),
+          (constants.RF_TREATMENT_PARAMETERS, constants.BETA_RF_FROM_PRIOR),
+      ):
+        # A coefficient prior is sampled under another name.
+        names = {
+            prior_type: (
+                beta_from_prior
+                if prior_type == coefficient
+                else parameters[prior_type]
+            )
+            for prior_type in parameters
+        }
+        for prior_type, name in names.items():
+          with self.subTest(get_joint_dist=get_joint_dist, name=name):
+            if prior_type in prior_types:
+              self.assertIn(name, sample)
+            else:
+              self.assertNotIn(name, sample)
+        # Only the full joint distribution has `beta_m` and `beta_rf`.
+        beta = parameters[coefficient]
+        with self.subTest(get_joint_dist=get_joint_dist, name=beta):
+          if get_joint_dist == "_get_joint_dist_unpinned":
+            self.assertIn(beta, sample)
+          else:
+            self.assertNotIn(beta, sample)
+      self.assertTrue(np.all(np.isfinite(np.asarray(sample["y"]))))
+
+  def test_sample_posterior_stores_time_varying_parameters(self):
+    # The channels with changepoints use the default ROI prior and the other
+    # channels use other prior types, so one posterior covers both cases.
+    meridian = self._meridian(
+        media_prior_type="coefficient", rf_prior_type="mroi"
+    )
+    # Stand in for MCMC with draws of the sampled joint distribution.
+    n_draws = self._N_BURNIN + self._N_KEEP
+    joint_dist = meridian.posterior_sampler_callable._get_joint_dist_sampling()
+    states = joint_dist.sample_unpinned(
+        [n_draws, self._N_CHAINS], seed=self.get_next_rng_seed_or_key()
+    )
+    mock_return = collections.namedtuple(
+        "StatesAndTrace", ["all_states", "trace"]
+    )(all_states=states, trace=self.test_trace)
+    with mock.patch.object(
+        backend,
+        "xla_windowed_adaptive_nuts",
+        autospec=True,
+        return_value=mock_return,
+    ):
+      meridian.sample_posterior(
+          n_chains=self._N_CHAINS,
+          n_adapt=self._N_ADAPT,
+          n_burnin=self._N_BURNIN,
+          n_keep=self._N_KEEP,
+          seed=1,
+      )
+    posterior = meridian.inference_data.posterior  # pyrefly: ignore[missing-attribute]
+    self.assertEqual(
+        posterior[constants.ZETA_M].dims,
+        (constants.CHAIN, constants.DRAW, constants.CHANGEPOINT_MEDIA_CHANNEL),
+    )
+    self.assertEqual(
+        posterior[constants.VARPHI_RF].dims,
+        (
+            constants.CHAIN,
+            constants.DRAW,
+            constants.CHANGEPOINT_RF_CHANNEL,
+            constants.CHANGEPOINT_INTERVAL,
+        ),
+    )
+    self.assertEqual(
+        list(posterior[constants.CHANGEPOINT_MEDIA_CHANNEL].values),
+        [self._media[1]],
+    )
+    self.assertEqual(
+        list(posterior[constants.CHANGEPOINT_RF_CHANNEL].values), [self._rf[0]]
+    )
+    self.assertEqual(
+        posterior[constants.VARPHI_M].shape,
+        (self._N_CHAINS, self._N_KEEP, 1, 3),
+    )
+    # The stored geo-level coefficients of the channels with changepoints are
+    # kept, even though the outcome leaves them out of the shared media sum.
+    for name, channel_dim, channel in (
+        (constants.BETA_GM, constants.MEDIA_CHANNEL, self._media[1]),
+        (constants.BETA_GRF, constants.RF_CHANNEL, self._rf[0]),
+    ):
+      self.assertTrue(
+          np.all(posterior[name].sel({channel_dim: channel}).values != 0),
+          msg=name,
+      )
+    self.assertNotIn(constants.BETA_M_FROM_PRIOR, posterior)
+    self.assertTrue(np.all(np.isfinite(posterior[constants.BETA_M].values)))
+    self.assertTrue(np.all(np.isfinite(posterior[constants.BETA_RF].values)))
+    # A treatment parameter is NaN for the channels that don't use it.
+    for name, channel_dim, used_by in (
+        (constants.ROI_M, constants.MEDIA_CHANNEL, [self._media[1]]),
+        (constants.ROI_RF, constants.RF_CHANNEL, [self._rf[0]]),
+        (constants.MROI_RF, constants.RF_CHANNEL, [self._rf[1]]),
+    ):
+      for channel in posterior[channel_dim].values:
+        values = posterior[name].sel({channel_dim: channel}).values
+        if channel in used_by:
+          self.assertTrue(np.all(np.isfinite(values)), msg=(name, channel))
+        else:
+          self.assertTrue(np.all(np.isnan(values)), msg=(name, channel))
+
+
+if __name__ == "__main__":
+  absltest.main()

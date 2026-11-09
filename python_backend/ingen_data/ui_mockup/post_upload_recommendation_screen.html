@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>IngenData - Spark AI Post-Upload Readiness & Transformation Hub</title>
+  <style>
+    :root {
+      --bg-primary: #0a0f1d;
+      --bg-card: #111a2e;
+      --bg-card-hover: #16223b;
+      --border: #1e2e4f;
+      --text-main: #f1f5f9;
+      --text-muted: #94a3b8;
+      --accent: #3b82f6;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --purple: #8b5cf6;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background-color: var(--bg-primary); color: var(--text-main); padding: 24px; }
+    .header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 20px; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+    .badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; text-transform: uppercase; }
+    .badge-blocked { background: rgba(239, 68, 68, 0.2); color: var(--danger); border: 1px solid var(--danger); }
+    .badge-success { background: rgba(16, 185, 129, 0.2); color: var(--success); border: 1px solid var(--success); }
+    
+    .ai-banner {
+      background: linear-gradient(135deg, rgba(59, 130, 246, 0.15), rgba(139, 92, 246, 0.15));
+      border: 1px solid #3b82f644;
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 24px;
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+    }
+    .ai-avatar { background: var(--accent); color: white; width: 42px; height: 42px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 20px; flex-shrink: 0; }
+    
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+    .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+    .card h3 { font-size: 16px; font-weight: 600; margin-bottom: 16px; display: flex; align-items: center; justify-content: space-between; }
+    
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+    th, td { text-align: left; padding: 10px; border-bottom: 1px solid var(--border); }
+    th { color: var(--text-muted); font-weight: 600; }
+    
+    .kpi-row { display: flex; gap: 12px; margin-bottom: 20px; }
+    .kpi-box { flex: 1; background: var(--bg-primary); border: 1px solid var(--border); padding: 12px; border-radius: 8px; text-align: center; }
+    .kpi-val { font-size: 20px; font-weight: 700; margin-top: 4px; }
+    
+    .action-box { background: rgba(239, 68, 68, 0.08); border-left: 4px solid var(--danger); padding: 14px; border-radius: 6px; margin-bottom: 12px; }
+    .action-btn { background: var(--accent); color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600; }
+    .btn-secondary { background: var(--border); color: var(--text-main); }
+    .footer-actions { margin-top: 24px; display: flex; justify-content: flex-end; gap: 12px; }
+  </style>
+</head>
+<body>
+
+  <!-- Top Header -->
+  <div class="header">
+    <div>
+      <h2>IngenData Studio</h2>
+      <p style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Dataset: <strong>sales_q1_q4_2024.csv</strong> • 1,248,500 rows • 42.8 MB</p>
+    </div>
+    <div style="display: flex; gap: 10px; align-items: center;">
+      <span style="font-size: 13px; color: var(--text-muted);">Modelling Gate:</span>
+      <span class="badge badge-blocked">🔴 BLOCKED (1 Fix Required)</span>
+    </div>
+  </div>
+
+  <!-- Spark AI Real-Time Agent Recommendation Banner -->
+  <div class="ai-banner">
+    <div class="ai-avatar">⚡</div>
+    <div>
+      <h4 style="margin-bottom: 4px;">Spark AI Ingestion & Governance Agent</h4>
+      <p style="font-size: 14px; color: #cbd5e1; line-height: 1.5;">
+        "I have parsed and classified your uploaded dataset. Column roles were automatically resolved via <code>application_specific_ruleset</code>. 
+        Your dataset matched <strong>Format 1 (Calendar Date Transactions)</strong> and has been successfully transformed into standardized Parquet tables (Pipeline B).
+        However, the <strong>Bayesian Causal Modelling Gate</strong> is currently <strong>BLOCKED</strong> due to an unlinked identifier check in area 1 (Check 1.9). Review my recommendations below to clear the gate."
+      </p>
+    </div>
+  </div>
+
+  <!-- Two-Pipeline Split Grid -->
+  <div class="grid-2">
+
+    <!-- Left Column: Pipeline B Transformation -->
+    <div class="card">
+      <h3>
+        <span>Pipeline B: Data Transformation</span>
+        <span class="badge badge-success">Format 1 Subgraph Executed</span>
+      </h3>
+      <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">Automated Schema Mapping & Temporal Pivoting</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Source Header</th>
+            <th>Mapped Analytical Role</th>
+            <th>Match Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>CUSTOMER_ID</code></td>
+            <td>Customer Identifier</td>
+            <td><span style="color: var(--success);">✔ Matched</span></td>
+          </tr>
+          <tr>
+            <td><code>PRODUCT_CODE</code></td>
+            <td>Product Identifier</td>
+            <td><span style="color: var(--success);">✔ Matched</span></td>
+          </tr>
+          <tr>
+            <td><code>TRANSACTION_DATE</code></td>
+            <td>Calendar Date (Daily)</td>
+            <td><span style="color: var(--success);">✔ 2024-01-01 to 2024-12-31</span></td>
+          </tr>
+          <tr>
+            <td><code>SALES_QTY</code></td>
+            <td>Primary Volume Metric</td>
+            <td><span style="color: var(--success);">✔ Float64, non-negative</span></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4 style="font-size: 13px; margin-top: 18px; margin-bottom: 8px;">Generated Parquet Tables:</h4>
+      <ul style="font-size: 12px; color: var(--text-muted); line-height: 1.8; list-style: none;">
+        <li>📦 <code>s3://bucket/trans_sales_data1_20241105_qty.parquet</code> (Customer × Product Volume)</li>
+        <li>📦 <code>s3://bucket/trans_sales_data2_20241105_qty.parquet</code> (Class Totals)</li>
+        <li>📦 <code>s3://bucket/trans_sales_data3_20241105_qty.parquet</code> (Market Share %)</li>
+      </ul>
+    </div>
+
+    <!-- Right Column: Pipeline A Data Readiness -->
+    <div class="card">
+      <h3>
+        <span>Pipeline A: Data Readiness & Governance</span>
+        <span class="badge badge-blocked">Gate Blocked</span>
+      </h3>
+      
+      <div class="kpi-row">
+        <div class="kpi-box"><span style="font-size: 12px; color: var(--text-muted);">Total Checks</span><div class="kpi-val">96</div></div>
+        <div class="kpi-box"><span style="font-size: 12px; color: var(--success);">Passed</span><div class="kpi-val" style="color: var(--success);">85</div></div>
+        <div class="kpi-box"><span style="font-size: 12px; color: var(--danger);">Fixes</span><div class="kpi-val" style="color: var(--danger);">1</div></div>
+        <div class="kpi-box"><span style="font-size: 12px; color: var(--warning);">Decisions</span><div class="kpi-val" style="color: var(--warning);">9</div></div>
+      </div>
+
+      <!-- Critical Blocker Box -->
+      <div class="action-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+          <strong style="color: var(--danger); font-size: 13px;">🚨 Critical Blocker: Check 1.9 (Sources & Assembly)</strong>
+          <span style="font-size: 11px; background: rgba(239, 68, 68, 0.2); padding: 2px 6px; border-radius: 4px; color: var(--danger);">Action Required</span>
+        </div>
+        <p style="font-size: 12px; color: #cbd5e1; margin-bottom: 10px;">
+          14,210 transactions ($1.14M volume) are missing physician NPI linkage (orphaned records).
+        </p>
+        <div style="display: flex; gap: 8px;">
+          <button class="action-btn">Filter Out Orphaned Rows (Auto-Fix)</button>
+          <button class="action-btn btn-secondary">Assign to Clinic Account</button>
+        </div>
+      </div>
+
+      <!-- Decisions Preview -->
+      <div style="background: var(--bg-primary); border: 1px solid var(--border); padding: 12px; border-radius: 6px; margin-top: 10px;">
+        <strong style="font-size: 12px; color: var(--warning);">⚠️ Key Human Decision (Check 10.1):</strong>
+        <p style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">
+          High collinearity (r = 0.88) detected between 'Rep F2F Calls' and 'Lunch & Learns'. Spark AI recommends combining into an In-Person Promotion Index.
+        </p>
+      </div>
+
+    </div>
+
+  </div>
+
+  <!-- Bottom Global Actions -->
+  <div class="footer-actions">
+    <button class="action-btn btn-secondary">Download Audit Log (.json)</button>
+    <button class="action-btn btn-secondary">Accept Exception & Override</button>
+    <button class="action-btn" style="opacity: 0.5; cursor: not-allowed;" disabled>Proceed to Bayesian Causal Modeling 🔒</button>
+  </div>
+
+</body>
+</html>

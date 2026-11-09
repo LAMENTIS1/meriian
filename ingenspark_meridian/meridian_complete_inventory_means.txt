@@ -1,0 +1,97 @@
+====================================================================================================
+GOOGLE MERIDIAN - COMPLETE MODULE DIRECTORY & PURPOSE (OFFICIAL SOURCE)
+====================================================================================================
+
+meridian.analysis                                  | Meridian analysis API for trained models.
+meridian.analysis.analyzer                         | Methods to compute analysis metrics of the model and the data.
+meridian.analysis.changepoint_effects              | Which effect budget optimization uses for channels with changepoints.
+meridian.analysis.optimizer                        | Module to output budget optimization scenarios based on the model.
+meridian.analysis.review                           | Meridian Model Quality Module.
+meridian.analysis.review.calibration_details_plots | Calibration details chart builders for the Model Quality Checks.
+meridian.analysis.review.calibration_overview_plots | Calibration overview chart builders for the Model Quality Checks.
+meridian.analysis.review.checks                    | Implementation of the Model Quality Checks.
+meridian.analysis.review.configs                   | Configurations for the Model Quality Checks.
+meridian.analysis.review.constants                 | Constants for model review.
+meridian.analysis.review.plots                     | Plotting and visualization functions for Model Quality Checks.
+meridian.analysis.review.results                   | Data structures for the Model Quality Checks results.
+meridian.analysis.review.reviewer                  | Implementation of the runner of the Model Quality Checks.
+meridian.analysis.summarizer                       | Summarization module that creates a 2-page HTML report.
+meridian.analysis.summary_text                     | Defines text string constants used in the model outputs.
+meridian.analysis.tensors                          | Data structures and tensor preparation utilities for Meridian.
+meridian.analysis.visualizer                       | Visualization module that creates analytical plots for the Meridian model.
+meridian.analysis.weekly_optimization_grid         | Weekly optimization grid information.
+meridian.backend                                   | Backend Abstraction Layer for Meridian.
+meridian.backend.config                            | Backend configuration for Meridian.
+meridian.common                                    | Common utilities for Meridian.
+meridian.common.currency                           | Currency utilities for Meridian.
+meridian.common.errors                             | Common errors for the Meridian library.
+meridian.constants                                 | Constants shared across the Meridian library.
+meridian.data                                      | Data handling API for Meridian.
+meridian.data.arg_builder                          | Data argument builders for various API surfaces in Meridian.
+meridian.data.data_frame_input_data_builder        | An implementation of `InputDataBuilder` with DataFrame primitives.
+meridian.data.input_data                           | This module contains classes to store data for Meridian.
+meridian.data.input_data_builder                   | This module defines a Builder API for Meridian `InputData`.
+meridian.data.load                                 | Contains classes and methods to load input data for Meridian.
+meridian.data.nd_array_input_data_builder          | An implementation of `InputDataBuilder` with n-dimensional array primitives.
+meridian.data.time_coordinates                     | Deals with coordinate values in the time dimensions of input data.
+meridian.data.validator                            | This module contains common validation functions for Meridian data.
+meridian.mlflow                                    | Meridian MLflow module that contains autologging functionality.
+meridian.mlflow.autolog                            | MLflow autologging integration for Meridian.
+meridian.model                                     | The Meridian API module that models the data.
+meridian.model.adstock_hill                        | Function definitions for Adstock and Hill calculations.
+meridian.model.calibration                         | API module for Meridian's calibration framework.
+meridian.model.calibration.adapters                | Calibration adapters for Meridian.
+meridian.model.calibration.adapters.experiment     | Generic incrementality experiment adapter for calibration.
+meridian.model.calibration.adapters.meridian_geox  | Meridian GeoX adapter for calibration.
+meridian.model.calibration.base                    | Base structures for Meridian's calibration framework.
+meridian.model.calibration.constants               | Constants specific to Meridian calibration module.
+meridian.model.calibration.prior_builder           | Builds a joint prior distribution based on incrementality experiment results.
+meridian.model.calibration.roi                     | ROI calibration logic for Meridian.
+meridian.model.changepoints                        | Math helpers for time-varying media effects.
+meridian.model.context                             | Defines ModelContext class for Meridian.
+meridian.model.eda                                 | The Meridian API module that performs EDA checks.
+meridian.model.eda.calibration_plots               | Plotting and visualization functions for prior calibration in EDA.
+meridian.model.eda.constants                       | Constants specific to MeridianEDA.
+meridian.model.eda.eda_engine                      | Meridian EDA Engine.
+meridian.model.eda.eda_outcome                     | Meridian EDA Outcome.
+meridian.model.eda.eda_spec                        | Meridian EDA Spec.
+meridian.model.eda.meridian_eda                    | Meridian Exploratory Data Analysis (EDA) visualization tools.
+meridian.model.eda.sampling_eda_engine             | Meridian Sampling EDA Engine.
+meridian.model.equations                           | Core mathematical equations for the Meridian model.
+meridian.model.knots                               | Auxiliary functions for knots calculations.
+meridian.model.media                               | Structures and functions for manipulating media value data and tensors.
+meridian.model.model                               | Meridian module for the geo-level Bayesian hierarchical media mix model.
+meridian.model.posterior_sampler                   | Module for MCMC sampling of posterior distributions in a Meridian model.
+meridian.model.prior_distribution                  | This file contains an object to store prior distributions.
+meridian.model.prior_sampler                       | Module for sampling prior distributions in a Meridian model.
+meridian.model.progress                            | Progress reporting for prior and posterior sampling.
+meridian.model.spec                                | Defines model specification parameters for Meridian.
+meridian.model.transformers                        | Contains data transformers for various inputs of the Meridian model.
+meridian.schema                                    | Module containing MMM schema library.
+meridian.schema.mmm_proto_generator                | Generates an `Mmm` (Marketing Mix Model) proto for Meridian.
+meridian.schema.model_consumer                     | Consumes a trained Meridian model and produces an `Mmm` proto.
+meridian.schema.processors                         | Meridian Model Processor Library.
+meridian.schema.processors.budget_optimization_processor | Defines a processor for budget optimization inference on a Meridian model.
+meridian.schema.processors.common                  | Classes and functions common to modules in this directory.
+meridian.schema.processors.marketing_processor     | Meridian module for analyzing marketing data in a Meridian model.
+meridian.schema.processors.model_fit_processor     | Meridian module for analyzing model fit in a Meridian model.
+meridian.schema.processors.model_kernel_processor  | Module for transforming a Meridian model into a structured MMM schema.
+meridian.schema.processors.model_processor         | Defines common and base classes for processing trained Meridian model to an MMM schema.
+meridian.schema.processors.reach_frequency_optimization_processor | Defines a processor for reach and frequency optimization inference on a Meridian model.
+meridian.schema.serde                              | A serialization and deserialization library for Meridian models.
+meridian.schema.serde.constants                    | Constants shared across the Meridian serde library.
+meridian.schema.serde.distribution                 | Serialization and deserialization of `Distribution` objects for priors.
+meridian.schema.serde.eda_spec                     | Serialization and deserialization of `EDASpec` objects.
+meridian.schema.serde.function_registry            | Function registry for Serde.
+meridian.schema.serde.hyperparameters              | Serde for Hyperparameters.
+meridian.schema.serde.inference_data               | Serialization and deserialization of `InferenceData` container for sampled priors and posteriors.
+meridian.schema.serde.legacy_aks                   | Legacy AKS logic for backwards compatibility.
+meridian.schema.serde.legacy_aks_v1_7_1            | Legacy AKS logic for backwards compatibility.
+meridian.schema.serde.marketing_data               | Serialization and deserialization of `InputData` for Meridian models.
+meridian.schema.serde.meridian_serde               | Serialization and deserialization of Meridian models into/from proto format.
+meridian.schema.serde.serde                        | Serialization and deserialization of Meridian models.
+meridian.schema.utils                              | Module containing MMM schema util functions.
+meridian.schema.utils.date_range_bucketing         | Helper classes for generating date intervals for various time buckets.
+meridian.schema.utils.proto_enum_converter         | A generic class for converting between Protobuf enums and strings.
+meridian.schema.utils.time_record                  | Helper functions for time-related operations.
+meridian.version                                   | Module for Meridian version.

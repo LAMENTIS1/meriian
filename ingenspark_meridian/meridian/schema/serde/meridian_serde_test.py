@@ -1,0 +1,2154 @@
+# Copyright 2026 The Meridian Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import pathlib
+import tomllib
+from typing import Callable
+from unittest import mock
+import warnings
+
+from absl import flags
+from absl.testing import absltest
+from absl.testing import parameterized
+import arviz as az
+from ingenspark_meridian.meridian import backend
+from ingenspark_meridian.meridian import constants
+from ingenspark_meridian.meridian.analysis import analyzer
+from ingenspark_meridian.meridian.analysis import visualizer
+from ingenspark_meridian.meridian.backend import config as backend_config
+from ingenspark_meridian.meridian.backend import test_utils as backend_test_utils
+from ingenspark_meridian.meridian.common import errors
+from ingenspark_meridian.meridian.data import input_data as meridian_input_data
+from ingenspark_meridian.meridian.data import test_utils
+from ingenspark_meridian.meridian.model import context
+from ingenspark_meridian.meridian.model import model
+from ingenspark_meridian.meridian.model import prior_distribution
+from ingenspark_meridian.meridian.model import spec
+from ingenspark_meridian.meridian.model.eda import eda_spec
+from mmm.v1.marketing import marketing_data_pb2 as marketing_pb
+from mmm.v1.model import mmm_kernel_pb2 as kernel_pb
+from mmm.v1.model.meridian import meridian_model_pb2 as meridian_pb
+from mmm.v1.model.meridian.eda import eda_spec_pb2
+from ingenspark_meridian.meridian.schema.serde import constants as serde_constants
+from ingenspark_meridian.meridian.schema.serde import distribution
+from ingenspark_meridian.meridian.schema.serde import eda_spec as eda_spec_serde
+from ingenspark_meridian.meridian.schema.serde import function_registry as function_registry_utils
+from ingenspark_meridian.meridian.schema.serde import hyperparameters
+from ingenspark_meridian.meridian.schema.serde import inference_data
+from ingenspark_meridian.meridian.schema.serde import marketing_data
+from ingenspark_meridian.meridian.schema.serde import meridian_serde as serde
+from ingenspark_meridian.meridian.schema.serde import test_data
+import numpy as np
+import pandas as pd
+import semver
+import xarray as xr
+import xarray.testing as xrt
+
+from google.protobuf import any_pb2
+from google.type import date_pb2
+from tensorflow.core.framework import types_pb2  # pylint: disable=g-direct-tensorflow-import
+
+_PRIOR_DATASET_CHAINS = 1
+_PRIOR_DATASET_DRAWS = 2
+_PRIOR_DATASET = test_data.make_sample_dataset(
+    _PRIOR_DATASET_CHAINS,
+    _PRIOR_DATASET_DRAWS,
+    n_geos=5,
+    n_controls=2,
+    n_knots=49,
+    n_times=49,
+    n_media_channels=3,
+)
+
+_POSTERIOR_DATASET_CHAINS = 3
+_POSTERIOR_DATASET_DRAWS = 7
+_POSTERIOR_DATASET = test_data.make_sample_dataset(
+    _POSTERIOR_DATASET_CHAINS,
+    _POSTERIOR_DATASET_DRAWS,
+    n_geos=5,
+    n_controls=2,
+    n_knots=49,
+    n_times=49,
+    n_media_channels=3,
+)
+
+_INPUT_DATA = test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+    n_geos=5,
+    n_times=49,
+    n_media_times=52,
+    n_controls=2,
+    n_media_channels=3,
+    seed=1,
+)
+_INPUT_DATA_NO_RPK = (
+    test_utils.sample_input_data_non_revenue_no_revenue_per_kpi(
+        n_geos=5,
+        n_times=49,
+        n_media_times=52,
+        n_controls=2,
+        n_media_channels=3,
+        seed=1,
+    )
+)
+_INPUT_DATA_NO_CONTROLS = (
+    test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+        n_geos=5,
+        n_times=49,
+        n_media_times=52,
+        n_controls=0,
+        n_media_channels=3,
+        seed=1,
+    )
+)
+
+
+class MeridianSerdeTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.serde = serde.MeridianSerde()
+
+    self._mock_analyzer = self.enter_context(
+        mock.patch.object(analyzer, 'Analyzer', autospec=True)
+    )
+    self._mock_visualizer = self.enter_context(
+        mock.patch.object(visualizer, 'ModelDiagnostics', autospec=True)
+    )
+    self._r_hats = {
+        constants.ALPHA_M: backend.to_tensor(
+            np.full((1, 2, 3), 22.0), dtype=backend.float_dtype
+        ),
+        constants.BETA_GRF: backend.to_tensor(
+            np.full((4, 5), 33.0), dtype=backend.float_dtype
+        ),
+        constants.TAU_G: backend.to_tensor(
+            np.full((6,), 44.0), dtype=backend.float_dtype
+        ),
+    }
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='empty',
+          model_id='empty_model',
+          meridian_version=semver.VersionInfo.parse('1.0.0'),
+          input_data=_INPUT_DATA,
+          model_spec_fn=lambda: None,
+          inf_data_fn=lambda: None,
+      ),
+      dict(
+          testcase_name='defaults',
+          model_id='default_model',
+          meridian_version=semver.VersionInfo.parse('1.0.1'),
+          input_data=_INPUT_DATA,
+          model_spec_fn=test_data.get_default_model_spec,
+          inf_data_fn=az.InferenceData,
+      ),
+      dict(
+          testcase_name='priors_and_posteriors',
+          model_id='priors_and_posteriors_model',
+          meridian_version=semver.VersionInfo.parse('1.1.0'),
+          input_data=_INPUT_DATA,
+          model_spec_fn=lambda: spec.ModelSpec(knots=49),
+          inf_data_fn=lambda: az.InferenceData(
+              prior=_PRIOR_DATASET,
+              posterior=_POSTERIOR_DATASET,
+          ),
+      ),
+  )
+  def test_serialize(
+      self,
+      model_id: str,
+      meridian_version: semver.VersionInfo,
+      input_data: meridian_input_data.InputData,
+      model_spec_fn,
+      inf_data_fn,
+  ):
+    meridian_model = model.Meridian(
+        input_data=input_data,
+        model_spec=model_spec_fn(),
+        inference_data=inf_data_fn(),
+    )
+
+    serialized_model = self.serde.serialize(
+        meridian_model, model_id, meridian_version
+    )
+
+    unpacked_model = meridian_pb.MeridianModel()
+    serialized_model.model.Unpack(unpacked_model)
+
+    self.assertTrue(
+        serialized_model.model.Is(meridian_pb.MeridianModel.DESCRIPTOR)
+    )
+    serialized_model.model.Unpack(unpacked_model)
+    self.assertEqual(unpacked_model.model_version, str(meridian_version))
+
+  def test_serialize_sets_computation_backend(self):
+    meridian_model = model.Meridian(
+        input_data=_INPUT_DATA, model_spec=test_data.get_default_model_spec()
+    )
+    with mock.patch.object(
+        model.Meridian,
+        'computation_backend',
+        new_callable=mock.PropertyMock,
+    ) as mock_backend:
+      mock_backend.return_value = 'JAX'
+      serialized_model = self.serde.serialize(meridian_model)
+
+    unpacked_model = meridian_pb.MeridianModel()
+    serialized_model.model.Unpack(unpacked_model)
+    self.assertEqual(
+        unpacked_model.computation_backend, meridian_pb.ComputationBackend.JAX
+    )
+
+  def test_serialize_sets_computation_precision(self):
+    meridian_model = model.Meridian(
+        input_data=_INPUT_DATA, model_spec=test_data.get_default_model_spec()
+    )
+    with mock.patch.object(
+        model.Meridian,
+        'computation_precision',
+        new_callable=mock.PropertyMock,
+    ) as mock_precision:
+      mock_precision.return_value = 'FLOAT64'
+      serialized_model = self.serde.serialize(meridian_model)
+
+    unpacked_model = meridian_pb.MeridianModel()
+    serialized_model.model.Unpack(unpacked_model)
+    self.assertEqual(
+        unpacked_model.computation_precision,
+        meridian_pb.ComputationPrecision.FLOAT64,
+    )
+
+  def test_deserialize_warns_on_backend_mismatch(self):
+    # Create a proto indicating it was trained with JAX.
+    meridian_model = meridian_pb.MeridianModel(
+        model_version='1.2.3',
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        inference_data=meridian_pb.InferenceData(),
+        computation_backend=meridian_pb.ComputationBackend.JAX,
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model)
+    mmm_kernel = kernel_pb.MmmKernel(
+        model=any_model,
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+    )
+
+    # Force the current environment to be TENSORFLOW.
+    with mock.patch.object(
+        backend,
+        'computation_backend',
+        return_value=backend_config.ComputationBackend.TENSORFLOW,
+        autospec=True,
+        spec_set=True,
+    ):
+      with self.assertWarnsRegex(
+          UserWarning,
+          'The model was trained using JAX, but the current backend is'
+          ' TENSORFLOW',
+      ):
+        self.serde.deserialize(mmm_kernel)
+
+  def test_deserialize_no_warning_on_backend_match(self):
+    # Create a proto indicating it was trained with TENSORFLOW.
+    meridian_model = meridian_pb.MeridianModel(
+        model_version='1.2.3',
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        inference_data=meridian_pb.InferenceData(),
+        computation_backend=meridian_pb.ComputationBackend.TENSORFLOW,
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model)
+    mmm_kernel = kernel_pb.MmmKernel(
+        model=any_model,
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+    )
+
+    # Force the current environment to be TENSORFLOW.
+    with mock.patch.object(
+        backend,
+        'computation_backend',
+        return_value=backend_config.ComputationBackend.TENSORFLOW,
+        autospec=True,
+        spec_set=True,
+    ):
+      with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        self.serde.deserialize(mmm_kernel)
+        # Ensure no backend-related warnings were raised.
+        backend_warnings = [x for x in w if 'backend' in str(x.message).lower()]
+        self.assertEmpty(backend_warnings)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='mismatch_warns',
+          stored_precision=meridian_pb.ComputationPrecision.FLOAT64,
+          current_precision=backend_config.ComputationPrecision.FLOAT32,
+          expected_warning=(
+              'The model was trained using FLOAT64, but the current precision'
+              ' is FLOAT32'
+          ),
+      ),
+      dict(
+          testcase_name='match_no_warning',
+          stored_precision=meridian_pb.ComputationPrecision.FLOAT32,
+          current_precision=backend_config.ComputationPrecision.FLOAT32,
+          expected_warning=None,
+      ),
+  )
+  def test_deserialize_precision_validation(
+      self, stored_precision, current_precision, expected_warning
+  ):
+    meridian_model = meridian_pb.MeridianModel(
+        model_version='1.2.3',
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        inference_data=meridian_pb.InferenceData(),
+        computation_precision=stored_precision,
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model)
+    mmm_kernel = kernel_pb.MmmKernel(
+        model=any_model,
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+    )
+
+    with mock.patch.object(
+        backend,
+        'computation_precision',
+        return_value=current_precision,
+        autospec=True,
+        spec_set=True,
+    ):
+      if expected_warning:
+        with self.assertWarnsRegex(UserWarning, expected_warning):
+          self.serde.deserialize(mmm_kernel)
+      else:
+        with warnings.catch_warnings(record=True) as w:
+          warnings.simplefilter('always')
+          self.serde.deserialize(mmm_kernel)
+          precision_warnings = [
+              x for x in w if 'precision' in str(x.message).lower()
+          ]
+          self.assertEmpty(precision_warnings)
+
+  def _mmm_kernel_with_model_version(
+      self, model_version: semver.VersionInfo
+  ) -> kernel_pb.MmmKernel:
+    meridian_model = meridian_pb.MeridianModel(
+        model_version=str(model_version),
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        inference_data=meridian_pb.InferenceData(),
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model)
+    return kernel_pb.MmmKernel(
+        model=any_model,
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+    )
+
+  def test_deserialize_warns_when_serialized_by_a_newer_meridian(self):
+    """Unknown fields are dropped silently, so the user must be told."""
+    newer_version = serde._VERSION_INFO.bump_minor()  # pylint: disable=protected-access
+
+    with warnings.catch_warnings(record=True) as caught:
+      warnings.simplefilter('always')
+      self.serde.deserialize(self._mmm_kernel_with_model_version(newer_version))
+
+    messages = [
+        str(w.message) for w in caught if 'newer than' in str(w.message)
+    ]
+    self.assertLen(messages, 1)
+    self.assertIn(f'serialized by Meridian {newer_version}', messages[0])
+    # Knowing the versions disagree is not enough: the user has to understand
+    # that the model they loaded may be configured differently from the one
+    # that was saved.
+    self.assertIn('silently ignored', messages[0])
+    self.assertIn('may differ from the one that was serialized', messages[0])
+
+  @parameterized.named_parameters(
+      dict(testcase_name='same_version', version_fn=lambda current: current),
+      dict(
+          testcase_name='older_version',
+          version_fn=lambda current: semver.VersionInfo.parse('1.2.3'),
+      ),
+  )
+  def test_deserialize_does_not_warn_for_a_version_it_can_read(
+      self, version_fn: Callable[[semver.VersionInfo], semver.VersionInfo]
+  ):
+    with warnings.catch_warnings(record=True) as caught:
+      warnings.simplefilter('always')
+      self.serde.deserialize(
+          self._mmm_kernel_with_model_version(
+              version_fn(serde._VERSION_INFO)  # pylint: disable=protected-access
+          )
+      )
+
+    self.assertEmpty([w for w in caught if 'newer than' in str(w.message)])
+
+  def _mmm_kernel_with_schema_version(
+      self, schema_version: str
+  ) -> kernel_pb.MmmKernel:
+    meridian_model_kwargs = dict(
+        model_version='1.2.3',
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        inference_data=meridian_pb.InferenceData(),
+    )
+    if schema_version:
+      meridian_model_kwargs['schema_version'] = schema_version
+    meridian_model = meridian_pb.MeridianModel(**meridian_model_kwargs)
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model)
+    return kernel_pb.MmmKernel(
+        model=any_model,
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+    )
+
+  def test_schema_version_matches_proto_pyproject_toml(self):
+    candidate_parents = (
+        *pathlib.Path(__file__).parents,
+        *pathlib.Path(__file__).resolve().parents,
+    )
+    pyproject_path = next(
+        p / 'proto' / 'pyproject.toml'
+        for p in candidate_parents
+        if (p / 'proto' / 'pyproject.toml').is_file()
+    )
+    with open(pyproject_path, 'rb') as f:
+      pyproject_version = tomllib.load(f)['project']['version']
+
+    self.assertEqual(serde_constants.SCHEMA_VERSION, pyproject_version)
+    self.assertEqual(serde._get_schema_version(), pyproject_version)  # pylint: disable=protected-access
+
+  def test_serialize_sets_schema_version(self):
+    meridian_model = model.Meridian(
+        input_data=_INPUT_DATA,
+        model_spec=test_data.get_default_model_spec(),
+    )
+    serialized_model = self.serde.serialize(meridian_model)
+
+    unpacked_model = meridian_pb.MeridianModel()
+    serialized_model.model.Unpack(unpacked_model)
+    self.assertEqual(
+        unpacked_model.schema_version,
+        serde._get_schema_version(),  # pylint: disable=protected-access
+    )
+
+  def test_deserialize_raises_when_schema_version_exceeds_supported(self):
+    flags.FLAGS.mark_as_parsed()
+    kernel = self._mmm_kernel_with_schema_version('99.0.0')
+
+    with self.assertRaisesRegex(
+        ValueError,
+        r'serialized with `mmm-proto-schema` 99\.0\.0'
+        r'.*force_deserialization=True',
+    ):
+      self.serde.deserialize(kernel)
+
+    file_path = os.path.join(self.create_tempdir().full_path, 'future.binpb')
+    with open(file_path, 'wb') as f:
+      f.write(kernel.SerializeToString())
+
+    with self.assertRaisesRegex(
+        ValueError,
+        r'serialized with `mmm-proto-schema` 99\.0\.0'
+        r'.*force_deserialization=True',
+    ):
+      serde.load_meridian(file_path)
+
+  def test_deserialize_warns_when_schema_version_exceeds_supported_and_forced(
+      self,
+  ):
+    flags.FLAGS.mark_as_parsed()
+    kernel = self._mmm_kernel_with_schema_version('99.0.0')
+
+    with self.assertWarnsRegex(
+        UserWarning,
+        r'serialized with `mmm-proto-schema` 99\.0\.0'
+        r'.*force_deserialization=True',
+    ):
+      deserialized = self.serde.deserialize(kernel, force_deserialization=True)
+    self.assertIsInstance(deserialized, model.Meridian)
+
+    file_path = os.path.join(self.create_tempdir().full_path, 'future.binpb')
+    with open(file_path, 'wb') as f:
+      f.write(kernel.SerializeToString())
+
+    with self.assertWarnsRegex(
+        UserWarning,
+        r'serialized with `mmm-proto-schema` 99\.0\.0'
+        r'.*force_deserialization=True',
+    ):
+      loaded = serde.load_meridian(file_path, force_deserialization=True)
+    self.assertIsInstance(loaded, model.Meridian)
+
+  def test_deserialize_raises_when_schema_version_unparseable(self):
+    flags.FLAGS.mark_as_parsed()
+    kernel = self._mmm_kernel_with_schema_version('not-a-version')
+
+    with self.assertRaisesRegex(
+        ValueError,
+        r"Could not parse serialized model `schema_version` 'not-a-version'"
+        r'.*force_deserialization=True',
+    ):
+      self.serde.deserialize(kernel)
+
+  def test_deserialize_warns_when_schema_version_unparseable_and_forced(self):
+    flags.FLAGS.mark_as_parsed()
+    kernel = self._mmm_kernel_with_schema_version('not-a-version')
+
+    with self.assertWarnsRegex(
+        UserWarning,
+        r"Could not parse serialized model `schema_version` 'not-a-version'"
+        r'.*force_deserialization=True',
+    ):
+      deserialized = self.serde.deserialize(kernel, force_deserialization=True)
+    self.assertIsInstance(deserialized, model.Meridian)
+
+  @parameterized.named_parameters(
+      dict(testcase_name='unset', schema_version=''),
+      dict(testcase_name='older', schema_version='1.5.0'),
+      dict(
+          testcase_name='current',
+          schema_version=serde_constants.SCHEMA_VERSION,
+      ),
+  )
+  def test_deserialize_succeeds_when_schema_version_unset_or_older(
+      self, schema_version: str
+  ):
+    kernel = self._mmm_kernel_with_schema_version(schema_version)
+    with warnings.catch_warnings(record=True) as caught:
+      warnings.simplefilter('always')
+      deserialized = self.serde.deserialize(kernel)
+
+    self.assertIsInstance(deserialized, model.Meridian)
+    self.assertEmpty(
+        [w for w in caught if 'mmm-proto-schema' in str(w.message)]
+    )
+
+  def test_serialize_no_controls(self):
+    meridian_model = model.Meridian(
+        input_data=_INPUT_DATA_NO_CONTROLS,
+        model_spec=test_data.get_default_model_spec(),
+    )
+
+    serialized_model = self.serde.serialize(
+        meridian_model, 'test_model', semver.VersionInfo.parse('1.0.3')
+    )
+
+    unpacked_model = meridian_pb.MeridianModel()
+    serialized_model.model.Unpack(unpacked_model)
+
+    self.assertTrue(
+        serialized_model.model.Is(meridian_pb.MeridianModel.DESCRIPTOR)
+    )
+    serialized_model.model.Unpack(unpacked_model)
+    self.assertEqual(unpacked_model.model_version, '1.0.3')
+
+  def test_serialize_convergence_status_not_ok(self):
+    with mock.patch.object(
+        self._mock_visualizer.return_value,
+        'plot_rhat_boxplot',
+        side_effect=model.MCMCSamplingError(),
+    ):
+      serialized_model = self.serde.serialize(
+          model.Meridian(input_data=_INPUT_DATA),
+          'test_model',
+          include_convergence_info=True,
+      )
+      unpacked_model = meridian_pb.MeridianModel()
+      serialized_model.model.Unpack(unpacked_model)
+
+      self.assertFalse(unpacked_model.convergence_info.convergence)
+
+  def test_serialize_model_convergence_proto(self):
+    self._mock_analyzer.return_value.get_rhat.return_value = self._r_hats
+
+    expected_sampling_trace = meridian_pb.McmcSamplingTrace(
+        num_chains=len(_POSTERIOR_DATASET.chain),
+        num_draws=len(_POSTERIOR_DATASET.draw),
+        step_size=test_data.make_tensor_proto(
+            dims=[_POSTERIOR_DATASET_CHAINS, _POSTERIOR_DATASET_DRAWS],
+            dtype=types_pb2.DT_DOUBLE,
+            tensor_content=_POSTERIOR_DATASET.data_vars.get(
+                constants.STEP_SIZE
+            ).data.tobytes(),
+        ),
+        tune=test_data.make_tensor_proto(
+            dims=[_POSTERIOR_DATASET_CHAINS, _POSTERIOR_DATASET_DRAWS],
+            dtype=types_pb2.DT_BOOL,
+            bool_vals=[False]
+            * (_POSTERIOR_DATASET_CHAINS * _POSTERIOR_DATASET_DRAWS),
+        ),
+        target_log_prob=test_data.make_tensor_proto(
+            dims=[_POSTERIOR_DATASET_CHAINS, _POSTERIOR_DATASET_DRAWS],
+            dtype=types_pb2.DT_DOUBLE,
+            tensor_content=_POSTERIOR_DATASET.data_vars.get(
+                constants.TARGET_LOG_PROBABILITY_TF
+            ).data.tobytes(),
+        ),
+        diverging=test_data.make_tensor_proto(
+            dims=[_POSTERIOR_DATASET_CHAINS, _POSTERIOR_DATASET_DRAWS],
+            dtype=types_pb2.DT_BOOL,
+            bool_vals=[False]
+            * (_POSTERIOR_DATASET_CHAINS * _POSTERIOR_DATASET_DRAWS),
+        ),
+        accept_ratio=test_data.make_tensor_proto(
+            dims=[_POSTERIOR_DATASET_CHAINS, _POSTERIOR_DATASET_DRAWS],
+            dtype=types_pb2.DT_DOUBLE,
+            tensor_content=_POSTERIOR_DATASET.data_vars.get(
+                constants.ACCEPT_RATIO
+            ).data.tobytes(),
+        ),
+        n_steps=test_data.make_tensor_proto(
+            dims=[_POSTERIOR_DATASET_CHAINS, _POSTERIOR_DATASET_DRAWS],
+            dtype=types_pb2.DT_DOUBLE,
+            tensor_content=_POSTERIOR_DATASET.data_vars.get(
+                constants.N_STEPS
+            ).data.tobytes(),
+        ),
+        is_accepted=test_data.make_tensor_proto(
+            dims=[_POSTERIOR_DATASET_CHAINS, _POSTERIOR_DATASET_DRAWS],
+            dtype=types_pb2.DT_BOOL,
+            bool_vals=[True]
+            * (_POSTERIOR_DATASET_CHAINS * _POSTERIOR_DATASET_DRAWS),
+        ),
+    )
+    rhat_dtype = (
+        types_pb2.DT_DOUBLE
+        if backend.standardize_dtype(backend.float_dtype) == 'float64'
+        else types_pb2.DT_FLOAT
+    )
+    expected_proto = meridian_pb.ModelConvergence(
+        convergence=True,
+        mcmc_sampling_trace=expected_sampling_trace,
+        r_hat_diagnostic=meridian_pb.RHatDiagnostic(
+            parameter_r_hats=[
+                meridian_pb.Parameter(
+                    name=constants.ALPHA_M,
+                    tensor=test_data.make_tensor_proto(
+                        dims=[1, 2, 3],
+                        dtype=rhat_dtype,
+                        tensor_content=np.array(
+                            self._r_hats[constants.ALPHA_M]
+                        ).tobytes(),
+                    ),
+                ),
+                meridian_pb.Parameter(
+                    name=constants.BETA_GRF,
+                    tensor=test_data.make_tensor_proto(
+                        dims=[4, 5],
+                        dtype=rhat_dtype,
+                        tensor_content=np.array(
+                            self._r_hats[constants.BETA_GRF]
+                        ).tobytes(),
+                    ),
+                ),
+                meridian_pb.Parameter(
+                    name=constants.TAU_G,
+                    tensor=test_data.make_tensor_proto(
+                        dims=[6],
+                        dtype=rhat_dtype,
+                        tensor_content=np.array(
+                            self._r_hats[constants.TAU_G]
+                        ).tobytes(),
+                    ),
+                ),
+            ]
+        ),
+    )
+
+    serialized_model = self.serde.serialize(
+        model.Meridian(
+            input_data=_INPUT_DATA,
+            model_spec=spec.ModelSpec(knots=49),
+            inference_data=az.InferenceData(
+                prior=_PRIOR_DATASET,
+                posterior=_POSTERIOR_DATASET,
+                trace=_POSTERIOR_DATASET,
+            ),
+        ),
+        'test_model',
+        include_convergence_info=True,
+    )
+    unpacked_model = meridian_pb.MeridianModel()
+    serialized_model.model.Unpack(unpacked_model)
+
+    backend_test_utils.assert_normalized_proto_equal(
+        self,
+        expected_proto,
+        unpacked_model.convergence_info,
+    )
+
+  def test_serialize_model_without_eda_spec(self):
+    meridian_model = model.Meridian(
+        input_data=_INPUT_DATA,
+        model_spec=test_data.get_default_model_spec(),
+        inference_data=az.InferenceData(),
+    )
+    delattr(meridian_model, '_eda_spec')
+
+    serialized_model = self.serde.serialize(
+        meridian_model, 'model_id', semver.VersionInfo.parse('1.0.0')
+    )
+
+    unpacked_model = meridian_pb.MeridianModel()
+    serialized_model.model.Unpack(unpacked_model)
+    self.assertFalse(unpacked_model.HasField('eda_spec'))
+
+  def test_deserialize_not_meridian_model(self):
+    not_meridian_model_proto = marketing_pb.MarketingData()
+    any_model = any_pb2.Any()
+    any_model.Pack(not_meridian_model_proto)
+
+    with self.assertRaisesRegex(
+        ValueError, '`serialized.model` is not a `MeridianModel`'
+    ):
+      self.serde.deserialize(kernel_pb.MmmKernel(model=any_model))
+
+  def test_deserialize(self):
+    meridian_model = meridian_pb.MeridianModel(
+        model_version='1.2.3',
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        inference_data=meridian_pb.InferenceData(),
+        eda_spec=eda_spec_pb2.EDASpec(),
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model)
+    mmm_kernel = kernel_pb.MmmKernel(
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+        model=any_model,
+    )
+
+    deserialized_model = self.serde.deserialize(mmm_kernel)
+
+    self.assertIsInstance(deserialized_model, model.Meridian)
+    self.assertIsInstance(
+        deserialized_model.input_data, meridian_input_data.InputData
+    )
+    self.assertIsInstance(deserialized_model.inference_data, az.InferenceData)
+    self.assertIsInstance(deserialized_model.model_spec, spec.ModelSpec)
+    self.assertIsInstance(
+        deserialized_model.model_spec.prior,
+        prior_distribution.PriorDistribution,
+    )
+
+  def test_deserialize_sets_model_spec_prior(self):
+    mock_version = '1.2.3'
+
+    meridian_model = meridian_pb.MeridianModel(
+        model_version=mock_version,
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        inference_data=meridian_pb.InferenceData(),
+        eda_spec=eda_spec_pb2.EDASpec(),
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model)
+    mmm_kernel = kernel_pb.MmmKernel(
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+        model=any_model,
+    )
+
+    mock_hyperparameters_model_spec = test_data.get_default_model_spec()
+    mock_prior_distributions = prior_distribution.PriorDistribution()
+    with (
+        mock.patch.object(
+            hyperparameters.HyperparametersSerde,
+            'deserialize',
+            return_value=mock_hyperparameters_model_spec,
+        ) as mock_hyperparameters_deserialize,
+        mock.patch.object(
+            distribution.DistributionSerde,
+            'deserialize',
+            return_value=mock_prior_distributions,
+        ) as mock_prior_tfp_distributions_deserialize,
+    ):
+
+      deserialized_model = self.serde.deserialize(mmm_kernel)
+
+      mock_hyperparameters_deserialize.assert_called_once_with(
+          meridian_model.hyperparameters, mock_version, input_data=mock.ANY
+      )
+      # The declarative date ranges are expressed against the input data's time
+      # coordinates, so the marketing data has to be deserialized first and
+      # threaded in.
+      self.assertIs(
+          mock_hyperparameters_deserialize.call_args.kwargs['input_data'],
+          deserialized_model.input_data,
+      )
+      mock_prior_tfp_distributions_deserialize.assert_called_once_with(
+          meridian_model.prior_tfp_distributions,
+          mock_version,
+          force_deserialization=False,
+      )
+
+      self.assertEqual(
+          deserialized_model.model_spec.prior, mock_prior_distributions
+      )
+
+  def test_serialize_with_default_distribution_registry(self):
+    mock_distribution_serde = self.enter_context(
+        mock.patch.object(distribution, 'DistributionSerde', autospec=True)
+    )
+    mock_distribution_serde.return_value.serialize.return_value = (
+        meridian_pb.PriorTfpDistributions()
+    )
+    meridian_model = model.Meridian(
+        input_data=_INPUT_DATA, model_spec=test_data.get_default_model_spec()
+    )
+    self.serde.serialize(meridian_model)
+    mock_distribution_serde.assert_called_once_with(
+        function_registry_utils.FunctionRegistry()
+    )
+
+  def test_serialize_with_custom_distribution_registry(self):
+    mock_distribution_serde = self.enter_context(
+        mock.patch.object(distribution, 'DistributionSerde', autospec=True)
+    )
+    mock_distribution_serde.return_value.serialize.return_value = (
+        meridian_pb.PriorTfpDistributions()
+    )
+    custom_registry = function_registry_utils.FunctionRegistry()
+    meridian_model = model.Meridian(
+        input_data=_INPUT_DATA, model_spec=test_data.get_default_model_spec()
+    )
+    self.serde.serialize(
+        meridian_model, distribution_function_registry=custom_registry
+    )
+    mock_distribution_serde.assert_called_once_with(custom_registry)
+
+  def test_deserialize_with_default_distribution_registry(self):
+    mock_distribution_serde = self.enter_context(
+        mock.patch.object(distribution, 'DistributionSerde', autospec=True)
+    )
+    mock_distribution_serde.return_value.deserialize.return_value = (
+        prior_distribution.PriorDistribution()
+    )
+    meridian_model_proto = meridian_pb.MeridianModel(
+        model_version='1.2.3',
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        eda_spec=eda_spec_pb2.EDASpec(),
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model_proto)
+    mmm_kernel = kernel_pb.MmmKernel(
+        model=any_model,
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+    )
+
+    self.serde.deserialize(mmm_kernel)
+
+    mock_distribution_serde.assert_called_once_with(
+        function_registry_utils.FunctionRegistry()
+    )
+
+  def test_deserialize_with_custom_distribution_registry(self):
+    mock_distribution_serde = self.enter_context(
+        mock.patch.object(distribution, 'DistributionSerde', autospec=True)
+    )
+    mock_distribution_serde.return_value.deserialize.return_value = (
+        prior_distribution.PriorDistribution()
+    )
+    custom_registry = function_registry_utils.FunctionRegistry()
+    meridian_model_proto = meridian_pb.MeridianModel(
+        model_version='1.2.3',
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        eda_spec=eda_spec_pb2.EDASpec(),
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model_proto)
+    mmm_kernel = kernel_pb.MmmKernel(
+        model=any_model,
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+    )
+
+    self.serde.deserialize(
+        mmm_kernel, distribution_function_registry=custom_registry
+    )
+
+    mock_distribution_serde.assert_called_once_with(custom_registry)
+
+  def test_serialize_with_default_eda_registry(self):
+    mock_eda_spec_serde = self.enter_context(
+        mock.patch.object(eda_spec_serde, 'EDASpecSerde', autospec=True)
+    )
+    mock_eda_spec_serde.return_value.serialize.return_value = (
+        eda_spec_pb2.EDASpec()
+    )
+    mock_eda_spec_serde.return_value.deserialize.return_value = (
+        eda_spec.EDASpec()
+    )
+    meridian_model = model.Meridian(
+        input_data=_INPUT_DATA, model_spec=test_data.get_default_model_spec()
+    )
+    self.serde.serialize(meridian_model)
+    mock_eda_spec_serde.assert_called_once_with(
+        function_registry_utils.FunctionRegistry()
+    )
+
+  def test_serialize_with_custom_eda_registry(self):
+    mock_eda_spec_serde = self.enter_context(
+        mock.patch.object(eda_spec_serde, 'EDASpecSerde', autospec=True)
+    )
+    mock_eda_spec_serde.return_value.serialize.return_value = (
+        eda_spec_pb2.EDASpec()
+    )
+    mock_eda_spec_serde.return_value.deserialize.return_value = (
+        eda_spec.EDASpec()
+    )
+    custom_registry = function_registry_utils.FunctionRegistry()
+    meridian_model = model.Meridian(
+        input_data=_INPUT_DATA, model_spec=test_data.get_default_model_spec()
+    )
+    self.serde.serialize(meridian_model, eda_function_registry=custom_registry)
+    mock_eda_spec_serde.assert_called_once_with(custom_registry)
+
+  def test_deserialize_with_default_eda_registry(self):
+    mock_eda_spec_serde = self.enter_context(
+        mock.patch.object(eda_spec_serde, 'EDASpecSerde', autospec=True)
+    )
+    mock_eda_spec_serde.return_value.deserialize.return_value = (
+        eda_spec.EDASpec()
+    )
+    meridian_model_proto = meridian_pb.MeridianModel(
+        model_version='1.2.3',
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        eda_spec=eda_spec_pb2.EDASpec(),
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model_proto)
+    mmm_kernel = kernel_pb.MmmKernel(
+        model=any_model,
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+    )
+
+    self.serde.deserialize(mmm_kernel)
+
+    mock_eda_spec_serde.assert_called_once_with(
+        function_registry_utils.FunctionRegistry()
+    )
+
+  def test_deserialize_with_custom_eda_registry(self):
+    mock_eda_spec_serde = self.enter_context(
+        mock.patch.object(eda_spec_serde, 'EDASpecSerde', autospec=True)
+    )
+    mock_eda_spec_serde.return_value.deserialize.return_value = (
+        eda_spec.EDASpec()
+    )
+    custom_registry = function_registry_utils.FunctionRegistry()
+    meridian_model_proto = meridian_pb.MeridianModel(
+        model_version='1.2.3',
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        eda_spec=eda_spec_pb2.EDASpec(),
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model_proto)
+    mmm_kernel = kernel_pb.MmmKernel(
+        model=any_model,
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+    )
+
+    self.serde.deserialize(mmm_kernel, eda_function_registry=custom_registry)
+
+    mock_eda_spec_serde.assert_called_once_with(custom_registry)
+
+  def test_deserialize_without_eda_spec_warns(self):
+    meridian_model_proto = meridian_pb.MeridianModel(
+        model_version='1.2.3',
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        inference_data=meridian_pb.InferenceData(),
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model_proto)
+    mmm_kernel = kernel_pb.MmmKernel(
+        model=any_model,
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+    )
+
+    with self.assertWarnsRegex(
+        UserWarning, 'MeridianModel does not contain an EDA spec.'
+    ):
+      deserialized_model = self.serde.deserialize(mmm_kernel)
+
+    self.assertEqual(deserialized_model.eda_spec, eda_spec.EDASpec())
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='empty',
+          input_data=_INPUT_DATA,
+          model_spec_fn=lambda: None,
+          inf_data_fn=lambda: None,
+      ),
+      dict(
+          testcase_name='defaults',
+          input_data=_INPUT_DATA,
+          model_spec_fn=test_data.get_default_model_spec,
+          inf_data_fn=az.InferenceData,
+      ),
+      dict(
+          testcase_name='priors_and_posteriors',
+          input_data=_INPUT_DATA,
+          model_spec_fn=lambda: spec.ModelSpec(knots=49),
+          inf_data_fn=lambda: az.InferenceData(
+              prior=_PRIOR_DATASET,
+              posterior=_POSTERIOR_DATASET,
+          ),
+      ),
+      dict(
+          testcase_name='single_knot_location_zero',
+          input_data=_INPUT_DATA,
+          model_spec_fn=lambda: spec.ModelSpec(knots=[0]),
+          inf_data_fn=az.InferenceData,
+      ),
+      dict(
+          testcase_name='single_knot_location_two',
+          input_data=_INPUT_DATA,
+          model_spec_fn=lambda: spec.ModelSpec(knots=[2]),
+          inf_data_fn=az.InferenceData,
+      ),
+      dict(
+          testcase_name='scalar_knots_two',
+          input_data=_INPUT_DATA,
+          model_spec_fn=lambda: spec.ModelSpec(knots=2),
+          inf_data_fn=az.InferenceData,
+      ),
+      dict(
+          testcase_name='multi_knot_locations',
+          input_data=_INPUT_DATA,
+          model_spec_fn=lambda: spec.ModelSpec(knots=[1, 5, 8]),
+          inf_data_fn=az.InferenceData,
+      ),
+      dict(
+          testcase_name='single_knot_tuple_zero',
+          input_data=_INPUT_DATA,
+          model_spec_fn=lambda: spec.ModelSpec(knots=(0,)),
+          inf_data_fn=az.InferenceData,
+      ),
+      dict(
+          testcase_name='multi_knot_tuple',
+          input_data=_INPUT_DATA,
+          model_spec_fn=lambda: spec.ModelSpec(knots=(1, 5, 8)),
+          inf_data_fn=az.InferenceData,
+      ),
+      dict(
+          testcase_name='multi_knot_numpy_array',
+          input_data=_INPUT_DATA,
+          model_spec_fn=lambda: spec.ModelSpec(knots=np.array([1, 5, 8])),
+          inf_data_fn=az.InferenceData,
+      ),
+  )
+  def test_serialize_deserialize_round_trip(
+      self,
+      input_data: meridian_input_data.InputData,
+      model_spec_fn: Callable[[], spec.ModelSpec],
+      inf_data_fn: Callable[[], az.InferenceData],
+  ):
+    model_spec = model_spec_fn()
+    inf_data = inf_data_fn()
+    with (
+        mock.patch.object(
+            context.ModelContext, '_validate_geo_invariants', autospec=True
+        ),
+    ):
+      original_model = model.Meridian(
+          input_data=input_data,
+          model_spec=model_spec,
+          inference_data=inf_data,
+      )
+      serialized_model = self.serde.serialize(original_model, 'test_model')
+      deserialized_model = self.serde.deserialize(serialized_model)
+
+      # Assertions for key attributes.  A comprehensive deep comparison
+      # is done in the serde subclasses' tests; here, we check a subset of
+      # important attributes to ensure the overall flow is correct.
+      self.assertIsInstance(deserialized_model, model.Meridian)
+      xrt.assert_allclose(
+          original_model.input_data.population,
+          deserialized_model.input_data.population,
+          atol=0.5,
+          rtol=0,
+      )
+      xrt.assert_allclose(
+          original_model.input_data.kpi,
+          deserialized_model.input_data.kpi,
+      )
+      xrt.assert_allclose(
+          original_model.input_data.controls,
+          deserialized_model.input_data.controls,
+      )
+
+      self.assertEqual(
+          original_model.model_spec.knots, deserialized_model.model_spec.knots
+      )
+      if original_model.model_spec.knots is not None:
+        self.assertIs(
+            type(original_model.model_spec.knots),
+            type(deserialized_model.model_spec.knots),
+        )
+      np.testing.assert_array_equal(
+          original_model.knot_info.knot_locations,
+          deserialized_model.knot_info.knot_locations,
+      )
+      self.assertEqual(
+          original_model.knot_info.n_knots, deserialized_model.knot_info.n_knots
+      )
+      np.testing.assert_allclose(
+          original_model.knot_info.weights,
+          deserialized_model.knot_info.weights,
+      )
+      self.assertEqual(
+          original_model.model_spec.max_lag,
+          deserialized_model.model_spec.max_lag,
+      )
+
+      if not hasattr(inf_data, constants.PRIOR):
+        self.assertFalse(
+            hasattr(deserialized_model.inference_data, constants.PRIOR)
+        )
+      else:
+        self.assertEqual(
+            original_model.inference_data.prior,
+            deserialized_model.inference_data.prior,
+        )
+
+      if not hasattr(inf_data, constants.POSTERIOR):
+        self.assertFalse(
+            hasattr(deserialized_model.inference_data, constants.POSTERIOR)
+        )
+      else:
+        self.assertEqual(
+            original_model.inference_data.posterior,
+            deserialized_model.inference_data.posterior,
+        )
+
+  def test_save_load_meridian_binpb(self):
+    # The create_tempdir() method below internally uses command line flag
+    # (--test_tmpdir) and such flags are not marked as parsed by default
+    # when running with pytest. Marking as parsed directly here to make the
+    # pytest run pass.
+    flags.FLAGS.mark_as_parsed()
+    file_path = os.path.join(self.create_tempdir().full_path, 'serde.binpb')
+
+    meridian_model = model.Meridian(
+        input_data=_INPUT_DATA,
+        model_spec=test_data.get_default_model_spec(),
+    )
+
+    serde.save_meridian(meridian_model, file_path)
+    self.assertTrue(os.path.exists(file_path))
+
+    loaded_model = serde.load_meridian(file_path)
+
+    for attr in dir(meridian_model):
+      if isinstance(getattr(meridian_model, attr), (int, bool)):
+        with self.subTest(name=attr):
+          self.assertEqual(
+              getattr(meridian_model, attr), getattr(loaded_model, attr)
+          )
+      elif isinstance(getattr(meridian_model, attr), backend.Tensor):
+        with self.subTest(name=attr):
+          backend_test_utils.assert_allclose(
+              getattr(meridian_model, attr), getattr(loaded_model, attr)
+          )
+
+  def test_save_load_meridian_bare_filename(self):
+    flags.FLAGS.mark_as_parsed()
+    meridian_model = model.Meridian(
+        input_data=_INPUT_DATA,
+        model_spec=test_data.get_default_model_spec(),
+    )
+    old_cwd = os.getcwd()
+    try:
+      os.chdir(self.create_tempdir().full_path)
+      serde.save_meridian(meridian_model, 'serde.binpb')
+      self.assertTrue(os.path.exists('serde.binpb'))
+      loaded_model = serde.load_meridian('serde.binpb')
+      self.assertEqual(meridian_model.n_geos, loaded_model.n_geos)
+    finally:
+      os.chdir(old_cwd)
+
+  def test_save_load_meridian_txtpb(self):
+    # The create_tempdir() method below internally uses command line flag
+    # (--test_tmpdir) and such flags are not marked as parsed by default
+    # when running with pytest. Marking as parsed directly here to make the
+    # pytest run pass.
+    flags.FLAGS.mark_as_parsed()
+    file_path = os.path.join(self.create_tempdir().full_path, 'serde.txtpb')
+
+    meridian_model = model.Meridian(
+        input_data=_INPUT_DATA,
+        model_spec=test_data.get_default_model_spec(),
+    )
+
+    serde.save_meridian(meridian_model, file_path)
+    self.assertTrue(os.path.exists(file_path))
+
+    loaded_model = serde.load_meridian(file_path)
+
+    for attr in dir(meridian_model):
+      if isinstance(getattr(meridian_model, attr), (int, bool)):
+        with self.subTest(name=attr):
+          self.assertEqual(
+              getattr(meridian_model, attr), getattr(loaded_model, attr)
+          )
+      elif isinstance(getattr(meridian_model, attr), backend.Tensor):
+        with self.subTest(name=attr):
+          backend_test_utils.assert_allclose(
+              getattr(meridian_model, attr), getattr(loaded_model, attr)
+          )
+
+  def test_save_load_total_media_prior_binpb(self):
+    # The create_tempdir() method below internally uses command line flag
+    # (--test_tmpdir) and such flags are not marked as parsed by default
+    # when running with pytest. Marking as parsed directly here to make the
+    # pytest run pass.
+    flags.FLAGS.mark_as_parsed()
+    file_path = os.path.join(self.create_tempdir().full_path, 'serde.binpb')
+
+    meridian_model = model.Meridian(
+        input_data=_INPUT_DATA_NO_RPK,
+        model_spec=test_data.get_default_model_spec(),
+    )
+
+    serde.save_meridian(meridian_model, file_path)
+    self.assertTrue(os.path.exists(file_path))
+
+    loaded_model = serde.load_meridian(file_path)
+
+    for attr in dir(meridian_model):
+      if isinstance(getattr(meridian_model, attr), (int, bool)):
+        with self.subTest(name=attr):
+          self.assertEqual(
+              getattr(meridian_model, attr), getattr(loaded_model, attr)
+          )
+      elif isinstance(getattr(meridian_model, attr), backend.Tensor):
+        with self.subTest(name=attr):
+          backend_test_utils.assert_allclose(
+              getattr(meridian_model, attr), getattr(loaded_model, attr)
+          )
+
+  def test_save_meridian_with_pandas_and_numpy_dtypes(self):
+    flags.FLAGS.mark_as_parsed()
+    file_path = os.path.join(self.create_tempdir().full_path, 'serde.binpb')
+
+    input_data = _INPUT_DATA.copy()
+    pop_values = input_data.population.values.copy()
+    population_pd = pd.array(pop_values, dtype=pd.Float64Dtype())
+    input_data.population = xr.DataArray(
+        population_pd,
+        dims=_INPUT_DATA.population.dims,
+        coords={constants.GEO: _INPUT_DATA.population.coords[constants.GEO]},
+        name=constants.POPULATION,
+    )
+
+    meridian_model = model.Meridian(
+        input_data=input_data,
+        model_spec=test_data.get_default_model_spec(),
+    )
+
+    serde.save_meridian(meridian_model, file_path)
+    self.assertTrue(os.path.exists(file_path))
+
+    loaded_model = serde.load_meridian(file_path)
+    xrt.assert_allclose(
+        meridian_model.input_data.population,
+        loaded_model.input_data.population,
+    )
+    xrt.assert_allclose(
+        meridian_model.input_data.kpi,
+        loaded_model.input_data.kpi,
+    )
+    xrt.assert_allclose(
+        meridian_model.input_data.controls,
+        loaded_model.input_data.controls,
+    )
+    xrt.assert_allclose(
+        meridian_model.input_data.media,
+        loaded_model.input_data.media,
+    )
+    xrt.assert_allclose(
+        meridian_model.input_data.media_spend,
+        loaded_model.input_data.media_spend,
+    )
+    xrt.assert_allclose(
+        meridian_model.input_data.revenue_per_kpi,
+        loaded_model.input_data.revenue_per_kpi,
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='monthly_cadence_leap_year',
+          freq='MS',
+          periods=12,
+          start_date='2024-01-01',
+          expected_first_interval=(
+              date_pb2.Date(year=2024, month=1, day=1),
+              date_pb2.Date(year=2024, month=2, day=1),
+          ),
+          expected_last_interval=(
+              date_pb2.Date(year=2024, month=12, day=1),
+              date_pb2.Date(year=2025, month=1, day=1),
+          ),
+      ),
+      dict(
+          testcase_name='quarterly_cadence_leap_year',
+          freq='QS',
+          periods=4,
+          start_date='2024-01-01',
+          expected_first_interval=(
+              date_pb2.Date(year=2024, month=1, day=1),
+              date_pb2.Date(year=2024, month=4, day=1),
+          ),
+          expected_last_interval=(
+              date_pb2.Date(year=2024, month=10, day=1),
+              date_pb2.Date(year=2025, month=1, day=1),
+          ),
+      ),
+  )
+  def test_save_meridian_with_calendar_cadence_coordinates(
+      self,
+      freq,
+      periods,
+      start_date,
+      expected_first_interval,
+      expected_last_interval,
+  ):
+    flags.FLAGS.mark_as_parsed()
+    file_path = os.path.join(
+        self.create_tempdir().full_path, f'serde_{freq}.binpb'
+    )
+
+    cadence_times = pd.date_range(
+        start=start_date, periods=periods, freq=freq
+    ).strftime(constants.DATE_FORMAT)
+
+    base_data = test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+        n_geos=5,
+        n_times=periods,
+        n_media_times=periods,
+        n_controls=2,
+        n_media_channels=3,
+        seed=1,
+    )
+    input_data = meridian_input_data.InputData(
+        kpi=base_data.kpi.assign_coords({constants.TIME: cadence_times}),
+        kpi_type=base_data.kpi_type,
+        revenue_per_kpi=base_data.revenue_per_kpi.assign_coords(
+            {constants.TIME: cadence_times}
+        ),
+        population=base_data.population,
+        controls=base_data.controls.assign_coords(
+            {constants.TIME: cadence_times}
+        ),
+        media=base_data.media.assign_coords(
+            {constants.MEDIA_TIME: cadence_times}
+        ),
+        media_spend=base_data.media_spend.assign_coords(
+            {constants.TIME: cadence_times}
+        ),
+    )
+
+    meridian_model = model.Meridian(
+        input_data=input_data,
+        model_spec=test_data.get_default_model_spec(),
+    )
+
+    serde.save_meridian(meridian_model, file_path)
+    self.assertTrue(os.path.exists(file_path))
+
+    loaded_model = serde.load_meridian(file_path)
+    xrt.assert_allclose(
+        meridian_model.input_data.time,
+        loaded_model.input_data.time,
+    )
+    xrt.assert_allclose(
+        meridian_model.input_data.media_time,
+        loaded_model.input_data.media_time,
+    )
+
+    marketing_proto = marketing_data._InputDataSerializer(
+        meridian_model.input_data
+    )()
+
+    first_interval = marketing_proto.marketing_data_points[0].date_interval
+    self.assertEqual(first_interval.start_date, expected_first_interval[0])
+    self.assertEqual(first_interval.end_date, expected_first_interval[1])
+
+    last_interval = marketing_proto.marketing_data_points[-1].date_interval
+    self.assertEqual(last_interval.start_date, expected_last_interval[0])
+    self.assertEqual(last_interval.end_date, expected_last_interval[1])
+
+  def test_deserialization_of_legacy_aks_model(self):
+    mock_version = '1.6.0'  # Older than 1.7.0
+
+    meridian_model = meridian_pb.MeridianModel(
+        model_version=mock_version,
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        inference_data=meridian_pb.InferenceData(),
+        eda_spec=eda_spec_pb2.EDASpec(),
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model)
+    mmm_kernel = kernel_pb.MmmKernel(
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+        model=any_model,
+    )
+
+    mock_hyperparameters_model_spec = spec.ModelSpec(
+        enable_aks=True, knots=None
+    )
+    mock_prior_distributions = prior_distribution.PriorDistribution()
+    with (
+        mock.patch.object(
+            hyperparameters.HyperparametersSerde,
+            'deserialize',
+            return_value=mock_hyperparameters_model_spec,
+        ),
+        mock.patch.object(
+            distribution.DistributionSerde,
+            'deserialize',
+            return_value=mock_prior_distributions,
+        ),
+        mock.patch(
+            'meridian.schema.serde.legacy_aks.get_legacy_knots',
+            return_value=[0, 1],
+        ) as mock_get_legacy_knots,
+    ):
+      deserialized_model = self.serde.deserialize(mmm_kernel)
+      mock_get_legacy_knots.assert_called_once()
+      self.assertIn('knot_info', deserialized_model.model_context.__dict__)
+      np.testing.assert_array_equal(
+          deserialized_model.model_context.knot_info.knot_locations, [0, 1]
+      )
+
+  def test_deserialization_of_legacy_aks_model_single_knot(self):
+    mock_version = '1.6.0'  # Older than 1.7.0
+
+    meridian_model = meridian_pb.MeridianModel(
+        model_version=mock_version,
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        inference_data=meridian_pb.InferenceData(),
+        eda_spec=eda_spec_pb2.EDASpec(),
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model)
+    mmm_kernel = kernel_pb.MmmKernel(
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+        model=any_model,
+    )
+
+    mock_hyperparameters_model_spec = spec.ModelSpec(
+        enable_aks=True, knots=None
+    )
+    mock_prior_distributions = prior_distribution.PriorDistribution()
+    with (
+        mock.patch.object(
+            hyperparameters.HyperparametersSerde,
+            'deserialize',
+            return_value=mock_hyperparameters_model_spec,
+        ),
+        mock.patch.object(
+            distribution.DistributionSerde,
+            'deserialize',
+            return_value=mock_prior_distributions,
+        ),
+        mock.patch(
+            'meridian.schema.serde.legacy_aks.get_legacy_knots',
+            return_value=[0],
+        ) as mock_get_legacy_knots,
+    ):
+      deserialized_model = self.serde.deserialize(mmm_kernel)
+      mock_get_legacy_knots.assert_called_once()
+      self.assertIn('knot_info', deserialized_model.model_context.__dict__)
+      np.testing.assert_array_equal(
+          deserialized_model.model_context.knot_info.knot_locations, [0]
+      )
+      self.assertEqual(
+          deserialized_model.model_context.knot_info.weights.shape,
+          (1, deserialized_model.model_context.n_times),
+      )
+
+  def test_deserialization_of_legacy_aks_v1_7_1_model(self):
+    mock_version = '1.7.1'  # legacy v2
+
+    meridian_model = meridian_pb.MeridianModel(
+        model_version=mock_version,
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        inference_data=meridian_pb.InferenceData(),
+        eda_spec=eda_spec_pb2.EDASpec(),
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model)
+    mmm_kernel = kernel_pb.MmmKernel(
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+        model=any_model,
+    )
+
+    mock_hyperparameters_model_spec = spec.ModelSpec(
+        enable_aks=True, knots=None
+    )
+    mock_prior_distributions = prior_distribution.PriorDistribution()
+    with (
+        mock.patch.object(
+            hyperparameters.HyperparametersSerde,
+            'deserialize',
+            return_value=mock_hyperparameters_model_spec,
+        ),
+        mock.patch.object(
+            distribution.DistributionSerde,
+            'deserialize',
+            return_value=mock_prior_distributions,
+        ),
+        mock.patch(
+            'meridian.schema.serde.legacy_aks_v1_7_1.get_legacy_knots',
+            return_value=[0, 1],
+        ) as mock_get_legacy_knots,
+    ):
+      deserialized_model = self.serde.deserialize(mmm_kernel)
+      mock_get_legacy_knots.assert_called_once()
+      self.assertIn('knot_info', deserialized_model.model_context.__dict__)
+      np.testing.assert_array_equal(
+          deserialized_model.model_context.knot_info.knot_locations, [0, 1]
+      )
+
+  def test_deserialization_of_legacy_aks_v1_7_1_model_single_knot(self):
+    mock_version = '1.7.1'  # legacy v2
+
+    meridian_model = meridian_pb.MeridianModel(
+        model_version=mock_version,
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        inference_data=meridian_pb.InferenceData(),
+        eda_spec=eda_spec_pb2.EDASpec(),
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model)
+    mmm_kernel = kernel_pb.MmmKernel(
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+        model=any_model,
+    )
+
+    mock_hyperparameters_model_spec = spec.ModelSpec(
+        enable_aks=True, knots=None
+    )
+    mock_prior_distributions = prior_distribution.PriorDistribution()
+    with (
+        mock.patch.object(
+            hyperparameters.HyperparametersSerde,
+            'deserialize',
+            return_value=mock_hyperparameters_model_spec,
+        ),
+        mock.patch.object(
+            distribution.DistributionSerde,
+            'deserialize',
+            return_value=mock_prior_distributions,
+        ),
+        mock.patch(
+            'meridian.schema.serde.legacy_aks_v1_7_1.get_legacy_knots',
+            return_value=[0],
+        ) as mock_get_legacy_knots,
+    ):
+      deserialized_model = self.serde.deserialize(mmm_kernel)
+      mock_get_legacy_knots.assert_called_once()
+      self.assertIn('knot_info', deserialized_model.model_context.__dict__)
+      np.testing.assert_array_equal(
+          deserialized_model.model_context.knot_info.knot_locations, [0]
+      )
+      self.assertEqual(
+          deserialized_model.model_context.knot_info.weights.shape,
+          (1, deserialized_model.model_context.n_times),
+      )
+
+  def test_deserialization_of_legacy_aks_model_fitted(self):
+    mock_version = '1.6.0'  # Older than 1.7.0
+
+    meridian_model = meridian_pb.MeridianModel(
+        model_version=mock_version,
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        inference_data=meridian_pb.InferenceData(),
+        eda_spec=eda_spec_pb2.EDASpec(),
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model)
+    mmm_kernel = kernel_pb.MmmKernel(
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+        model=any_model,
+    )
+
+    mock_hyperparameters_model_spec = spec.ModelSpec(
+        enable_aks=True, knots=None
+    )
+    mock_prior_distributions = prior_distribution.PriorDistribution()
+
+    mock_inference_data = test_data.make_sample_dataset(
+        _POSTERIOR_DATASET_CHAINS,
+        _POSTERIOR_DATASET_DRAWS,
+        n_geos=2,
+        n_controls=2,
+        n_knots=2,
+        n_times=2,
+        n_media_channels=2,
+    )
+
+    with (
+        mock.patch.object(
+            hyperparameters.HyperparametersSerde,
+            'deserialize',
+            return_value=mock_hyperparameters_model_spec,
+        ),
+        mock.patch.object(
+            distribution.DistributionSerde,
+            'deserialize',
+            return_value=mock_prior_distributions,
+        ),
+        mock.patch.object(
+            inference_data.InferenceDataSerde,
+            'deserialize',
+            return_value=az.InferenceData(posterior=mock_inference_data),
+        ),
+        mock.patch(
+            'meridian.schema.serde.legacy_aks.get_legacy_knots',
+            return_value=[0, 1],
+        ) as mock_get_legacy_knots,
+    ):
+      deserialized_model = self.serde.deserialize(mmm_kernel)
+      mock_get_legacy_knots.assert_called_once()
+      self.assertIn('knot_info', deserialized_model.model_context.__dict__)
+      self.assertEqual(deserialized_model.model_context.knot_info.n_knots, 2)
+
+  def test_deserialization_of_legacy_aks_model_fitted_invalid_inference_data(
+      self,
+  ):
+    mock_version = '1.6.0'  # Older than 1.7.0
+
+    meridian_model = meridian_pb.MeridianModel(
+        model_version=mock_version,
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        inference_data=meridian_pb.InferenceData(),
+        eda_spec=eda_spec_pb2.EDASpec(),
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model)
+    mmm_kernel = kernel_pb.MmmKernel(
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+        model=any_model,
+    )
+
+    mock_hyperparameters_model_spec = spec.ModelSpec(
+        enable_aks=True, knots=None
+    )
+    mock_prior_distributions = prior_distribution.PriorDistribution()
+
+    # Invalid dataset (n_knots=5) does not match legacy knots length
+    mock_inference_data = test_data.make_sample_dataset(
+        _POSTERIOR_DATASET_CHAINS,
+        _POSTERIOR_DATASET_DRAWS,
+        n_geos=2,
+        n_controls=2,
+        n_knots=5,
+        n_times=2,
+        n_media_channels=2,
+    )
+
+    with (
+        mock.patch.object(
+            hyperparameters.HyperparametersSerde,
+            'deserialize',
+            return_value=mock_hyperparameters_model_spec,
+        ),
+        mock.patch.object(
+            distribution.DistributionSerde,
+            'deserialize',
+            return_value=mock_prior_distributions,
+        ),
+        mock.patch.object(
+            inference_data.InferenceDataSerde,
+            'deserialize',
+            return_value=az.InferenceData(posterior=mock_inference_data),
+        ),
+        mock.patch(
+            'meridian.schema.serde.legacy_aks.get_legacy_knots',
+            return_value=[0, 1],
+        ),
+    ):
+      with self.assertRaisesRegex(
+          ValueError,
+          "Injected inference data posterior has incorrect coordinate 'knots'",
+      ):
+        self.serde.deserialize(mmm_kernel)
+
+  def test_deserialization_of_current_aks_model(self):
+    mock_version = '1.8.0'  # Newer than 1.7.0
+
+    meridian_model = meridian_pb.MeridianModel(
+        model_version=mock_version,
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        inference_data=meridian_pb.InferenceData(),
+        eda_spec=eda_spec_pb2.EDASpec(),
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model)
+    mmm_kernel = kernel_pb.MmmKernel(
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+        model=any_model,
+    )
+
+    mock_hyperparameters_model_spec = spec.ModelSpec(
+        enable_aks=True, knots=None
+    )
+    mock_prior_distributions = prior_distribution.PriorDistribution()
+    with (
+        mock.patch.object(
+            hyperparameters.HyperparametersSerde,
+            'deserialize',
+            return_value=mock_hyperparameters_model_spec,
+        ),
+        mock.patch.object(
+            distribution.DistributionSerde,
+            'deserialize',
+            return_value=mock_prior_distributions,
+        ),
+        mock.patch(
+            'meridian.schema.serde.legacy_aks.get_legacy_knots',
+        ) as mock_get_legacy_knots,
+    ):
+      deserialized_model = self.serde.deserialize(mmm_kernel)
+      mock_get_legacy_knots.assert_not_called()
+      self.assertNotIn('knot_info', deserialized_model.model_context.__dict__)
+
+  def test_deserialization_of_legacy_no_aks_model(self):
+    mock_version = '1.6.0'  # Older than 1.7.0
+
+    meridian_model = meridian_pb.MeridianModel(
+        model_version=mock_version,
+        hyperparameters=test_data.DEFAULT_HYPERPARAMETERS_PROTO,
+        prior_tfp_distributions=meridian_pb.PriorTfpDistributions(),
+        inference_data=meridian_pb.InferenceData(),
+        eda_spec=eda_spec_pb2.EDASpec(),
+    )
+    any_model = any_pb2.Any()
+    any_model.Pack(meridian_model)
+    mmm_kernel = kernel_pb.MmmKernel(
+        marketing_data=test_data.MOCK_PROTO_MEDIA_PAID_GRANULAR_NOT_LAGGED,
+        model=any_model,
+    )
+
+    mock_hyperparameters_model_spec = spec.ModelSpec(
+        enable_aks=False, knots=None
+    )
+    mock_prior_distributions = prior_distribution.PriorDistribution()
+    with (
+        mock.patch.object(
+            hyperparameters.HyperparametersSerde,
+            'deserialize',
+            return_value=mock_hyperparameters_model_spec,
+        ),
+        mock.patch.object(
+            distribution.DistributionSerde,
+            'deserialize',
+            return_value=mock_prior_distributions,
+        ),
+        mock.patch(
+            'meridian.schema.serde.legacy_aks.get_legacy_knots',
+        ) as mock_get_legacy_knots,
+    ):
+      deserialized_model = self.serde.deserialize(mmm_kernel)
+      mock_get_legacy_knots.assert_not_called()
+      self.assertNotIn('knot_info', deserialized_model.model_context.__dict__)
+
+
+class HoldoutRoundTripTest(parameterized.TestCase):
+  """End-to-end coverage that a holdout survives a save/load round trip.
+
+  `hyperparameters_test` covers the proto translation in isolation and
+  `analyzer_test` covers analysis reading `ModelContext.compiled_holdout_id`.
+  This class of tests cover the seam between them.
+
+  Every case asserts on `compiled_holdout_id`, which is the attribute the
+  analysis and sampling layers actually consume, so an equal mask means every
+  downstream consumer sees the holdout the original fit used.
+  """
+
+  _RANDOM_HOLDOUT = spec.RandomHoldoutSpec(ratio=0.2, seed=17)
+  # Unseeded, so the draw comes from OS entropy and a re-draw would produce a
+  # different mask. Asserting mask equality is then a real assertion that the
+  # recorded draw governed, not that the seed happened to reproduce it.
+  _UNSEEDED_RANDOM_HOLDOUT = spec.RandomHoldoutSpec(ratio=0.2)
+
+  def setUp(self):
+    super().setUp()
+    # The create_tempdir() method below internally uses command line flag
+    # (--test_tmpdir) and such flags are not marked as parsed by default
+    # when running with pytest. Marking as parsed directly here to make the
+    # pytest run pass.
+    flags.FLAGS.mark_as_parsed()
+    self._tempdir = self.create_tempdir().full_path
+
+  def _save(self, mmm: model.Meridian, name: str = 'model') -> str:
+    """Writes `mmm` to a wire-format proto file and returns the path."""
+    file_path = os.path.join(self._tempdir, f'{name}.binpb')
+    serde.save_meridian(mmm, file_path)
+    return file_path
+
+  def _round_trip(
+      self,
+      model_spec: spec.ModelSpec,
+      input_data: meridian_input_data.InputData = _INPUT_DATA,
+  ) -> tuple[model.Meridian, model.Meridian]:
+    """Returns a model built from `model_spec` and its round-tripped copy."""
+    original = model.Meridian(input_data=input_data, model_spec=model_spec)
+    return original, serde.load_meridian(self._save(original))
+
+  def _model_spec_with_both_holdouts(self) -> spec.ModelSpec:
+    """Returns a spec with a legacy array and a random holdout both set."""
+    legacy = np.full((len(_INPUT_DATA.geo), len(_INPUT_DATA.time)), False)
+    legacy[:, 5:15] = True
+    with warnings.catch_warnings():
+      # Constructing a both-set spec warns about precedence and deprecation;
+      # that behavior belongs to `spec_test`, not here.
+      warnings.simplefilter('ignore')
+      return spec.ModelSpec(
+          holdout=spec.HoldoutSpec(spec=self._RANDOM_HOLDOUT),
+          holdout_id=legacy,
+      )
+
+  def test_a_random_draw_survives_the_round_trip(self):
+    original, loaded = self._round_trip(
+        spec.ModelSpec(
+            holdout=spec.HoldoutSpec(spec=self._UNSEEDED_RANDOM_HOLDOUT)
+        )
+    )
+
+    np.testing.assert_array_equal(
+        loaded.model_context.compiled_holdout_id,
+        original.model_context.compiled_holdout_id,
+    )
+
+  def test_a_balanced_random_draw_survives_the_round_trip(self):
+    """Both the `balanced` flag and the recorded draw round-trip."""
+    original, loaded = self._round_trip(
+        spec.ModelSpec(
+            holdout=spec.HoldoutSpec(
+                spec=spec.RandomHoldoutSpec(ratio=0.2, balanced=True)
+            )
+        )
+    )
+
+    holdout = loaded.model_spec.holdout
+    assert holdout is not None  # Narrows the type for the read below.
+    self.assertTrue(holdout.spec.balanced)
+    np.testing.assert_array_equal(
+        loaded.model_context.compiled_holdout_id,
+        original.model_context.compiled_holdout_id,
+    )
+
+  def test_the_loaded_spec_records_the_draw_alongside_the_intent(self):
+    _, loaded = self._round_trip(
+        spec.ModelSpec(holdout=spec.HoldoutSpec(spec=self._RANDOM_HOLDOUT))
+    )
+
+    holdout = loaded.model_spec.holdout
+    self.assertIsNotNone(holdout)
+    assert holdout is not None  # Narrows the type for the reads below.
+    # The request is provenance; the draw is what governs on reload.
+    self.assertEqual(holdout.spec, self._RANDOM_HOLDOUT)
+    self.assertIsNotNone(holdout.resolved)
+
+  def test_loading_a_recorded_draw_does_not_warn(self):
+    file_path = self._save(
+        model.Meridian(
+            input_data=_INPUT_DATA,
+            model_spec=spec.ModelSpec(
+                holdout=spec.HoldoutSpec(spec=self._RANDOM_HOLDOUT)
+            ),
+        )
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+      warnings.simplefilter('always')
+      serde.load_meridian(file_path)
+
+    self.assertEmpty(
+        [w for w in caught if 'does not record the draw' in str(w.message)]
+    )
+
+  def test_the_draw_is_stable_across_repeated_round_trips(self):
+    original, once = self._round_trip(
+        spec.ModelSpec(
+            holdout=spec.HoldoutSpec(spec=self._UNSEEDED_RANDOM_HOLDOUT)
+        )
+    )
+    twice = serde.load_meridian(self._save(once, name='reloaded'))
+
+    # The recorded draw has to be carried forward on every write, not just the
+    # first one, or the second load would silently draw a different holdout.
+    np.testing.assert_array_equal(
+        twice.model_context.compiled_holdout_id,
+        original.model_context.compiled_holdout_id,
+    )
+
+  def test_a_national_random_draw_survives_the_round_trip(self):
+    national_input_data = (
+        test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+            n_geos=1,
+            n_times=49,
+            n_media_times=52,
+            n_controls=2,
+            n_media_channels=3,
+            seed=1,
+        )
+    )
+
+    original, loaded = self._round_trip(
+        spec.ModelSpec(
+            holdout=spec.HoldoutSpec(spec=self._UNSEEDED_RANDOM_HOLDOUT)
+        ),
+        input_data=national_input_data,
+    )
+
+    # A national mask is 1-D over time, so the round trip also has to survive
+    # the squeeze that drops the geo axis.
+    national_mask = original.model_context.compiled_holdout_id
+    self.assertIsNotNone(national_mask)
+    assert national_mask is not None  # Narrows the type for the read below.
+    self.assertEqual(national_mask.ndim, 1)
+    np.testing.assert_array_equal(
+        loaded.model_context.compiled_holdout_id,
+        national_mask,
+    )
+
+  def test_a_date_range_holdout_survives_the_round_trip(self):
+    dates = _INPUT_DATA.time_coordinates.all_dates
+
+    original, loaded = self._round_trip(
+        spec.ModelSpec(
+            holdout=spec.HoldoutSpec(
+                spec=[spec.DateRange(dates[10], dates[20])]
+            )
+        )
+    )
+
+    np.testing.assert_array_equal(
+        loaded.model_context.compiled_holdout_id,
+        original.model_context.compiled_holdout_id,
+    )
+    # Deterministic specs recompile from `spec`, so there is no draw to record.
+    holdout = loaded.model_spec.holdout
+    self.assertIsNotNone(holdout)
+    assert holdout is not None  # Narrows the type for the read below.
+    self.assertIsNone(holdout.resolved)
+
+  def test_a_geo_holdout_survives_the_round_trip(self):
+    dates = _INPUT_DATA.time_coordinates.all_dates
+
+    original, loaded = self._round_trip(
+        spec.ModelSpec(
+            holdout=spec.HoldoutSpec(
+                spec=[
+                    spec.GeoHoldoutSpec(
+                        geos=['geo_1', 'geo_3'],
+                        date_ranges=[spec.DateRange(dates[10], dates[20])],
+                    )
+                ]
+            )
+        )
+    )
+
+    np.testing.assert_array_equal(
+        loaded.model_context.compiled_holdout_id,
+        original.model_context.compiled_holdout_id,
+    )
+    # Deterministic specs recompile from `spec`, so there is no draw to record.
+    holdout = loaded.model_spec.holdout
+    self.assertIsNotNone(holdout)
+    assert holdout is not None  # Narrows the type for the read below.
+    self.assertIsNone(holdout.resolved)
+
+  def test_a_legacy_holdout_array_survives_the_round_trip(self):
+    legacy = np.full((len(_INPUT_DATA.geo), len(_INPUT_DATA.time)), False)
+    legacy[:, 5:15] = True
+    with warnings.catch_warnings():
+      warnings.simplefilter('ignore')  # Deprecation of `holdout_id`.
+      model_spec = spec.ModelSpec(holdout_id=legacy)
+
+    original, loaded = self._round_trip(model_spec)
+
+    np.testing.assert_array_equal(
+        loaded.model_context.compiled_holdout_id,
+        original.model_context.compiled_holdout_id,
+    )
+
+  def test_a_legacy_array_keeps_precedence_across_the_round_trip(self):
+    model_spec = self._model_spec_with_both_holdouts()
+
+    original, loaded = self._round_trip(model_spec)
+
+    np.testing.assert_array_equal(
+        loaded.model_context.compiled_holdout_id,
+        original.model_context.compiled_holdout_id,
+    )
+    # The random specification never governed, so no draw was made to record.
+    holdout = loaded.model_spec.holdout
+    self.assertIsNotNone(holdout)
+    assert holdout is not None  # Narrows the type for the read below.
+    self.assertIsNone(holdout.resolved)
+
+  def test_loading_an_inert_random_holdout_does_not_warn(self):
+    file_path = self._save(
+        model.Meridian(
+            input_data=_INPUT_DATA,
+            model_spec=self._model_spec_with_both_holdouts(),
+        )
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+      warnings.simplefilter('always')
+      serde.load_meridian(file_path)
+
+    # The unrecorded draw is not worth warning about when `holdout_id` governs.
+    self.assertEmpty(
+        [w for w in caught if 'does not record the draw' in str(w.message)]
+    )
+
+  def test_no_holdout_stays_absent_across_the_round_trip(self):
+    _, loaded = self._round_trip(spec.ModelSpec())
+
+    self.assertIsNone(loaded.model_spec.holdout)
+    self.assertIsNone(loaded.model_spec.holdout_id)
+    self.assertIsNone(loaded.model_context.compiled_holdout_id)
+
+
+class ChangepointsRoundTripTest(absltest.TestCase):
+  """Tests saving and loading the time-varying media effects of a model."""
+
+  # pylint: disable=protected-access
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    dates = _INPUT_DATA.time_coordinates.all_dates
+    cls.channel = str(_INPUT_DATA.media_channel.values[0])
+    cls.original = model.Meridian(
+        input_data=_INPUT_DATA,
+        model_spec=spec._ModelSpecWithChangepoints(
+            changepoints={cls.channel: [dates[20], dates[35]]},
+            changepoint_media_prior_type=constants.TREATMENT_PRIOR_TYPE_MROI,
+            changepoint_media_effects_dist=constants.MEDIA_EFFECTS_NORMAL,
+            prior=prior_distribution._PriorDistributionWithChangepoints(
+                zeta_m=backend.tfd.HalfNormal(
+                    backend.np_float_dtype(0.3), name=constants.ZETA_M
+                )
+            ),
+        ),
+    )
+    cls.original.sample_prior(n_draws=2, seed=1)
+    meridian_serde = serde.MeridianSerde()
+    cls.loaded = meridian_serde.deserialize(
+        meridian_serde.serialize(cls.original)
+    )
+
+  def test_the_changepoint_settings_survive(self):
+    loaded_spec = self.loaded.model_spec
+    assert isinstance(loaded_spec, spec._ModelSpecWithChangepoints)
+    original_spec = self.original.model_spec
+    assert isinstance(original_spec, spec._ModelSpecWithChangepoints)
+    for field in (
+        'changepoints',
+        'changepoint_media_prior_type',
+        'changepoint_rf_prior_type',
+        'changepoint_media_effects_dist',
+    ):
+      with self.subTest(field=field):
+        self.assertEqual(
+            getattr(loaded_spec, field), getattr(original_spec, field)
+        )
+
+  def test_the_model_uses_the_same_changepoints(self):
+    self.assertEqual(
+        self.loaded.model_context._changepoints,
+        self.original.model_context._changepoints,
+    )
+
+  def test_the_time_varying_priors_survive(self):
+    prior = self.loaded.model_spec.prior
+    assert isinstance(
+        prior, prior_distribution._PriorDistributionWithChangepoints
+    )
+    self.assertAlmostEqual(float(prior.zeta_m.scale), 0.3)
+    self.assertAlmostEqual(float(prior.zeta_rf.scale), 0.5)
+
+  def test_the_prior_samples_survive(self):
+    self.assertIn(constants.VARPHI_M, self.loaded.inference_data.prior)
+    xrt.assert_equal(
+        self.loaded.inference_data.prior, self.original.inference_data.prior
+    )
+
+  def test_the_default_time_varying_priors_are_saved(self):
+    original = model.Meridian(
+        input_data=_INPUT_DATA,
+        model_spec=spec._ModelSpecWithChangepoints(
+            changepoints={
+                self.channel: [_INPUT_DATA.time_coordinates.all_dates[20]]
+            }
+        ),
+    )
+    meridian_serde = serde.MeridianSerde()
+
+    loaded = meridian_serde.deserialize(meridian_serde.serialize(original))
+
+    # A plain `PriorDistribution` would mean the defaults weren't saved.
+    prior = loaded.model_spec.prior
+    assert isinstance(
+        prior, prior_distribution._PriorDistributionWithChangepoints
+    )
+    self.assertAlmostEqual(float(prior.zeta_m.scale), 0.5)
+    self.assertAlmostEqual(float(prior.zeta_rf.scale), 0.5)
+
+  def test_a_model_without_changepoints_saves_no_time_varying_priors(self):
+    mmm = model.Meridian(
+        input_data=_INPUT_DATA,
+        model_spec=spec.ModelSpec(
+            prior=prior_distribution._PriorDistributionWithChangepoints()
+        ),
+    )
+    unpacked_model = meridian_pb.MeridianModel()
+
+    serde.MeridianSerde().serialize(mmm).model.Unpack(unpacked_model)
+
+    priors = unpacked_model.prior_tfp_distributions
+    self.assertTrue(priors.HasField(constants.BETA_M))
+    self.assertFalse(priors.HasField(constants.ZETA_M))
+    self.assertFalse(priors.HasField(constants.ZETA_RF))
+
+
+if __name__ == '__main__':
+  absltest.main()

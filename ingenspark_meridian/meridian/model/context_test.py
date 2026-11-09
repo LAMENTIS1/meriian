@@ -1,0 +1,5216 @@
+# Copyright 2026 The Meridian Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections.abc import Callable, Collection, Mapping, Sequence
+import dataclasses
+import datetime
+import re
+import types
+from typing import Any
+from unittest import mock
+import warnings
+
+from absl.testing import absltest
+from absl.testing import parameterized
+from ingenspark_meridian.meridian import backend
+from ingenspark_meridian.meridian import constants
+from ingenspark_meridian.meridian.backend import test_utils
+from ingenspark_meridian.meridian.data import input_data
+from ingenspark_meridian.meridian.data import test_utils as data_test_utils
+from ingenspark_meridian.meridian.model import changepoints
+from ingenspark_meridian.meridian.model import context
+from ingenspark_meridian.meridian.model import knots as knots_module
+from ingenspark_meridian.meridian.model import model_test_data
+from ingenspark_meridian.meridian.model import prior_distribution
+from ingenspark_meridian.meridian.model import spec
+import numpy as np
+import xarray as xr
+
+# Data dimensions for sample input.
+_MEDIA_CHANNEL_NAMES = ("ch_0", "ch_1", "ch_2")
+_RF_CHANNEL_NAMES = ("rf_ch_0", "rf_ch_1", "rf_ch_2")
+
+
+def _cast_dist_arg(arg: Any) -> Any:
+  if isinstance(arg, (list, tuple)):
+    return np.array(arg, dtype=backend.np_float_dtype)
+  if isinstance(arg, (int, float)):
+    return backend.np_float_dtype(arg)
+  return arg
+
+
+class ContextTest(
+    test_utils.MeridianTestCase,
+    model_test_data.WithInputDataSamples,
+):
+  input_data_samples = model_test_data.WithInputDataSamples
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    model_test_data.WithInputDataSamples.setup()
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="national",
+          input_data_type="national",
+      ),
+      dict(
+          testcase_name="geo",
+          input_data_type="geo",
+      ),
+  )
+  def test_init_with_wrong_roi_calibration_period_shape_fails(
+      self,
+      input_data_type: str,
+  ):
+    error_msg = (
+        "The shape of `roi_calibration_period` (2, 3) is different"
+        " from `(n_media_times, n_media_channels) = (203, 3)`."
+    )
+    model_spec = spec.ModelSpec(
+        roi_calibration_period=np.ones((2, 3), dtype=bool)
+    )
+    data = (
+        self.national_input_data_media_and_rf
+        if input_data_type == "national"
+        else self.input_data_with_media_and_rf
+    )
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        error_msg,
+    ):
+      context.ModelContext(input_data=data, model_spec=model_spec)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="national",
+          input_data_type="national",
+      ),
+      dict(
+          testcase_name="geo",
+          input_data_type="geo",
+      ),
+  )
+  def test_init_with_wrong_rf_roi_calibration_period_shape_fails(
+      self,
+      input_data_type: str,
+  ):
+    error_msg = (
+        "The shape of `rf_roi_calibration_period` (4, 5) is different"
+        " from `(n_media_times, n_rf_channels) = (203, 2)`."
+    )
+    model_spec = spec.ModelSpec(
+        rf_roi_calibration_period=np.ones((4, 5), dtype=bool)
+    )
+    data = (
+        self.national_input_data_media_and_rf
+        if input_data_type == "national"
+        else self.input_data_with_media_and_rf
+    )
+    with self.assertRaisesWithLiteralMatch(ValueError, error_msg):
+      context.ModelContext(input_data=data, model_spec=model_spec)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="national",
+          input_data_type="national",
+          error_msg=(
+              "The shape of `holdout_id` (2, 8) is different from `(n_times,) ="
+              " (200,)`."
+          ),
+      ),
+      dict(
+          testcase_name="geo",
+          input_data_type="geo",
+          error_msg=(
+              "The shape of `holdout_id` (2, 8) is different from `(n_geos,"
+              " n_times) = (5, 200)`."
+          ),
+      ),
+  )
+  def test_init_with_wrong_holdout_id_shape_fails(
+      self, input_data_type: str, error_msg: str
+  ):
+    model_spec = spec.ModelSpec(holdout_id=np.ones((2, 8), dtype=bool))
+    data = (
+        self.national_input_data_media_and_rf
+        if input_data_type == "national"
+        else self.input_data_with_media_and_rf
+    )
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        error_msg,
+    ):
+      _ = context.ModelContext(
+          input_data=data, model_spec=model_spec
+      ).holdout_id
+
+  def test_init_with_wrong_control_population_scaling_id_shape_fails(self):
+    model_spec = spec.ModelSpec(
+        control_population_scaling_id=np.ones((7), dtype=bool)
+    )
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "The shape of `control_population_scaling_id` (7,) is different from"
+        " `(n_controls,) = (2,)`.",
+    ):
+      context.ModelContext(
+          input_data=self.input_data_with_media_and_rf, model_spec=model_spec
+      )
+
+  def test_init_with_wrong_non_media_population_scaling_id_shape_fails(self):
+    data = self.input_data_non_media_and_organic
+    model_spec = spec.ModelSpec(
+        non_media_population_scaling_id=np.ones((7), dtype=bool)
+    )
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "The shape of `non_media_population_scaling_id` (7,) is different from"
+        " `(n_non_media_channels,) = (2,)`.",
+    ):
+      context.ModelContext(
+          input_data=data,
+          model_spec=model_spec,
+      )
+
+  @parameterized.named_parameters(
+      ("none", None, 200), ("int", 3, 3), ("list", [0, 50, 100, 150], 4)
+  )
+  def test_n_knots(self, knots, expected_n_knots):
+    # Create sample model spec with given knots
+    model_spec = spec.ModelSpec(knots=knots)
+
+    model_context = context.ModelContext(
+        input_data=self.input_data_with_media_only, model_spec=model_spec
+    )
+
+    self.assertEqual(model_context.knot_info.n_knots, expected_n_knots)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="too_many",
+          knots=201,
+          msg=(
+              "The number of knots (201) cannot be greater than the number of"
+              " time periods in the kpi (200)."
+          ),
+      ),
+      dict(
+          testcase_name="less_than_one",
+          knots=-1,
+          msg="If knots is an integer, it must be at least 1.",
+      ),
+      dict(
+          testcase_name="negative",
+          knots=[-2, 17],
+          msg="Knots must be all non-negative.",
+      ),
+      dict(
+          testcase_name="too_large",
+          knots=[3, 202],
+          msg="Knots must all be less than the number of time periods.",
+      ),
+  )
+  def test_init_with_wrong_knots_fails(
+      self, knots: int | Collection[int] | None, msg: str
+  ):
+    # Create sample model spec with given knots
+    model_spec = spec.ModelSpec(knots=knots)
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        msg,
+    ):
+      _ = context.ModelContext(
+          input_data=self.input_data_with_media_only, model_spec=model_spec
+      ).knot_info
+
+  @parameterized.named_parameters(
+      dict(testcase_name="none", knots=None, is_national=False),
+      dict(testcase_name="none_and_national", knots=None, is_national=True),
+      dict(testcase_name="int", knots=3, is_national=False),
+      dict(testcase_name="list", knots=[0, 50, 100, 150], is_national=False),
+  )
+  def test_get_knot_info_is_called(
+      self, knots: int | Collection[int] | None, is_national: bool
+  ):
+    mock_get_knot_info = self.enter_context(
+        mock.patch.object(
+            knots_module,
+            "get_knot_info",
+            autospec=True,
+            spec_set=True,
+            return_value=knots_module.KnotInfo(
+                3, np.array([2, 5, 8]), np.eye(3)  # pyrefly: ignore[bad-argument-type]
+            ),
+        )
+    )
+    data = (
+        self.national_input_data_media_only
+        if is_national
+        else self.input_data_with_media_only
+    )
+    _ = context.ModelContext(
+        input_data=data,
+        model_spec=spec.ModelSpec(knots=knots),
+    ).knot_info
+    mock_get_knot_info.assert_called_once_with(
+        self._N_TIMES,
+        knots,
+        False,
+        data,
+        is_national,
+    )
+
+  def test_base_geo_properties(self):
+    model_context = context.ModelContext(
+        input_data=self.input_data_with_media_and_rf,
+        model_spec=spec.ModelSpec(),
+    )
+    self.assertEqual(model_context.n_geos, self._N_GEOS)
+    self.assertEqual(model_context.n_controls, self._N_CONTROLS)
+    self.assertEqual(model_context.n_times, self._N_TIMES)
+    self.assertEqual(model_context.n_media_times, self._N_MEDIA_TIMES)
+    self.assertFalse(model_context.is_national)
+
+  def test_base_national_properties(self):
+    model_context = context.ModelContext(
+        input_data=self.national_input_data_media_only,
+        model_spec=spec.ModelSpec(),
+    )
+    self.assertEqual(model_context.n_geos, self._N_GEOS_NATIONAL)
+    self.assertEqual(model_context.n_controls, self._N_CONTROLS)
+    self.assertEqual(model_context.n_times, self._N_TIMES)
+    self.assertEqual(model_context.n_media_times, self._N_MEDIA_TIMES)
+    self.assertTrue(model_context.is_national)
+
+  def test_saturation_spec_property_global_string(self):
+    data = self.input_data_with_media_only
+    model_spec = spec.ModelSpec(saturation_spec="none")
+    model_context = context.ModelContext(input_data=data, model_spec=model_spec)
+
+    spec_obj = model_context.saturation_spec
+    expected_spec = context.SaturationSpec(
+        media="none", rf="none", organic_media="none", organic_rf="none"
+    )
+    self.assertEqual(spec_obj, expected_spec)
+
+  def test_saturation_spec_property_mapping(self):
+    data = data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+        n_media_channels=2, n_organic_media_channels=2
+    )
+    self.assertIsNotNone(data.media_channel)
+    self.assertIsNotNone(data.organic_media_channel)
+    media_channels = data.media_channel.values.tolist()
+    organic_media_channels = data.organic_media_channel.values.tolist()
+
+    mapping = {
+        media_channels[0]: "none",
+        organic_media_channels[0]: "none",
+    }
+
+    model_spec = spec.ModelSpec(saturation_spec=mapping)
+    model_context = context.ModelContext(input_data=data, model_spec=model_spec)
+
+    spec_obj = model_context.saturation_spec
+
+    expected_spec = context.SaturationSpec(
+        media=["none", constants.HILL],
+        rf=constants.HILL,
+        organic_media=["none", constants.HILL],
+        organic_rf=constants.HILL,
+    )
+    self.assertEqual(spec_obj, expected_spec)
+
+  def test_saturation_spec_property_invalid_mapping_fails(self):
+    data = self.input_data_with_media_only
+    model_spec = spec.ModelSpec(saturation_spec={"invalid_channel": "none"})
+    model_context = context.ModelContext(input_data=data, model_spec=model_spec)
+
+    with self.assertRaisesRegex(
+        ValueError,
+        "Unrecognized channel names found in `saturation_spec` keys",
+    ):
+      _ = model_context.saturation_spec
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="media_only",
+          data=data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+              n_media_channels=input_data_samples._N_MEDIA_CHANNELS
+          ),
+      ),
+      dict(
+          testcase_name="rf_only",
+          data=data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+              n_rf_channels=input_data_samples._N_RF_CHANNELS
+          ),
+      ),
+      dict(
+          testcase_name="rf_and_media",
+          data=data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+              n_media_channels=input_data_samples._N_MEDIA_CHANNELS,
+              n_rf_channels=input_data_samples._N_RF_CHANNELS,
+          ),
+      ),
+      dict(
+          testcase_name="media_non_media_and_organic",
+          data=data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+              n_media_channels=input_data_samples._N_MEDIA_CHANNELS,
+              n_organic_media_channels=input_data_samples._N_ORGANIC_MEDIA_CHANNELS,
+              n_organic_rf_channels=input_data_samples._N_ORGANIC_RF_CHANNELS,
+              n_non_media_channels=input_data_samples._N_NON_MEDIA_CHANNELS,
+          ),
+      ),
+      dict(
+          testcase_name="rf_non_media_and_organic",
+          data=data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+              n_rf_channels=input_data_samples._N_RF_CHANNELS,
+              n_organic_media_channels=input_data_samples._N_ORGANIC_MEDIA_CHANNELS,
+              n_organic_rf_channels=input_data_samples._N_ORGANIC_RF_CHANNELS,
+              n_non_media_channels=input_data_samples._N_NON_MEDIA_CHANNELS,
+          ),
+      ),
+      dict(
+          testcase_name="media_rf_non_media_and_organic",
+          data=data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+              n_media_channels=input_data_samples._N_MEDIA_CHANNELS,
+              n_rf_channels=input_data_samples._N_RF_CHANNELS,
+              n_organic_media_channels=input_data_samples._N_ORGANIC_MEDIA_CHANNELS,
+              n_organic_rf_channels=input_data_samples._N_ORGANIC_RF_CHANNELS,
+              n_non_media_channels=input_data_samples._N_NON_MEDIA_CHANNELS,
+          ),
+      ),
+  )
+  def test_input_data_tensor_properties(self, data):
+    model_context = context.ModelContext(
+        input_data=data, model_spec=spec.ModelSpec()
+    )
+    test_utils.assert_allequal(
+        backend.to_tensor(data.kpi, dtype=backend.float_dtype),
+        model_context.kpi,
+    )
+    test_utils.assert_allequal(
+        backend.to_tensor(data.revenue_per_kpi, dtype=backend.float_dtype),
+        model_context.revenue_per_kpi,
+    )
+    if data.controls is not None:
+      test_utils.assert_allequal(
+          backend.to_tensor(data.controls, dtype=backend.float_dtype),
+          model_context.controls,
+      )
+    if data.non_media_treatments is not None:
+      test_utils.assert_allequal(
+          backend.to_tensor(
+              data.non_media_treatments, dtype=backend.float_dtype
+          ),
+          model_context.non_media_treatments,
+      )
+    test_utils.assert_allequal(
+        backend.to_tensor(data.population, dtype=backend.float_dtype),
+        model_context.population,
+    )
+    if data.media is not None:
+      test_utils.assert_allequal(
+          backend.to_tensor(data.media, dtype=backend.float_dtype),
+          model_context.media_tensors.media,
+      )
+    if data.media_spend is not None:
+      test_utils.assert_allequal(
+          backend.to_tensor(data.media_spend, dtype=backend.float_dtype),
+          model_context.media_tensors.media_spend,
+      )
+    if data.reach is not None:
+      test_utils.assert_allequal(
+          backend.to_tensor(data.reach, dtype=backend.float_dtype),
+          model_context.rf_tensors.reach,
+      )
+    if data.frequency is not None:
+      test_utils.assert_allequal(
+          backend.to_tensor(data.frequency, dtype=backend.float_dtype),
+          model_context.rf_tensors.frequency,
+      )
+    if data.rf_spend is not None:
+      test_utils.assert_allequal(
+          backend.to_tensor(data.rf_spend, dtype=backend.float_dtype),
+          model_context.rf_tensors.rf_spend,
+      )
+    if data.organic_media is not None:
+      test_utils.assert_allequal(
+          backend.to_tensor(data.organic_media, dtype=backend.float_dtype),
+          model_context.organic_media_tensors.organic_media,
+      )
+    if data.organic_reach is not None:
+      test_utils.assert_allequal(
+          backend.to_tensor(data.organic_reach, dtype=backend.float_dtype),
+          model_context.organic_rf_tensors.organic_reach,
+      )
+    if data.organic_frequency is not None:
+      test_utils.assert_allequal(
+          backend.to_tensor(data.organic_frequency, dtype=backend.float_dtype),
+          model_context.organic_rf_tensors.organic_frequency,
+      )
+    if data.media_spend is not None and data.rf_spend is not None:
+      test_utils.assert_allclose(
+          backend.concatenate(
+              [  # pyrefly: ignore[bad-argument-type]
+                  backend.to_tensor(
+                      data.media_spend, dtype=backend.float_dtype
+                  ),
+                  backend.to_tensor(data.rf_spend, dtype=backend.float_dtype),
+              ],
+              axis=-1,
+          ),
+          model_context.total_spend,
+      )
+    elif data.media_spend is not None:
+      test_utils.assert_allclose(
+          backend.to_tensor(data.media_spend, dtype=backend.float_dtype),
+          model_context.total_spend,
+      )
+    elif data.rf_spend is not None:
+      test_utils.assert_allclose(
+          backend.to_tensor(data.rf_spend, dtype=backend.float_dtype),
+          model_context.total_spend,
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="geo_normal",
+          n_geos=input_data_samples._N_GEOS,
+          media_effects_dist=constants.MEDIA_EFFECTS_NORMAL,
+          expected_media_effects_dist=constants.MEDIA_EFFECTS_NORMAL,
+      ),
+      dict(
+          testcase_name="geo_log_normal",
+          n_geos=input_data_samples._N_GEOS,
+          media_effects_dist=constants.MEDIA_EFFECTS_LOG_NORMAL,
+          expected_media_effects_dist=constants.MEDIA_EFFECTS_LOG_NORMAL,
+      ),
+      dict(
+          testcase_name="national_normal",
+          n_geos=input_data_samples._N_GEOS_NATIONAL,
+          media_effects_dist=constants.MEDIA_EFFECTS_NORMAL,
+          expected_media_effects_dist=constants.MEDIA_EFFECTS_NORMAL,
+      ),
+      dict(
+          testcase_name="national_log_normal",
+          n_geos=input_data_samples._N_GEOS_NATIONAL,
+          media_effects_dist=constants.MEDIA_EFFECTS_LOG_NORMAL,
+          expected_media_effects_dist=constants.MEDIA_EFFECTS_NORMAL,
+      ),
+  )
+  def test_media_effects_dist_property(
+      self, n_geos, media_effects_dist, expected_media_effects_dist
+  ):
+    model_context = context.ModelContext(
+        input_data=data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+            n_geos=n_geos, n_media_channels=self._N_MEDIA_CHANNELS
+        ),
+        model_spec=spec.ModelSpec(media_effects_dist=media_effects_dist),
+    )
+    self.assertEqual(
+        model_context.media_effects_dist, expected_media_effects_dist
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="geo_unique_sigma_for_each_geo_true",
+          n_geos=input_data_samples._N_GEOS,
+          unique_sigma_for_each_geo=True,
+          expected_unique_sigma_for_each_geo=True,
+      ),
+      dict(
+          testcase_name="geo_unique_sigma_for_each_geo_false",
+          n_geos=input_data_samples._N_GEOS,
+          unique_sigma_for_each_geo=False,
+          expected_unique_sigma_for_each_geo=False,
+      ),
+      dict(
+          testcase_name="national_unique_sigma_for_each_geo_true",
+          n_geos=input_data_samples._N_GEOS_NATIONAL,
+          unique_sigma_for_each_geo=True,
+          expected_unique_sigma_for_each_geo=False,
+      ),
+      dict(
+          testcase_name="national_unique_sigma_for_each_geo_false",
+          n_geos=input_data_samples._N_GEOS_NATIONAL,
+          unique_sigma_for_each_geo=False,
+          expected_unique_sigma_for_each_geo=False,
+      ),
+  )
+  def test_unique_sigma_for_each_geo_property(
+      self,
+      n_geos,
+      unique_sigma_for_each_geo,
+      expected_unique_sigma_for_each_geo,
+  ):
+    model_context = context.ModelContext(
+        input_data=data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+            n_geos=n_geos, n_media_channels=self._N_MEDIA_CHANNELS
+        ),
+        model_spec=spec.ModelSpec(
+            unique_sigma_for_each_geo=unique_sigma_for_each_geo
+        ),
+    )
+    self.assertEqual(
+        model_context.unique_sigma_for_each_geo,
+        expected_unique_sigma_for_each_geo,
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="tau_g_excl_baseline",
+          dist_name="tau_g_excl_baseline",
+          expected_shape_func=lambda mc: (mc.n_geos - 1,),
+      ),
+      dict(
+          testcase_name="knot_values",
+          dist_name="knot_values",
+          expected_shape_func=lambda mc: (mc.knot_info.n_knots,),
+      ),
+      dict(
+          testcase_name="beta_m",
+          dist_name="beta_m",
+          expected_shape_func=lambda mc: (mc.n_media_channels,),
+      ),
+      dict(
+          testcase_name="eta_m",
+          dist_name="eta_m",
+          expected_shape_func=lambda mc: (mc.n_media_channels,),
+      ),
+      dict(
+          testcase_name="alpha_m",
+          dist_name="alpha_m",
+          expected_shape_func=lambda mc: (mc.n_media_channels,),
+      ),
+      dict(
+          testcase_name="ec_m",
+          dist_name="ec_m",
+          expected_shape_func=lambda mc: (mc.n_media_channels,),
+      ),
+      dict(
+          testcase_name="slope_m",
+          dist_name="slope_m",
+          expected_shape_func=lambda mc: (mc.n_media_channels,),
+      ),
+      dict(
+          testcase_name="roi_m",
+          dist_name="roi_m",
+          expected_shape_func=lambda mc: (mc.n_media_channels,),
+      ),
+      dict(
+          testcase_name="beta_rf",
+          dist_name="beta_rf",
+          expected_shape_func=lambda mc: (mc.n_rf_channels,),
+      ),
+      dict(
+          testcase_name="eta_rf",
+          dist_name="eta_rf",
+          expected_shape_func=lambda mc: (mc.n_rf_channels,),
+      ),
+      dict(
+          testcase_name="alpha_rf",
+          dist_name="alpha_rf",
+          expected_shape_func=lambda mc: (mc.n_rf_channels,),
+      ),
+      dict(
+          testcase_name="ec_rf",
+          dist_name="ec_rf",
+          expected_shape_func=lambda mc: (mc.n_rf_channels,),
+      ),
+      dict(
+          testcase_name="slope_rf",
+          dist_name="slope_rf",
+          expected_shape_func=lambda mc: (mc.n_rf_channels,),
+      ),
+      dict(
+          testcase_name="roi_rf",
+          dist_name="roi_rf",
+          expected_shape_func=lambda mc: (mc.n_rf_channels,),
+      ),
+      dict(
+          testcase_name="beta_om",
+          dist_name="beta_om",
+          expected_shape_func=lambda mc: (mc.n_organic_media_channels,),
+      ),
+      dict(
+          testcase_name="eta_om",
+          dist_name="eta_om",
+          expected_shape_func=lambda mc: (mc.n_organic_media_channels,),
+      ),
+      dict(
+          testcase_name="alpha_om",
+          dist_name="alpha_om",
+          expected_shape_func=lambda mc: (mc.n_organic_media_channels,),
+      ),
+      dict(
+          testcase_name="ec_om",
+          dist_name="ec_om",
+          expected_shape_func=lambda mc: (mc.n_organic_media_channels,),
+      ),
+      dict(
+          testcase_name="slope_om",
+          dist_name="slope_om",
+          expected_shape_func=lambda mc: (mc.n_organic_media_channels,),
+      ),
+      dict(
+          testcase_name="beta_orf",
+          dist_name="beta_orf",
+          expected_shape_func=lambda mc: (mc.n_organic_rf_channels,),
+      ),
+      dict(
+          testcase_name="eta_orf",
+          dist_name="eta_orf",
+          expected_shape_func=lambda mc: (mc.n_organic_rf_channels,),
+      ),
+      dict(
+          testcase_name="alpha_orf",
+          dist_name="alpha_orf",
+          expected_shape_func=lambda mc: (mc.n_organic_rf_channels,),
+      ),
+      dict(
+          testcase_name="ec_orf",
+          dist_name="ec_orf",
+          expected_shape_func=lambda mc: (mc.n_organic_rf_channels,),
+      ),
+      dict(
+          testcase_name="slope_orf",
+          dist_name="slope_orf",
+          expected_shape_func=lambda mc: (mc.n_organic_rf_channels,),
+      ),
+      dict(
+          testcase_name="gamma_c",
+          dist_name="gamma_c",
+          expected_shape_func=lambda mc: (mc.n_controls,),
+      ),
+      dict(
+          testcase_name="xi_c",
+          dist_name="xi_c",
+          expected_shape_func=lambda mc: (mc.n_controls,),
+      ),
+      dict(
+          testcase_name="gamma_n",
+          dist_name="gamma_n",
+          expected_shape_func=lambda mc: (mc.n_non_media_channels,),
+      ),
+      dict(
+          testcase_name="xi_n",
+          dist_name="xi_n",
+          expected_shape_func=lambda mc: (mc.n_non_media_channels,),
+      ),
+      dict(
+          testcase_name="sigma",
+          dist_name="sigma",
+          expected_shape_func=lambda mc: (),
+      ),
+  )
+  def test_broadcast_prior_distribution_shapes(
+      self, dist_name, expected_shape_func
+  ):
+    data = self.input_data_non_media_and_organic
+    model_context = context.ModelContext(
+        input_data=data, model_spec=spec.ModelSpec()
+    )
+    dist = getattr(model_context.prior_broadcast, dist_name)
+    self.assertEqual(dist.batch_shape, expected_shape_func(model_context))
+
+  def test_scaled_data_shape(self):
+    data = self.input_data_non_media_and_organic
+    controls = data.controls
+    model_context = context.ModelContext(
+        input_data=data, model_spec=spec.ModelSpec()
+    )
+    self.assertIsNotNone(model_context.controls_scaled)
+    self.assertIsNotNone(controls)
+    test_utils.assert_allequal(
+        model_context.controls_scaled.shape,
+        controls.shape,
+        err_msg=(
+            "Shape of `_controls_scaled` does not match the shape of `controls`"
+            " from the input data."
+        ),
+    )
+    self.assertIsNotNone(model_context.non_media_treatments_normalized)
+    self.assertIsNotNone(data.non_media_treatments)
+    test_utils.assert_allequal(
+        model_context.non_media_treatments_normalized.shape,
+        data.non_media_treatments.shape,
+        err_msg=(
+            "Shape of `_non_media_treatments_scaled` does not match the shape"
+            " of `non_media_treatments` from the input data."
+        ),
+    )
+    test_utils.assert_allequal(
+        model_context.kpi_scaled.shape,
+        data.kpi.shape,
+        err_msg=(
+            "Shape of `_kpi_scaled` does not match the shape of"
+            " `kpi` from the input data."
+        ),
+    )
+
+  def test_scaled_data_no_controls(self):
+    data = self.input_data_with_media_and_rf_no_controls
+    model_context = context.ModelContext(
+        input_data=data, model_spec=spec.ModelSpec()
+    )
+
+    self.assertEqual(model_context.n_controls, 0)
+    self.assertIsNone(model_context.controls)
+    self.assertIsNone(model_context.controls_transformer)
+    self.assertIsNone(model_context.controls_scaled)
+    test_utils.assert_allequal(
+        model_context.kpi_scaled.shape,
+        data.kpi.shape,
+        err_msg=(
+            "Shape of `_kpi_scaled` does not match the shape of"
+            " `kpi` from the input data."
+        ),
+    )
+
+  def test_population_scaled_controls_transformer_set(self):
+    data = self.input_data_with_media_and_rf
+    model_spec = spec.ModelSpec(
+        control_population_scaling_id=backend.to_tensor(  # pyrefly: ignore[bad-argument-type]
+            [True for _ in data.control_variable]  # pyrefly: ignore[not-iterable]
+        )
+    )
+    model_context = context.ModelContext(input_data=data, model_spec=model_spec)
+    self.assertIsNotNone(model_context.controls_transformer)
+    self.assertIsNotNone(
+        model_context.controls_transformer._population_scaling_factors,
+        msg=(
+            "`_population_scaling_factors` not set for the controls"
+            " transformer."
+        ),
+    )
+    test_utils.assert_allequal(
+        model_context.controls_transformer._population_scaling_factors.shape,
+        [len(data.geo), len(data.control_variable)],  # pyrefly: ignore[bad-argument-type]
+        err_msg=(
+            "Shape of `controls_transformer._population_scaling_factors` does"
+            " not match (`n_geos`, `n_controls`)."
+        ),
+    )
+
+  def test_population_scaled_non_media_transformer_set(self):
+    data = self.input_data_non_media_and_organic
+    model_spec = spec.ModelSpec(
+        non_media_population_scaling_id=backend.to_tensor(  # pyrefly: ignore[bad-argument-type]
+            [True for _ in data.non_media_channel]  # pyrefly: ignore[not-iterable]
+        )
+    )
+    model_context = context.ModelContext(input_data=data, model_spec=model_spec)
+    self.assertIsNotNone(model_context.non_media_transformer)
+    self.assertIsNotNone(
+        model_context.non_media_transformer._population_scaling_factors,
+        msg=(
+            "`_population_scaling_factors` not set for the non-media"
+            " transformer."
+        ),
+    )
+    test_utils.assert_allequal(
+        model_context.non_media_transformer._population_scaling_factors.shape,
+        [
+            len(data.geo),
+            len(data.non_media_channel),  # pyrefly: ignore[bad-argument-type]
+        ],
+        err_msg=(
+            "Shape of"
+            " `non_media_transformer._population_scaling_factors` does"
+            " not match (`n_geos`, `n_non_media_channels`)."
+        ),
+    )
+
+  def test_scaled_data_inverse_is_identity(self):
+    data = self.input_data_non_media_and_organic
+    model_context = context.ModelContext(
+        input_data=data, model_spec=spec.ModelSpec()
+    )
+
+    # With the default tolerance of eps * 10 the test fails due to rounding
+    # errors.
+    atol = np.finfo(backend.np_float_dtype).eps * 100
+    test_utils.assert_allclose(
+        model_context.controls_transformer.inverse(model_context.controls_scaled),  # pyrefly: ignore[missing-attribute]
+        data.controls,
+        atol=atol,  # pyrefly: ignore[bad-argument-type]
+    )
+    self.assertIsNotNone(model_context.non_media_transformer)
+    test_utils.assert_allclose(
+        model_context.non_media_transformer.inverse(
+            model_context.non_media_treatments_normalized
+        ),
+        data.non_media_treatments,
+        atol=atol,  # pyrefly: ignore[bad-argument-type]
+    )
+    test_utils.assert_allclose(
+        model_context.kpi_transformer.inverse(model_context.kpi_scaled),
+        data.kpi,
+        atol=atol,  # pyrefly: ignore[bad-argument-type]
+    )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="int", baseline_geo=4, expected_idx=4),
+      dict(testcase_name="str", baseline_geo="geo_1", expected_idx=1),
+      dict(testcase_name="none", baseline_geo=None, expected_idx=2),
+  )
+  def test_baseline_geo_idx(
+      self, baseline_geo: int | str | None, expected_idx: int
+  ):
+    data = self.input_data_with_media_only
+    data.population.data = [
+        2.0,
+        5.0,
+        20.0,
+        7.0,
+        10.0,
+    ]
+    model_context = context.ModelContext(
+        input_data=data,
+        model_spec=spec.ModelSpec(baseline_geo=baseline_geo),
+    )
+    self.assertEqual(model_context.baseline_geo_idx, expected_idx)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="int",
+          baseline_geo=7,
+          msg="Baseline geo index 7 out of range [0, 4].",
+      ),
+      dict(
+          testcase_name="str",
+          baseline_geo="incorrect",
+          msg="Baseline geo 'incorrect' not found.",
+      ),
+  )
+  def test_wrong_baseline_geo_id_fails(
+      self, baseline_geo: int | str | None, msg: str
+  ):
+    with self.assertRaisesWithLiteralMatch(ValueError, msg):
+      _ = context.ModelContext(
+          input_data=self.input_data_with_media_only,
+          model_spec=spec.ModelSpec(baseline_geo=baseline_geo),
+      ).baseline_geo_idx
+
+  def test_validate_media_prior_type_mroi(self):
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "Custom priors should be set on `mroi_m` when `media_prior_type` is"
+        ' "mroi", KPI is non-revenue and revenue per kpi data is missing.',
+    ):
+      context.ModelContext(
+          input_data=self.input_data_non_revenue_no_revenue_per_kpi,
+          model_spec=spec.ModelSpec(
+              media_prior_type=constants.TREATMENT_PRIOR_TYPE_MROI
+          ),
+      )
+
+  def test_validate_rf_prior_type_mroi(self):
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "Custom priors should be set on `mroi_rf` when `rf_prior_type` is"
+        ' "mroi", KPI is non-revenue and revenue per kpi data is missing.',
+    ):
+      context.ModelContext(
+          input_data=self.input_data_media_and_rf_non_revenue_no_revenue_per_kpi,
+          model_spec=spec.ModelSpec(
+              rf_prior_type=constants.TREATMENT_PRIOR_TYPE_MROI
+          ),
+      )
+
+  def test_validate_media_prior_type_roi(self):
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "Custom priors should be set on `roi_m` when `media_prior_type` is"
+        ' "roi", custom priors are assigned on `roi_rf` or'
+        ' `rf_prior_type` is not "roi", KPI is non-revenue and revenue per kpi'
+        " data is missing.",
+    ):
+      context.ModelContext(
+          input_data=self.input_data_media_and_rf_non_revenue_no_revenue_per_kpi,
+          model_spec=spec.ModelSpec(
+              media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+              rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          ),
+      )
+
+  def test_validate_rf_prior_type_roi(self):
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        'Custom priors should be set on `roi_rf` when `rf_prior_type` is "roi",'
+        " custom priors are assigned on `roi_m` or"
+        ' `media_prior_type` is not "roi", KPI is non-revenue and revenue per'
+        " kpi data is missing.",
+    ):
+      context.ModelContext(
+          input_data=self.input_data_media_and_rf_non_revenue_no_revenue_per_kpi,
+          model_spec=spec.ModelSpec(
+              rf_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+              media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          ),
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="roi_m",
+          dist_args=([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], 0.9),
+          dist_name=constants.ROI_M,
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+      ),
+      dict(
+          testcase_name="roi_rf",
+          dist_args=(0.0, 0.9),
+          dist_name=constants.ROI_RF,
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+      ),
+      dict(
+          testcase_name="mroi_m",
+          dist_args=(0.5, 0.9),
+          dist_name=constants.MROI_M,
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_MROI,
+      ),
+      dict(
+          testcase_name="mroi_rf",
+          dist_args=([0.0, 0.0, 0.0, 0.0], 0.9),
+          dist_name=constants.MROI_RF,
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_MROI,
+      ),
+      dict(
+          testcase_name="contribution_m",
+          dist_args=(0.0, 0.9),
+          dist_name=constants.CONTRIBUTION_M,
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+      ),
+      dict(
+          testcase_name="contribution_rf",
+          dist_args=(0.0, 0.9),
+          dist_name=constants.CONTRIBUTION_RF,
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+      ),
+  )
+  def test_check_for_negative_support_paid_media_raises_error(
+      self,
+      dist_args: tuple[list[float] | float, float],
+      dist_name: str,
+      media_prior_type: str,
+  ):
+    processed_args = [_cast_dist_arg(arg) for arg in dist_args]
+    dist = backend.tfd.Normal(*processed_args, name=dist_name)
+    prior_dist = prior_distribution.PriorDistribution(**{dist_name: dist})
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "Media priors must have non-negative support when"
+        ' `media_effects_dist`="log_normal". Found negative prior distribution'
+        f" support for {dist_name}.",
+    ):
+      context.ModelContext(
+          input_data=self.input_data_with_media_and_rf,
+          model_spec=spec.ModelSpec(
+              media_effects_dist=constants.MEDIA_EFFECTS_LOG_NORMAL,
+              media_prior_type=media_prior_type,
+              prior=prior_dist,
+          ),
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="contribution_om",
+          dist_args=(0.0, 0.9),
+          dist_name=constants.CONTRIBUTION_OM,
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+      ),
+      dict(
+          testcase_name="contribution_orf",
+          dist_args=(0.0, 0.9),
+          dist_name=constants.CONTRIBUTION_ORF,
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+      ),
+  )
+  def test_check_for_negative_support_organic_media_raises_error(
+      self,
+      dist_args: tuple[list[float] | float, float],
+      dist_name: str,
+      media_prior_type: str,
+  ):
+    processed_args = [_cast_dist_arg(arg) for arg in dist_args]
+    dist = backend.tfd.Normal(*processed_args, name=dist_name)
+    prior_dist = prior_distribution.PriorDistribution(**{dist_name: dist})
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "Media priors must have non-negative support when"
+        ' `media_effects_dist`="log_normal". Found negative prior distribution'
+        f" support for {dist_name}.",
+    ):
+      context.ModelContext(
+          input_data=self.input_data_non_media_and_organic,
+          model_spec=spec.ModelSpec(
+              media_effects_dist=constants.MEDIA_EFFECTS_LOG_NORMAL,
+              media_prior_type=media_prior_type,
+              prior=prior_dist,
+          ),
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="custom_beta_m_prior_type_roi",
+          custom_dist_kwargs={
+              constants.BETA_M: {
+                  "loc": 0.2,
+                  "scale": 0.8,
+                  "name": constants.BETA_M,
+              }
+          },
+          ignored_priors="beta_m",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+          wrong_prior_type_var_name="media_prior_type",
+          wrong_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+      ),
+      dict(
+          testcase_name="custom_mroi_rf_prior_type_roi",
+          custom_dist_kwargs={
+              constants.MROI_M: {
+                  "loc": 0.2,
+                  "scale": 0.8,
+                  "name": constants.MROI_M,
+              },
+              constants.MROI_RF: {
+                  "loc": 0.2,
+                  "scale": 0.8,
+                  "name": constants.MROI_RF,
+              },
+          },
+          ignored_priors="mroi_rf",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_MROI,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+          wrong_prior_type_var_name="rf_prior_type",
+          wrong_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+      ),
+      dict(
+          testcase_name="custom_beta_m_roi_m_prior_type_mroi",
+          custom_dist_kwargs={
+              constants.BETA_M: {
+                  "loc": 0.7,
+                  "scale": 0.9,
+                  "name": constants.BETA_M,
+              },
+              constants.BETA_RF: {
+                  "loc": 0.8,
+                  "scale": 0.9,
+                  "name": constants.BETA_RF,
+              },
+              constants.ROI_M: {
+                  "loc": 0.2,
+                  "scale": 0.1,
+                  "name": constants.ROI_M,
+              },
+          },
+          ignored_priors="beta_m, roi_m",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_MROI,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          wrong_prior_type_var_name="media_prior_type",
+          wrong_prior_type=constants.TREATMENT_PRIOR_TYPE_MROI,
+      ),
+      dict(
+          testcase_name="custom_roi_rf_prior_type_coefficient",
+          custom_dist_kwargs={
+              constants.ROI_RF: {
+                  "loc": 0.2,
+                  "scale": 0.1,
+                  "name": constants.ROI_RF,
+              }
+          },
+          ignored_priors="roi_rf",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          wrong_prior_type_var_name="rf_prior_type",
+          wrong_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+      ),
+  )
+  def test_warn_setting_ignored_priors(
+      self,
+      custom_dist_kwargs: Mapping[str, Mapping[str, Any]],
+      ignored_priors: str,
+      media_prior_type: str,
+      rf_prior_type: str,
+      wrong_prior_type_var_name: str,
+      wrong_prior_type: str,
+  ):
+    custom_distributions = {
+        name: backend.tfd.LogNormal(
+            **{k: _cast_dist_arg(v) for k, v in kwargs.items()}
+        )
+        for name, kwargs in custom_dist_kwargs.items()
+    }
+    # Create prior distribution with given parameters.
+    distribution = prior_distribution.PriorDistribution(**custom_distributions)
+    model_spec = spec.ModelSpec(
+        prior=distribution,
+        media_prior_type=media_prior_type,
+        rf_prior_type=rf_prior_type,
+    )
+    # Copying the test data outside the block keeps `InputData` warnings about
+    # the data itself out of the warnings counted below.
+    # TODO: Copy it inside the block again once the shared test
+    # data has frequency of at least 1.
+    data = self.input_data_with_media_and_rf
+    with warnings.catch_warnings(record=True) as w:
+      warnings.simplefilter("module")
+      context.ModelContext(
+          input_data=data,
+          model_spec=model_spec,
+      )
+      self.assertLen(w, 1)
+      self.assertEqual(
+          (
+              f"Custom prior(s) `{ignored_priors}` are ignored when"
+              f" `{wrong_prior_type_var_name}` is set to"
+              f' "{wrong_prior_type}".'
+          ),
+          str(w[0].message),
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="wrong_controls",
+          dataset=data_test_utils.DATASET_WITHOUT_GEO_VARIATION_IN_CONTROLS,
+          data_name=constants.CONTROLS,
+          dims_bad=np.array(["control_0", "control_1"]),
+      ),
+      dict(
+          testcase_name="wrong_media",
+          dataset=data_test_utils.DATASET_WITHOUT_GEO_VARIATION_IN_MEDIA,
+          data_name=constants.MEDIA,
+          dims_bad=np.array(["media_channel_1", "media_channel_2"]),
+      ),
+      dict(
+          testcase_name="wrong_rf",
+          dataset=data_test_utils.DATASET_WITHOUT_GEO_VARIATION_IN_REACH,
+          data_name=constants.REACH,
+          dims_bad=np.array(["rf_channel_0", "rf_channel_1"]),
+      ),
+  )
+  def test_init_without_geo_variation_fails(
+      self, dataset: xr.Dataset, data_name: str, dims_bad: Sequence[str]
+  ):
+    with self.assertRaisesRegex(
+        ValueError,
+        f"The following {data_name} variables do not vary across geos.*"
+        f"{'.*'.join(dims_bad)}",
+    ):
+      context.ModelContext(
+          input_data=data_test_utils.sample_input_data_from_dataset(
+              dataset, kpi_type=constants.NON_REVENUE
+          ),
+          model_spec=spec.ModelSpec(),
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="wrong_controls",
+          dataset=data_test_utils.DATASET_WITHOUT_TIME_VARIATION_IN_CONTROLS,
+          data_name=constants.CONTROLS,
+          dims_bad=np.array(["control_0", "control_1"]),
+      ),
+      dict(
+          testcase_name="wrong_non_media_treatments",
+          dataset=data_test_utils.DATASET_WITHOUT_TIME_VARIATION_IN_NON_MEDIA_TREATMENTS,
+          data_name=constants.NON_MEDIA_TREATMENTS,
+          dims_bad=np.array(["non_media_channel_0", "non_media_channel_1"]),
+      ),
+      dict(
+          testcase_name="wrong_media",
+          dataset=data_test_utils.DATASET_WITHOUT_TIME_VARIATION_IN_MEDIA,
+          data_name=constants.MEDIA,
+          dims_bad=np.array(["media_channel_1", "media_channel_2"]),
+      ),
+      dict(
+          testcase_name="wrong_rf",
+          dataset=data_test_utils.DATASET_WITHOUT_TIME_VARIATION_IN_REACH,
+          data_name=constants.REACH,
+          dims_bad=np.array(["rf_channel_0", "rf_channel_1"]),
+      ),
+      dict(
+          testcase_name="wrong_organic_media",
+          dataset=data_test_utils.DATASET_WITHOUT_TIME_VARIATION_IN_ORGANIC_MEDIA,
+          data_name=constants.ORGANIC_MEDIA,
+          dims_bad=np.array(["organic_media_channel_0"]),
+      ),
+      dict(
+          testcase_name="wrong_organic_rf",
+          dataset=data_test_utils.DATASET_WITHOUT_TIME_VARIATION_IN_ORGANIC_REACH,
+          data_name=constants.ORGANIC_REACH,
+          dims_bad=np.array(["organic_rf_channel_1"]),
+      ),
+  )
+  def test_init_without_time_variation_fails(
+      self, dataset: xr.Dataset, data_name: str, dims_bad: Sequence[str]
+  ):
+    with self.assertRaisesRegex(
+        ValueError,
+        f"The following {data_name} variables do not vary across time.*"
+        f"{'.*'.join(dims_bad)}",
+    ):
+      context.ModelContext(
+          input_data=data_test_utils.sample_input_data_from_dataset(
+              dataset, kpi_type=constants.NON_REVENUE
+          ),
+          model_spec=spec.ModelSpec(),
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="wrong_controls",
+          dataset=data_test_utils.DATASET_WITHOUT_TIME_VARIATION_IN_CONTROLS,
+          data_name=constants.CONTROLS,
+          dims_bad=np.array(["control_0", "control_1"]),
+      ),
+      dict(
+          testcase_name="wrong_non_media_treatments",
+          dataset=data_test_utils.DATASET_WITHOUT_TIME_VARIATION_IN_NON_MEDIA_TREATMENTS,
+          data_name=constants.NON_MEDIA_TREATMENTS,
+          dims_bad=np.array(["non_media_channel_0", "non_media_channel_1"]),
+      ),
+      dict(
+          testcase_name="wrong_media",
+          dataset=data_test_utils.DATASET_WITHOUT_TIME_VARIATION_IN_MEDIA,
+          data_name=constants.MEDIA,
+          dims_bad=np.array(["media_channel_1", "media_channel_2"]),
+      ),
+      dict(
+          testcase_name="wrong_rf",
+          dataset=data_test_utils.DATASET_WITHOUT_TIME_VARIATION_IN_REACH,
+          data_name=constants.REACH,
+          dims_bad=np.array(["rf_channel_0", "rf_channel_1"]),
+      ),
+      dict(
+          testcase_name="wrong_organic_media",
+          dataset=data_test_utils.DATASET_WITHOUT_TIME_VARIATION_IN_ORGANIC_MEDIA,
+          data_name=constants.ORGANIC_MEDIA,
+          dims_bad=np.array(["organic_media_channel_0"]),
+      ),
+      dict(
+          testcase_name="wrong_organic_rf",
+          dataset=data_test_utils.DATASET_WITHOUT_TIME_VARIATION_IN_ORGANIC_REACH,
+          data_name=constants.ORGANIC_REACH,
+          dims_bad=np.array(["organic_rf_channel_1"]),
+      ),
+  )
+  def test_init_without_time_variation_national_model_fails(
+      self, dataset: xr.Dataset, data_name: str, dims_bad: Sequence[str]
+  ):
+    national_dataset = dataset.sel(geo=["geo_0"])
+    with self.assertRaisesRegex(
+        ValueError,
+        f"The following {data_name} variables do not vary across time.*"
+        f"{'.*'.join(dims_bad)}",
+    ):
+      context.ModelContext(
+          input_data=data_test_utils.sample_input_data_from_dataset(
+              national_dataset, kpi_type=constants.NON_REVENUE
+          ),
+          model_spec=spec.ModelSpec(),
+      )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="default_knots", knots=None),
+      dict(testcase_name="one_knot", knots=1),
+  )
+  def test_init_with_constant_controls_fails(self, knots: int | None):
+    dataset = data_test_utils.DATASET_WITHOUT_GEO_VARIATION_IN_CONTROLS.copy()
+    dataset[constants.CONTROLS] = xr.full_like(
+        dataset[constants.CONTROLS], 7.0
+    )
+    # The time check runs first, so a constant control isn't reported as
+    # varying across time, whatever the knots.
+    with self.assertRaisesRegex(
+        ValueError,
+        "The following controls variables do not vary across time.*"
+        "control_0.*control_1.*either constant or only varies across geos",
+    ):
+      context.ModelContext(
+          input_data=data_test_utils.sample_input_data_from_dataset(
+              dataset, kpi_type=constants.NON_REVENUE
+          ),
+          model_spec=spec.ModelSpec(knots=knots),
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="media",
+          array_name=constants.MEDIA,
+          channel_dim=constants.MEDIA_CHANNEL,
+          message="media channels have media of 0",
+      ),
+      dict(
+          testcase_name="reach",
+          array_name=constants.REACH,
+          channel_dim=constants.RF_CHANNEL,
+          message="reach and frequency channels have reach of 0",
+      ),
+      dict(
+          testcase_name="organic_media",
+          array_name=constants.ORGANIC_MEDIA,
+          channel_dim=constants.ORGANIC_MEDIA_CHANNEL,
+          message="organic media channels have organic media of 0",
+      ),
+      dict(
+          testcase_name="organic_reach",
+          array_name=constants.ORGANIC_REACH,
+          channel_dim=constants.ORGANIC_RF_CHANNEL,
+          message=(
+              "organic reach and frequency channels have organic reach of 0"
+          ),
+      ),
+  )
+  def test_init_with_all_zero_channel_fails(
+      self, array_name: str, channel_dim: str, message: str
+  ):
+    dataset = data_test_utils.random_dataset(
+        n_geos=5,
+        n_times=20,
+        n_media_times=23,
+        n_controls=1,
+        n_media_channels=2,
+        n_rf_channels=2,
+        n_organic_media_channels=2,
+        n_organic_rf_channels=2,
+    )
+    channel = dataset.coords[channel_dim].values[1]
+    array = dataset[array_name].astype(float)
+    array.loc[{channel_dim: channel}] = 0.0
+    dataset[array_name] = array
+    with self.assertRaisesRegex(
+        ValueError,
+        f"The following {message} in every geo and time period, so there is"
+        f" no execution to model: \\['{channel}'\\]",
+    ):
+      context.ModelContext(
+          input_data=data_test_utils.sample_input_data_from_dataset(
+              dataset, kpi_type=constants.NON_REVENUE
+          ),
+          model_spec=spec.ModelSpec(),
+      )
+
+  def test_custom_priors_not_passed_in_ok(self):
+    data = self.input_data_non_revenue_no_revenue_per_kpi
+    model_context = context.ModelContext(
+        input_data=data,
+        model_spec=spec.ModelSpec(
+            media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT
+        ),
+    )
+    # Compare input data.
+    self.assertEqual(model_context.input_data, data)
+
+    # Create sample model spec for comparison
+    sample_spec = spec.ModelSpec(
+        media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT
+    )
+
+    # Compare model spec.
+    self.assertEqual(repr(model_context.model_spec), repr(sample_spec))
+
+  def test_custom_priors_okay_with_array_params(self):
+    prior = prior_distribution.PriorDistribution(
+        roi_m=backend.tfd.LogNormal(
+            np.array([1, 1], dtype=backend.np_float_dtype),
+            np.array([1, 1], dtype=backend.np_float_dtype),
+        )
+    )
+    data = self.input_data_non_revenue_no_revenue_per_kpi
+    model_context = context.ModelContext(
+        input_data=data,
+        model_spec=spec.ModelSpec(prior=prior),
+    )
+    # Compare input data.
+    self.assertEqual(model_context.input_data, data)
+
+    # Create sample model spec for comparison
+    sample_spec = spec.ModelSpec(prior=prior)
+
+    # Compare model spec.
+    self.assertEqual(repr(model_context.model_spec), repr(sample_spec))
+
+  def test_get_knot_info_fails(self):
+    error_msg = "Knots must be all non-negative."
+    with mock.patch.object(
+        knots_module,
+        "get_knot_info",
+        autospec=True,
+        side_effect=ValueError(error_msg),
+    ):
+      with self.assertRaisesWithLiteralMatch(ValueError, error_msg):
+        _ = context.ModelContext(
+            input_data=self.input_data_with_media_only,
+            model_spec=spec.ModelSpec(knots=4),
+        ).knot_info
+
+  def test_init_with_default_parameters_works(self):
+    data = self.input_data_with_media_only
+    model_context = context.ModelContext(
+        input_data=data, model_spec=spec.ModelSpec()
+    )
+
+    # Compare input data.
+    self.assertEqual(model_context.input_data, data)
+
+    # Create sample model spec for comparison
+    sample_spec = spec.ModelSpec()
+
+    # Compare model spec.
+    self.assertEqual(repr(model_context.model_spec), repr(sample_spec))
+
+  def test_init_with_default_national_parameters_works(self):
+    data = self.national_input_data_media_only
+    model_context = context.ModelContext(
+        input_data=data, model_spec=spec.ModelSpec()
+    )
+
+    # Compare input data.
+    self.assertEqual(model_context.input_data, data)
+
+    # Create sample model spec for comparison
+    expected_spec = spec.ModelSpec()
+
+    # Compare model spec.
+    self.assertEqual(repr(model_context.model_spec), repr(expected_spec))
+
+  def test_init_geo_args_no_warning(self):
+    with warnings.catch_warnings(record=True) as w:
+      warnings.simplefilter("module")
+      context.ModelContext(
+          input_data=self.input_data_with_media_only,
+          model_spec=spec.ModelSpec(
+              media_effects_dist="normal", unique_sigma_for_each_geo=True
+          ),
+      )
+      self.assertEmpty(w)
+
+  def test_init_national_args_with_broadcast_warnings(self):
+    with warnings.catch_warnings(record=True) as warns:
+      warnings.simplefilter("module")
+      _ = context.ModelContext(
+          input_data=self.national_input_data_media_only,
+          model_spec=spec.ModelSpec(
+              media_effects_dist=constants.MEDIA_EFFECTS_NORMAL
+          ),
+      ).prior_broadcast
+      # 7 warnings from the broadcasting (tau_g_excl_baseline, eta_m, eta_rf,
+      # xi_c, eta_om, eta_orf, xi_n)
+      self.assertLen(warns, 7)
+      for w in warns:
+        self.assertTrue(issubclass(w.category, UserWarning))
+        self.assertIn(
+            "Hierarchical distribution parameters must be deterministically"
+            " zero for national models.",
+            str(w.message),
+        )
+
+  def test_init_national_args_with_model_spec_warnings(self):
+    with warnings.catch_warnings(record=True) as w:
+      warnings.simplefilter("module")
+      _ = context.ModelContext(
+          input_data=self.national_input_data_media_only,
+          model_spec=spec.ModelSpec(unique_sigma_for_each_geo=True),
+      ).prior_broadcast
+      # 7 warnings from the broadcasting (tau_g_excl_baseline, eta_m, eta_rf,
+      # xi_c, eta_om, eta_orf, xi_n).
+      self.assertLen(w, 7)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="1d",
+          get_total_spend=np.array([1.0, 2.0, 3.0, 4.0]),
+          expected_total_spend=np.array([1.0, 2.0, 3.0, 4.0]),
+      ),
+      dict(
+          testcase_name="2d",
+          get_total_spend=np.array([[1.0, 2.0], [4.0, 5.0]]),
+          expected_total_spend=np.array([5.0, 7.0]),
+      ),
+      dict(
+          testcase_name="3d",
+          get_total_spend=np.array([
+              [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+              [[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]],
+          ]),
+          expected_total_spend=np.array([55.0, 77.0, 99.0]),
+      ),
+  )
+  def test_broadcast_is_called_non_revenue_no_revenue_per_kpi_total_spend(
+      self, get_total_spend: np.ndarray, expected_total_spend: np.ndarray
+  ):
+    mock_get_total_spend = self.enter_context(
+        mock.patch.object(
+            input_data.InputData,
+            "get_total_spend",
+            autospec=True,
+        )
+    )
+    mock_get_total_spend.return_value = get_total_spend
+    mock_broadcast = self.enter_context(
+        mock.patch.object(
+            prior_distribution.PriorDistribution,
+            "broadcast",
+            autospec=True,
+        )
+    )
+    model_context = context.ModelContext(
+        input_data=self.input_data_non_revenue_no_revenue_per_kpi,
+        model_spec=spec.ModelSpec(),
+    )
+    _ = model_context.prior_broadcast
+
+    _, mock_kwargs = mock_broadcast.call_args
+    self.assertEqual(mock_kwargs["set_total_media_contribution_prior"], True)
+    self.assertEqual(mock_kwargs["kpi"], np.sum(model_context.input_data.kpi))
+    np.testing.assert_allclose(mock_kwargs["total_spend"], expected_total_spend)
+
+  def test_default_roi_prior_distribution_raises_warning(
+      self,
+  ):
+    data = self.input_data_non_revenue_no_revenue_per_kpi
+    with warnings.catch_warnings(record=True) as warns:
+      # Cause all warnings to always be triggered.
+      warnings.simplefilter("always")
+
+      model_context = context.ModelContext(
+          input_data=data, model_spec=spec.ModelSpec()
+      )
+
+      _ = model_context.prior_broadcast
+      self.assertLen(warns, 1, f"warns: {[w.message for w in warns]}")
+      for w in warns:
+        self.assertTrue(issubclass(w.category, UserWarning))
+        self.assertIn(
+            "Consider setting custom ROI priors, as kpi_type was specified as"
+            " `non_revenue` with no `revenue_per_kpi` being set. Otherwise, the"
+            " total media contribution prior will be used with `p_mean=0.4` and"
+            " `p_sd=0.2`. Further documentation available at "
+            " https://developers.google.com/meridian/docs/advanced-modeling/unknown-revenue-kpi-custom#set-total-paid-media-contribution-prior",
+            str(w.message),
+        )
+
+  def test_aks_returns_correct_knot_info(self):
+    data, expected_knot_info = (
+        data_test_utils.sample_input_data_for_aks_with_expected_knot_info()
+    )
+    model_spec = spec.ModelSpec(enable_aks=True)
+    actual_knot_info = context.ModelContext(
+        input_data=data, model_spec=model_spec
+    ).knot_info
+    self.assertEqual(actual_knot_info.n_knots, expected_knot_info.n_knots)
+    np.testing.assert_equal(
+        actual_knot_info.knot_locations, expected_knot_info.knot_locations
+    )
+    np.testing.assert_equal(
+        actual_knot_info.weights, expected_knot_info.weights
+    )
+
+
+class AdstockDecaySpecFromChannelMappingTest(
+    test_utils.MeridianTestCase,
+):
+
+  @parameterized.product(**data_test_utils.ADSTOCK_DECAY_SPEC_CASES)
+  def test_from_channel(
+      self,
+      media,
+      rf,
+      organic_media,
+      organic_rf,
+  ):
+    """Test if adstock decay functions are explicitly passed for all channels."""
+
+    if not (media or rf):
+      self.skipTest("Invalid test case: Meridian requires paid media.")
+
+    inp_data = data_test_utils.sample_input_data_revenue(
+        n_media_channels=len(media),
+        n_rf_channels=len(rf),
+        n_organic_media_channels=len(organic_media),
+        n_organic_rf_channels=len(organic_rf),
+    )
+
+    decay_spec = media | rf | organic_media | organic_rf
+    model_spec = spec.ModelSpec(adstock_decay_spec=decay_spec)
+    model_context = context.ModelContext(
+        input_data=inp_data, model_spec=model_spec
+    )
+
+    expected_media = list(media.values()) or constants.GEOMETRIC_DECAY
+    expected_rf = list(rf.values()) or constants.GEOMETRIC_DECAY
+    expected_organic_media = (
+        list(organic_media.values()) or constants.GEOMETRIC_DECAY
+    )
+    expected_organic_rf = list(organic_rf.values()) or constants.GEOMETRIC_DECAY
+
+    self.assertSequenceEqual(
+        model_context.adstock_decay_spec.media, expected_media
+    )
+    self.assertSequenceEqual(model_context.adstock_decay_spec.rf, expected_rf)
+    self.assertSequenceEqual(
+        model_context.adstock_decay_spec.organic_media, expected_organic_media
+    )
+    self.assertSequenceEqual(
+        model_context.adstock_decay_spec.organic_rf, expected_organic_rf
+    )
+
+  @parameterized.product(
+      **data_test_utils.ADSTOCK_DECAY_SPEC_CASES,
+      has_undefined_media_channel=(True, False),
+      has_undefined_rf_channel=(True, False),
+      has_undefined_organic_media_channel=(True, False),
+      has_undefined_organic_rf_channel=(True, False),
+  )
+  def test_from_channels_some_undefined(
+      self,
+      media,
+      rf,
+      organic_media,
+      organic_rf,
+      has_undefined_media_channel,
+      has_undefined_rf_channel,
+      has_undefined_organic_media_channel,
+      has_undefined_organic_rf_channel,
+  ):
+    """Test if adstock decay functions are not explicitly passed for all channels."""
+    if not (
+        media or rf or has_undefined_media_channel or has_undefined_rf_channel
+    ):
+      self.skipTest("Invalid test case: Meridian requires paid media.")
+
+    if not sum((
+        has_undefined_media_channel,
+        has_undefined_rf_channel,
+        has_undefined_organic_media_channel,
+        has_undefined_organic_rf_channel,
+    )):
+      self.skipTest("Redundant test case: no undefined channels.")
+
+    inp_data = data_test_utils.sample_input_data_revenue(
+        n_media_channels=len(media) + has_undefined_media_channel,
+        n_rf_channels=len(rf) + has_undefined_rf_channel,
+        n_organic_media_channels=len(organic_media)
+        + has_undefined_organic_media_channel,
+        n_organic_rf_channels=len(organic_rf)
+        + has_undefined_organic_rf_channel,
+    )
+
+    decay_spec = media | rf | organic_media | organic_rf
+    model_spec = spec.ModelSpec(adstock_decay_spec=decay_spec)
+    model_context = context.ModelContext(
+        input_data=inp_data, model_spec=model_spec
+    )
+
+    if media:
+      expected_media = list(media.values())
+
+      if has_undefined_media_channel:
+        expected_media.append(constants.GEOMETRIC_DECAY)
+    elif has_undefined_media_channel:
+      expected_media = [constants.GEOMETRIC_DECAY]
+    else:
+      expected_media = constants.GEOMETRIC_DECAY
+
+    if rf:
+      expected_rf = list(rf.values())
+
+      if has_undefined_rf_channel:
+        expected_rf.append(constants.GEOMETRIC_DECAY)
+    elif has_undefined_rf_channel:
+      expected_rf = [constants.GEOMETRIC_DECAY]
+    else:
+      expected_rf = constants.GEOMETRIC_DECAY
+
+    if organic_media:
+      expected_organic_media = list(organic_media.values())
+
+      if has_undefined_organic_media_channel:
+        expected_organic_media.append(constants.GEOMETRIC_DECAY)
+    elif has_undefined_organic_media_channel:
+      expected_organic_media = [constants.GEOMETRIC_DECAY]
+    else:
+      expected_organic_media = constants.GEOMETRIC_DECAY
+
+    if organic_rf:
+      expected_organic_rf = list(organic_rf.values())
+
+      if has_undefined_organic_rf_channel:
+        expected_organic_rf.append(constants.GEOMETRIC_DECAY)
+    elif has_undefined_organic_rf_channel:
+      expected_organic_rf = [constants.GEOMETRIC_DECAY]
+    else:
+      expected_organic_rf = constants.GEOMETRIC_DECAY
+
+    self.assertSequenceEqual(
+        model_context.adstock_decay_spec.media, expected_media
+    )
+    self.assertSequenceEqual(model_context.adstock_decay_spec.rf, expected_rf)
+    self.assertSequenceEqual(
+        model_context.adstock_decay_spec.organic_media, expected_organic_media
+    )
+    self.assertSequenceEqual(
+        model_context.adstock_decay_spec.organic_rf, expected_organic_rf
+    )
+
+  @parameterized.product(**data_test_utils.ADSTOCK_DECAY_SPEC_CASES)
+  def test_from_channel_explicit_media_name(
+      self,
+      media,
+      rf,
+      organic_media,
+      organic_rf,
+  ):
+    """Test if one media channel has the name "media"."""
+
+    if not (media or rf):
+      self.skipTest("Invalid test case: Meridian requires paid media.")
+
+    media = media | {"media": constants.BINOMIAL_DECAY}
+
+    inp_data = data_test_utils.sample_input_data_revenue(
+        n_media_channels=len(media),
+        n_rf_channels=len(rf),
+        n_organic_media_channels=len(organic_media),
+        n_organic_rf_channels=len(organic_rf),
+        explicit_media_channel_names=list(media.keys()),
+    )
+
+    decay_spec = media | rf | organic_media | organic_rf
+    model_spec = spec.ModelSpec(adstock_decay_spec=decay_spec)
+    model_context = context.ModelContext(
+        input_data=inp_data, model_spec=model_spec
+    )
+
+    expected_media = list(media.values()) or constants.GEOMETRIC_DECAY
+    expected_rf = list(rf.values()) or constants.GEOMETRIC_DECAY
+    expected_organic_media = (
+        list(organic_media.values()) or constants.GEOMETRIC_DECAY
+    )
+    expected_organic_rf = list(organic_rf.values()) or constants.GEOMETRIC_DECAY
+
+    self.assertSequenceEqual(
+        model_context.adstock_decay_spec.media, expected_media
+    )
+    self.assertSequenceEqual(model_context.adstock_decay_spec.rf, expected_rf)
+    self.assertSequenceEqual(
+        model_context.adstock_decay_spec.organic_media, expected_organic_media
+    )
+    self.assertSequenceEqual(
+        model_context.adstock_decay_spec.organic_rf, expected_organic_rf
+    )
+
+  @parameterized.product(
+      **data_test_utils.ADSTOCK_DECAY_SPEC_CASES,
+      bad_channel=({"nonexistent_channel": constants.GEOMETRIC_DECAY},),
+  )
+  def test_from_channels_misnamed_channel_raises_error(
+      self, media, rf, organic_media, organic_rf, bad_channel
+  ):
+    """Test if an exception is raised with an unrecognized channel."""
+    if not (media or rf):
+      self.skipTest("Invalid test case: Meridian requires paid media.")
+
+    inp_data = data_test_utils.sample_input_data_revenue(
+        n_media_channels=len(media),
+        n_rf_channels=len(rf),
+        n_organic_media_channels=len(organic_media),
+        n_organic_rf_channels=len(organic_rf),
+    )
+
+    decay_spec = media | rf | organic_media | organic_rf | bad_channel
+    model_spec = spec.ModelSpec(adstock_decay_spec=decay_spec)
+
+    valid_channel_names = tuple(
+        (media | rf | organic_media | organic_rf).keys()
+    )
+
+    model_context = context.ModelContext(
+        input_data=inp_data, model_spec=model_spec
+    )
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "Unrecognized channel names found in `adstock_decay_spec` keys "
+        f"{tuple(decay_spec.keys())}. Keys should contain only "
+        f"channel_names {valid_channel_names}.",
+    ):
+      _ = model_context.adstock_decay_spec
+
+  def test_validate_media_spend_for_paid_media_channels_raises_error(self):
+    data = data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+        n_media_channels=len(_MEDIA_CHANNEL_NAMES),
+    )
+    spend = data_test_utils.random_media_spend_nd_da(
+        n_media_channels=len(_MEDIA_CHANNEL_NAMES),
+        explicit_media_channel_names=list(_MEDIA_CHANNEL_NAMES),
+    )
+
+    # Change spend values to zero for a single channel.
+    channel_to_zero = _MEDIA_CHANNEL_NAMES[0]
+    spend.loc[{constants.MEDIA_CHANNEL: channel_to_zero}] = 0
+    data.media_spend = spend
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        f"Zero total spend detected for paid channels: {channel_to_zero}."
+        " If data is correct and this is expected, please consider modeling"
+        " the data as organic media.",
+    ):
+      context.ModelContext(
+          input_data=data,
+          model_spec=spec.ModelSpec(
+              media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI
+          ),
+      )
+
+  def test_validate_rf_spend_for_paid_channels_raises_error(self):
+    data = data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+        n_rf_channels=len(_RF_CHANNEL_NAMES),
+    )
+    spend = data_test_utils.random_rf_spend_nd_da(
+        n_rf_channels=len(_RF_CHANNEL_NAMES),
+    )
+
+    # Change spend values to zero for a single channel.
+    channel_to_zero = _RF_CHANNEL_NAMES[0]
+    spend.loc[{constants.RF_CHANNEL: channel_to_zero}] = 0
+    data.rf_spend = spend
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        f"Zero total spend detected for paid channels: {channel_to_zero}."
+        " If data is correct and this is expected, please consider modeling"
+        " the data as organic media.",
+    ):
+      context.ModelContext(
+          input_data=data,
+          model_spec=spec.ModelSpec(
+              media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+          ),
+      )
+
+
+class InferenceDataTest(
+    test_utils.MeridianTestCase,
+    model_test_data.WithInputDataSamples,
+):
+  input_data_samples = model_test_data.WithInputDataSamples
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    model_test_data.WithInputDataSamples.setup()
+
+  def test_inference_data_non_paid_correct_dims(self):
+    data = self.input_data_non_media_and_organic
+    model_spec = spec.ModelSpec()
+    model_context = context.ModelContext(
+        input_data=data,
+        model_spec=model_spec,
+    )
+    n_chains = 1
+    n_draws = 7
+    coords = model_context.create_inference_data_coords(n_chains, n_draws)
+    dims = model_context.create_inference_data_dims()
+
+    expected_coords_len = {
+        constants.CHAIN: n_chains,
+        constants.DRAW: n_draws,
+        constants.GEO: model_context.n_geos,
+        constants.TIME: model_context.n_times,
+        constants.MEDIA_TIME: model_context.n_media_times,
+        constants.KNOTS: model_context.knot_info.n_knots,
+        constants.CONTROL_VARIABLE: model_context.n_controls,
+        constants.NON_MEDIA_CHANNEL: model_context.n_non_media_channels,
+        constants.MEDIA_CHANNEL: model_context.n_media_channels,
+        constants.RF_CHANNEL: model_context.n_rf_channels,
+        constants.ORGANIC_MEDIA_CHANNEL: model_context.n_organic_media_channels,
+        constants.ORGANIC_RF_CHANNEL: model_context.n_organic_rf_channels,
+    }
+    actual_coords_len = {k: len(v) for k, v in coords.items()}
+
+    with self.subTest("coords"):
+      self.assertDictEqual(actual_coords_len, expected_coords_len)
+    with self.subTest("dims"):
+      self.assertEqual(dims[constants.SIGMA], ["chain", "draw"])
+
+  def test_inference_data_with_unique_sigma_geo_correct_dims(self):
+    data = self.input_data_non_media_and_organic
+    model_spec = spec.ModelSpec(unique_sigma_for_each_geo=True)
+    model_context = context.ModelContext(
+        input_data=data,
+        model_spec=model_spec,
+    )
+    n_chains = 1
+    n_draws = 7
+    coords = model_context.create_inference_data_coords(n_chains, n_draws)
+    dims = model_context.create_inference_data_dims()
+
+    expected_coords_len = {
+        constants.CHAIN: n_chains,
+        constants.DRAW: n_draws,
+        constants.GEO: model_context.n_geos,
+        constants.TIME: model_context.n_times,
+        constants.MEDIA_TIME: model_context.n_media_times,
+        constants.KNOTS: model_context.knot_info.n_knots,
+        constants.CONTROL_VARIABLE: model_context.n_controls,
+        constants.NON_MEDIA_CHANNEL: model_context.n_non_media_channels,
+        constants.MEDIA_CHANNEL: model_context.n_media_channels,
+        constants.RF_CHANNEL: model_context.n_rf_channels,
+        constants.ORGANIC_MEDIA_CHANNEL: model_context.n_organic_media_channels,
+        constants.ORGANIC_RF_CHANNEL: model_context.n_organic_rf_channels,
+    }
+    actual_coords_len = {k: len(v) for k, v in coords.items()}
+
+    with self.subTest("coords"):
+      self.assertDictEqual(actual_coords_len, expected_coords_len)
+    with self.subTest("dims"):
+      self.assertEqual(dims[constants.SIGMA], ["chain", "draw", constants.GEO])
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="paid_media",
+          channel_type=constants.MEDIA,
+          tensor_attr="media_tensors",
+          transformer_attr="media_transformer",
+      ),
+      dict(
+          testcase_name="organic_media",
+          channel_type=constants.ORGANIC_MEDIA,
+          tensor_attr="organic_media_tensors",
+          transformer_attr="organic_media_transformer",
+      ),
+      dict(
+          testcase_name="paid_rf",
+          channel_type=constants.RF,
+          tensor_attr="rf_tensors",
+          transformer_attr="reach_transformer",
+      ),
+      dict(
+          testcase_name="organic_rf",
+          channel_type=constants.ORGANIC_RF,
+          tensor_attr="organic_rf_tensors",
+          transformer_attr="organic_reach_transformer",
+      ),
+  )
+  def test_get_media_scaling_factor_success(
+      self, channel_type: str, tensor_attr: str, transformer_attr: str
+  ):
+    data = data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+        n_media_channels=1,
+        n_rf_channels=1,
+        n_organic_media_channels=1,
+        n_organic_rf_channels=1,
+        n_non_media_channels=1,
+    )
+    model_context = context.ModelContext(
+        input_data=data, model_spec=spec.ModelSpec()
+    )
+
+    channel_attr = f"{channel_type}_channel"
+    channel_data = getattr(data, channel_attr)
+    self.assertIsNotNone(channel_data)
+    assert channel_data is not None
+    channel_name = channel_data.values[0]
+
+    scaling_factor = model_context.get_media_scaling_factor(channel_name)
+
+    tensors = getattr(model_context, tensor_attr)
+    transformer = getattr(tensors, transformer_attr)
+    self.assertIsNotNone(transformer)
+    expected = (
+        model_context.population * transformer.population_scaled_median_m[0]
+    )
+
+    test_utils.assert_allclose(scaling_factor, expected)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="non_media",
+          channel_type="non_media",
+          error_msg="Cannot return a scaling factor for non-media treatment",
+      ),
+      dict(
+          testcase_name="control",
+          channel_type="control",
+          error_msg="Cannot return a scaling factor for control variable",
+      ),
+      dict(
+          testcase_name="unknown",
+          channel_type="unknown",
+          error_msg="not found in any model inputs",
+      ),
+  )
+  def test_get_media_scaling_factor_failure(
+      self, channel_type: str, error_msg: str
+  ):
+    data = data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+        n_media_channels=1,
+        n_rf_channels=1,
+        n_organic_media_channels=1,
+        n_organic_rf_channels=1,
+        n_non_media_channels=1,
+    )
+    model_context = context.ModelContext(
+        input_data=data, model_spec=spec.ModelSpec()
+    )
+
+    if channel_type == "non_media":
+      self.assertIsNotNone(data.non_media_channel)
+      assert data.non_media_channel is not None
+      channel_name = data.non_media_channel.values[0]
+    elif channel_type == "control":
+      self.assertIsNotNone(data.control_variable)
+      assert data.control_variable is not None
+      channel_name = data.control_variable.values[0]
+    else:
+      channel_name = "unknown_channel"
+
+    with self.assertRaises(ValueError) as cm:
+      model_context.get_media_scaling_factor(channel_name)
+    self.assertIn(error_msg, str(cm.exception))
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="media",
+          channel_type=constants.MEDIA,
+          expected_prefix="m",
+          expected_is_rf=False,
+      ),
+      dict(
+          testcase_name="rf",
+          channel_type=constants.RF,
+          expected_prefix="rf",
+          expected_is_rf=True,
+      ),
+      dict(
+          testcase_name="organic_media",
+          channel_type=constants.ORGANIC_MEDIA,
+          expected_prefix="om",
+          expected_is_rf=False,
+      ),
+      dict(
+          testcase_name="organic_rf",
+          channel_type=constants.ORGANIC_RF,
+          expected_prefix="orf",
+          expected_is_rf=True,
+      ),
+  )
+  def test_get_channel_parameters_success(
+      self, channel_type: str, expected_prefix: str, expected_is_rf: bool
+  ):
+    data = data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+        n_media_channels=2,
+        n_rf_channels=2,
+        n_organic_media_channels=2,
+        n_organic_rf_channels=2,
+        n_non_media_channels=1,
+    )
+    model_context = context.ModelContext(
+        input_data=data, model_spec=spec.ModelSpec()
+    )
+
+    channel_attr = f"{channel_type}_channel"
+    channel_data = getattr(data, channel_attr)
+    self.assertIsNotNone(channel_data)
+    assert channel_data is not None
+    channel_name = channel_data.values[1]
+
+    params = model_context.get_channel_parameters(channel_name)
+
+    self.assertEqual(params.index, 1)
+    self.assertEqual(params.prefix, expected_prefix)
+    self.assertEqual(params.is_rf, expected_is_rf)
+
+    expected_decay_spec = getattr(
+        model_context.adstock_decay_spec, channel_type
+    )
+    self.assertEqual(params.decay_spec, expected_decay_spec)
+
+  def test_get_channel_parameters_missing_channel_failure(self):
+    data = data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+        n_media_channels=1,
+    )
+    model_context = context.ModelContext(
+        input_data=data, model_spec=spec.ModelSpec()
+    )
+
+    with self.assertRaises(ValueError) as cm:
+      model_context.get_channel_parameters("not_a_channel")
+    self.assertEqual(
+        str(cm.exception), "Channel 'not_a_channel' not found in the model."
+    )
+
+  def test_get_channel_parameters_sequence_decay(self):
+    data = data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+        n_media_channels=2,
+    )
+    self.assertIsNotNone(data.media_channel)
+    assert data.media_channel is not None
+    channel_0 = data.media_channel.values[0]
+    channel_1 = data.media_channel.values[1]
+
+    decay_spec = {
+        channel_0: "geometric",
+        channel_1: "binomial",
+    }
+    model_spec = spec.ModelSpec(adstock_decay_spec=decay_spec)
+    model_context = context.ModelContext(input_data=data, model_spec=model_spec)
+
+    params_0 = model_context.get_channel_parameters(channel_0)
+    self.assertEqual(params_0.index, 0)
+    self.assertEqual(params_0.prefix, "m")
+    self.assertEqual(params_0.decay_spec, "geometric")
+    self.assertFalse(params_0.is_rf)
+
+    params_1 = model_context.get_channel_parameters(channel_1)
+    self.assertEqual(params_1.index, 1)
+    self.assertEqual(params_1.prefix, "m")
+    self.assertEqual(params_1.decay_spec, "binomial")
+    self.assertFalse(params_1.is_rf)
+
+  def test_get_channel_parameter_tensor_success(self):
+    data = data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+        n_media_channels=3,
+    )
+    model_context = context.ModelContext(
+        input_data=data, model_spec=spec.ModelSpec()
+    )
+    self.assertIsNotNone(data.media_channel)
+    assert data.media_channel is not None
+    channel_1 = data.media_channel.values[1]
+
+    dummy_dist_tensors = types.SimpleNamespace(
+        alpha_m=backend.to_tensor([[[0.1, 0.2, 0.3]]])
+    )
+
+    tensor = model_context.get_channel_parameter_tensor(
+        dist_tensors=dummy_dist_tensors,
+        param_base_name="alpha",
+        channel_name=channel_1,
+    )
+
+    expected = backend.to_tensor([[0.2]])
+    test_utils.assert_allclose(tensor, expected)
+
+  def test_get_channel_parameter_tensor_missing_channel(self):
+    data = data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+        n_media_channels=1,
+    )
+    model_context = context.ModelContext(
+        input_data=data, model_spec=spec.ModelSpec()
+    )
+    dummy_dist_tensors = types.SimpleNamespace(
+        alpha_m=backend.to_tensor([[[0.1]]])
+    )
+
+    with self.assertRaises(ValueError) as cm:
+      model_context.get_channel_parameter_tensor(
+          dist_tensors=dummy_dist_tensors,
+          param_base_name="alpha",
+          channel_name="not_a_channel",
+      )
+    self.assertEqual(
+        str(cm.exception), "Channel 'not_a_channel' not found in the model."
+    )
+
+  def test_get_channel_parameter_tensor_beta_g_success(self):
+    data = data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+        n_media_channels=3,
+    )
+    model_context = context.ModelContext(
+        input_data=data, model_spec=spec.ModelSpec()
+    )
+    self.assertIsNotNone(data.media_channel)
+    assert data.media_channel is not None
+    channel_1 = data.media_channel.values[1]
+
+    dummy_dist_tensors = types.SimpleNamespace(
+        beta_gm=backend.to_tensor([[[0.1, 0.2, 0.3]]])
+    )
+
+    tensor = model_context.get_channel_parameter_tensor(
+        dist_tensors=dummy_dist_tensors,
+        param_base_name=constants.BETA_G,
+        channel_name=channel_1,
+    )
+
+    expected = backend.to_tensor([[0.2]])
+    test_utils.assert_allclose(tensor, expected)
+
+  def test_aggregate_baseline_constraint(self):
+    data = self.input_data_with_media_and_rf
+    model_context = context.ModelContext(
+        input_data=data,
+        model_spec=spec.ModelSpec(allows_negative_aggregate_baseline=False),
+    )
+    constraint = model_context.aggregate_baseline_constraint
+    assert constraint is not None
+
+    # Test outcome_weights and geo_weights
+    outcome_weights = constraint.outcome_weights
+    self.assertEqual(
+        outcome_weights.shape, (model_context.n_geos, model_context.n_times)
+    )
+    np.testing.assert_allclose(
+        np.sum(np.asarray(outcome_weights)),
+        float(model_context.n_times),
+        rtol=1e-5,
+    )
+
+    geo_weights = constraint.geo_weights
+    self.assertEqual(geo_weights.shape, (model_context.n_geos,))
+    np.testing.assert_allclose(
+        np.sum(np.asarray(geo_weights)),
+        1.0,
+        atol=1e-5,
+    )
+    raw_weights = np.asarray(model_context.population)[
+        :, np.newaxis
+    ] * np.asarray(model_context.revenue_per_kpi)
+    expected_geo_weights = np.sum(raw_weights, axis=-1) / np.sum(raw_weights)
+    np.testing.assert_allclose(
+        np.asarray(geo_weights),
+        expected_geo_weights,
+        rtol=1e-5,
+    )
+
+    # Test without revenue_per_kpi reduces to pure population weights
+    data_no_rpk = self.input_data_non_revenue_no_revenue_per_kpi
+    mc_no_rpk = context.ModelContext(
+        input_data=data_no_rpk,
+        model_spec=spec.ModelSpec(allows_negative_aggregate_baseline=False),
+    )
+    constraint_no_rpk = mc_no_rpk.aggregate_baseline_constraint
+    assert constraint_no_rpk is not None
+    np.testing.assert_allclose(
+        np.asarray(constraint_no_rpk.geo_weights),
+        np.asarray(mc_no_rpk.population)
+        / np.sum(np.asarray(mc_no_rpk.population)),
+        rtol=1e-5,
+    )
+
+    # Test knot_rotation_matrix and knot_norm_w
+    knot_weight_sums = model_context.knot_info.weights @ np.sum(
+        np.asarray(outcome_weights), axis=0
+    )
+    expected_norm_w = np.linalg.norm(knot_weight_sums)
+    np.testing.assert_allclose(
+        constraint.knot_norm_w, expected_norm_w, rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        constraint.knot_rotation_matrix[0],
+        knot_weight_sums / expected_norm_w,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+    # Test threshold_l
+    kpi_transformer = model_context.kpi_transformer
+    expected_l = (
+        -float(model_context.n_times)
+        * float(np.asarray(kpi_transformer.population_scaled_mean))
+        / float(np.asarray(kpi_transformer.population_scaled_stdev))
+    )
+    test_utils.assert_allclose(
+        constraint.threshold_l,
+        backend.to_tensor(expected_l, dtype=backend.float_dtype),
+        atol=1e-4,
+    )
+
+    # Test controls_weights
+    if model_context.controls_scaled is not None:
+      c_weights = constraint.controls_weights
+      self.assertIsNotNone(c_weights)
+      assert c_weights is not None
+      self.assertEqual(
+          c_weights.shape, (model_context.n_geos, model_context.n_controls)
+      )
+      expected_c_weights = np.einsum(
+          "gt,gtc->gc",
+          np.asarray(outcome_weights),
+          np.asarray(model_context.controls_scaled),
+      )
+      np.testing.assert_allclose(
+          np.asarray(c_weights), expected_c_weights, rtol=1e-5, atol=1e-5
+      )
+
+  def test_aggregate_baseline_constraint_offset(self):
+    model_context = context.ModelContext(
+        input_data=self.short_input_data_non_media_and_organic,
+        model_spec=spec.ModelSpec(allows_negative_aggregate_baseline=False),
+    )
+    constraint = model_context.aggregate_baseline_constraint
+    assert constraint is not None
+    n_geos = model_context.n_geos
+    n_non_media_channels = model_context.n_non_media_channels
+    rng = np.random.default_rng(0)
+    tau_g = rng.normal(size=(2, n_geos))
+    gamma_gc = rng.normal(size=(2, n_geos, model_context.n_controls))
+    gamma_gn = rng.normal(size=(2, n_geos, n_non_media_channels))
+    non_media_baseline = rng.normal(size=(n_non_media_channels,))
+
+    # Each term of the baseline, summed over geos and time periods with the
+    # outcome weights.
+    weights = np.asarray(constraint.outcome_weights)
+    geo_term = np.einsum("gt,dg->d", weights, tau_g)
+    controls_term = np.einsum(
+        "gt,gtc,dgc->d",
+        weights,
+        np.asarray(model_context.controls_scaled),
+        gamma_gc,
+    )
+    non_media_term = np.einsum(
+        "gt,n,dgn->d", weights, non_media_baseline, gamma_gn
+    )
+
+    def to_tensor(array: np.ndarray) -> backend.Tensor:
+      return backend.to_tensor(array, dtype=backend.float_dtype)
+
+    with self.subTest("geo"):
+      test_utils.assert_allclose(
+          constraint.offset(tau_g=to_tensor(tau_g)),
+          geo_term,
+          rtol=1e-4,
+          atol=1e-3,
+      )
+    with self.subTest("geo_controls_and_non_media"):
+      test_utils.assert_allclose(
+          constraint.offset(
+              tau_g=to_tensor(tau_g),
+              gamma_gc=to_tensor(gamma_gc),
+              gamma_gn=to_tensor(gamma_gn),
+              non_media_baseline_normalized=to_tensor(non_media_baseline),
+          ),
+          geo_term + controls_term + non_media_term,
+          rtol=1e-4,
+          atol=1e-3,
+      )
+    with self.subTest("non_media_without_baseline_raises"):
+      with self.assertRaisesWithLiteralMatch(
+          ValueError,
+          "`non_media_baseline_normalized` is required with `gamma_gn`.",
+      ):
+        constraint.offset(
+            tau_g=to_tensor(tau_g), gamma_gn=to_tensor(gamma_gn)
+        )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="scalar", scale=2.0, batch_broadcast=False),
+      dict(testcase_name="batched", scale=[2.0] * 3, batch_broadcast=False),
+      dict(testcase_name="batch_broadcast", scale=2.0, batch_broadcast=True),
+  )
+  def test_aggregate_baseline_constraint_knot_prior(
+      self, scale: float | Sequence[float], batch_broadcast: bool
+  ):
+    knot_prior = backend.tfd.Normal(
+        np.zeros_like(scale, dtype=backend.np_float_dtype),
+        _cast_dist_arg(scale),
+    )
+    if batch_broadcast:
+      knot_prior = backend.tfd.BatchBroadcast(knot_prior, 3)
+    model_context = context.ModelContext(
+        input_data=self.input_data_with_media_and_rf,
+        model_spec=spec.ModelSpec(
+            prior=prior_distribution.PriorDistribution(knot_values=knot_prior),
+            knots=3,
+            allows_negative_aggregate_baseline=False,
+        ),
+    )
+    constraint = model_context.aggregate_baseline_constraint
+    assert constraint is not None
+    test_utils.assert_allclose(constraint.knot_loc, 0.0)
+    test_utils.assert_allclose(constraint.knot_scale, 2.0)
+
+  def test_aggregate_baseline_constraint_rotated_knot_0_prior(self):
+    model_context = context.ModelContext(
+        input_data=self.input_data_with_media_and_rf,
+        model_spec=spec.ModelSpec(allows_negative_aggregate_baseline=False),
+    )
+    constraint = model_context.aggregate_baseline_constraint
+    assert constraint is not None
+    # Offsets that put the lower bound of the first rotated knot below zero, and
+    # far above it. The default knot prior is `Normal(0, 5)`.
+    expected_low = np.array([-3.0, 500.0])
+    offset = backend.to_tensor(
+        float(np.asarray(constraint.threshold_l))
+        - constraint.knot_norm_w * expected_low,
+        dtype=backend.float_dtype,
+    )
+
+    prior = constraint.rotated_knot_0_prior(offset)
+
+    self.assertEqual(prior.name, constants.ROTATED_KNOT_0)
+    test_utils.assert_allclose(prior.loc, 0.0)
+    test_utils.assert_allclose(prior.scale, 5.0)
+    test_utils.assert_allclose(prior.low, expected_low, rtol=1e-5, atol=1e-3)
+    # The upper bound is 50 knot prior scales above the lower bound, but at
+    # least 50 scales above zero.
+    test_utils.assert_allclose(
+        prior.high, [250.0, 750.0], rtol=1e-5, atol=1e-3
+    )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="one_knot", n_knots=1),
+      dict(testcase_name="five_knots", n_knots=5),
+  )
+  def test_aggregate_baseline_constraint_rotated_knot_rest_prior(
+      self, n_knots: int
+  ):
+    model_context = context.ModelContext(
+        input_data=self.input_data_with_media_and_rf,
+        model_spec=spec.ModelSpec(
+            knots=n_knots, allows_negative_aggregate_baseline=False
+        ),
+    )
+    constraint = model_context.aggregate_baseline_constraint
+    assert constraint is not None
+
+    prior = constraint.rotated_knot_rest_prior()
+
+    if n_knots == 1:
+      self.assertIsNone(prior)
+    else:
+      assert prior is not None
+      self.assertEqual(prior.name, constants.ROTATED_KNOT_REST)
+      self.assertEqual(tuple(prior.event_shape), (n_knots - 1,))
+
+  @parameterized.named_parameters(
+      dict(testcase_name="one_knot", n_knots=1),
+      dict(testcase_name="five_knots", n_knots=5),
+  )
+  def test_aggregate_baseline_constraint_knot_values(self, n_knots: int):
+    model_context = context.ModelContext(
+        input_data=self.input_data_with_media_and_rf,
+        model_spec=spec.ModelSpec(
+            knots=n_knots, allows_negative_aggregate_baseline=False
+        ),
+    )
+    constraint = model_context.aggregate_baseline_constraint
+    assert constraint is not None
+    rng = np.random.default_rng(0)
+    rotated_knot_0 = rng.normal(size=(2,))
+    if n_knots == 1:
+      rotated_knot_rest = None
+    else:
+      rotated_knot_rest = backend.to_tensor(
+          rng.normal(size=(2, n_knots - 1)), dtype=backend.float_dtype
+      )
+
+    knot_values = constraint.knot_values(
+        backend.to_tensor(rotated_knot_0, dtype=backend.float_dtype),
+        rotated_knot_rest,
+    )
+
+    self.assertEqual(tuple(knot_values.shape), (2, n_knots))
+    # The outcome-weighted sum of `mu_t` over time only depends on the first
+    # rotated knot.
+    mu_t = np.asarray(knot_values) @ model_context.knot_info.weights
+    time_weights = np.sum(np.asarray(constraint.outcome_weights), axis=0)
+    test_utils.assert_allclose(
+        mu_t @ time_weights,
+        constraint.knot_norm_w * rotated_knot_0,
+        rtol=1e-4,
+        atol=1e-3,
+    )
+    with self.subTest("mismatched_rotated_knot_rest_raises"):
+      mismatched_rotated_knot_rest = (
+          backend.zeros([2, 1], dtype=backend.float_dtype)
+          if n_knots == 1
+          else None
+      )
+      with self.assertRaisesRegex(
+          ValueError, "`rotated_knot_rest` must be passed if and only if"
+      ):
+        constraint.knot_values(
+            backend.zeros([2], dtype=backend.float_dtype),
+            mismatched_rotated_knot_rest,
+        )
+
+  def test_init_revalidates_mutated_knot_values_prior(self):
+    model_spec = spec.ModelSpec(allows_negative_aggregate_baseline=False)
+    model_spec.prior.knot_values = backend.tfd.Uniform(
+        backend.np_float_dtype(-1.0), backend.np_float_dtype(1.0)
+    )
+    with self.assertRaisesRegex(
+        ValueError,
+        "When `allows_negative_aggregate_baseline` is `False`,"
+        " `prior.knot_values` must be a `Normal` distribution",
+    ):
+      context.ModelContext(
+          input_data=self.input_data_with_media_and_rf,
+          model_spec=model_spec,
+      )
+
+  def _input_data_with_constant_kpi(self) -> input_data.InputData:
+    return dataclasses.replace(
+        self.input_data_with_media_and_rf,
+        kpi=self.input_data_with_media_and_rf.kpi * 0.0,
+    )
+
+  def _input_data_with_zero_outcome_weights(self) -> input_data.InputData:
+    # `population` and `revenue_per_kpi` are each valid, but don't overlap.
+    base_data = self.input_data_with_media_and_rf
+    pop = base_data.population.copy(deep=True)
+    pop.data = pop.data.copy()
+    pop.data[0] = 0.0
+    assert base_data.revenue_per_kpi is not None
+    rpk = base_data.revenue_per_kpi.copy(deep=True)
+    rpk.data = np.zeros_like(rpk.data)
+    rpk.data[0, :] = 1.0
+    return dataclasses.replace(
+        base_data,
+        population=pop,
+        revenue_per_kpi=rpk,
+    )
+
+  def test_aggregate_baseline_constraint_zero_weights_raises_value_error(self):
+    mc = context.ModelContext(
+        input_data=self._input_data_with_zero_outcome_weights(),
+        model_spec=spec.ModelSpec(allows_negative_aggregate_baseline=False),
+    )
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "Outcome weights (`population * revenue_per_kpi` or `population`)"
+        " must be non-negative and have a strictly positive sum across geos"
+        " and time periods when `allows_negative_aggregate_baseline=False`."
+        " Please ensure `population` contains positive values and has"
+        " non-zero overlap with `revenue_per_kpi`, or set"
+        " `allows_negative_aggregate_baseline=True`.",
+    ):
+      _ = mc.aggregate_baseline_constraint
+
+  def test_aggregate_baseline_constraint_constant_kpi_raises_value_error(self):
+    mc = context.ModelContext(
+        input_data=self._input_data_with_constant_kpi(),
+        model_spec=spec.ModelSpec(allows_negative_aggregate_baseline=False),
+    )
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "`kpi` cannot be constant when"
+        " `allows_negative_aggregate_baseline=False` because standardizing"
+        " the baseline threshold requires non-zero KPI variability"
+        " (`population_scaled_stdev > 0`). Please verify that `kpi` varies"
+        " across geos or time periods, or set"
+        " `allows_negative_aggregate_baseline=True`.",
+    ):
+      _ = mc.aggregate_baseline_constraint
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="constant_kpi",
+          input_data_fn="_input_data_with_constant_kpi",
+      ),
+      dict(
+          testcase_name="zero_outcome_weights",
+          input_data_fn="_input_data_with_zero_outcome_weights",
+      ),
+  )
+  def test_populate_cached_properties_default_spec_succeeds(
+      self, input_data_fn: str
+  ):
+    # `populate_cached_properties()` evaluates every cached property, and runs
+    # in `Analyzer.__init__` and posterior sampling. Models that don't opt into
+    # the aggregate baseline constraint must not fail there, even if their data
+    # couldn't satisfy it.
+    model_context = context.ModelContext(
+        input_data=getattr(self, input_data_fn)(),
+        model_spec=spec.ModelSpec(),
+    )
+    model_context.populate_cached_properties()
+    self.assertIsNone(model_context.aggregate_baseline_constraint)
+
+
+class CompiledModelSpecTest(
+    test_utils.MeridianTestCase,
+    model_test_data.WithInputDataSamples,
+):
+  """Tests for `ModelContext`'s compiled model spec properties."""
+
+  input_data_samples = model_test_data.WithInputDataSamples
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    model_test_data.WithInputDataSamples.setup()
+
+  def _context(
+      self,
+      data: input_data.InputData,
+      model_spec: spec.ModelSpec,
+  ) -> context.ModelContext:
+    return context.ModelContext(input_data=data, model_spec=model_spec)
+
+  # --- Invariants the compilation logic depends on ----------------------------
+
+  # `_compile_calibration_spec` and `compiled_holdout_id` decide how to
+  # interpret an entire sequence by inspecting only its first element. That is
+  # sound only because the spec dataclasses reject mixed-scope and empty
+  # sequences at construction. These tests pin those guarantees next to the
+  # code that relies on them, so relaxing the validation cannot quietly become
+  # a mis-compilation.
+  #
+  # Static typing already rejects a *literal* mixed list, so each case below
+  # builds the sequence as `list[Any]`. That is deliberate: it reproduces the
+  # dynamically-built sequence the runtime guard actually exists to catch.
+
+  def test_calibration_spec_rejects_mixed_scopes(self):
+    mixed: list[Any] = [
+        spec.DateRange("2021-01-25", "2021-02-01"),
+        spec.ChannelCalibrationSpec(
+            channels=["ch_1"],
+            date_ranges=[spec.DateRange("2021-01-25", "2021-02-01")],
+        ),
+    ]
+    with self.assertRaisesRegex(ValueError, "the two cannot be mixed"):
+      spec.CalibrationSpec(spec=mixed)
+
+  def test_holdout_spec_rejects_mixed_scopes(self):
+    mixed: list[Any] = [
+        spec.DateRange("2021-01-25", "2021-02-01"),
+        spec.GeoHoldoutSpec(
+            geos=["geo_0"],
+            date_ranges=[spec.DateRange("2021-01-25", "2021-02-01")],
+        ),
+    ]
+    with self.assertRaisesRegex(ValueError, "the two cannot be mixed"):
+      spec.HoldoutSpec(spec=mixed)
+
+  def test_calibration_spec_rejects_empty_sequence(self):
+    """An empty sequence would make the `entries[0]` scope probe raise."""
+    with self.assertRaisesRegex(ValueError, "cannot be empty"):
+      spec.CalibrationSpec(spec=[])
+
+  def test_holdout_spec_rejects_empty_sequence(self):
+    with self.assertRaisesRegex(ValueError, "cannot be empty"):
+      spec.HoldoutSpec(spec=[])
+
+  # --- Date range bound validation -------------------------------------------
+
+  # A `DateRange` bound must name an exact time coordinate. A bound landing
+  # between two coordinates has no well-defined period boundary, so it has no
+  # faithful half-open `DateInterval` representation.
+
+  def test_compiled_roi_calibration_rejects_start_date_off_coordinate(self):
+    data = self.input_data_with_media_and_rf
+    dates = data.media_time_coordinates.all_dates
+    off_coordinate = dates[10] + datetime.timedelta(days=1)
+    model_spec = spec.ModelSpec(
+        media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+        roi_calibration=spec.CalibrationSpec(
+            spec=[spec.DateRange(off_coordinate, dates[20])]
+        ),
+    )
+    with self.assertRaisesRegex(
+        ValueError,
+        "`roi_calibration` has a `DateRange` whose `start_date`"
+        f" \\({off_coordinate}\\) is not one of the input data's time"
+        " coordinates",
+    ):
+      _ = self._context(data, model_spec).compiled_roi_calibration_period
+
+  def test_compiled_roi_calibration_rejects_end_date_off_coordinate(self):
+    data = self.input_data_with_media_and_rf
+    dates = data.media_time_coordinates.all_dates
+    off_coordinate = dates[20] + datetime.timedelta(days=1)
+    model_spec = spec.ModelSpec(
+        media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+        roi_calibration=spec.CalibrationSpec(
+            spec=[spec.DateRange(dates[10], off_coordinate)]
+        ),
+    )
+    with self.assertRaisesRegex(ValueError, "`end_date`"):
+      _ = self._context(data, model_spec).compiled_roi_calibration_period
+
+  def test_off_coordinate_bound_error_names_the_bracketing_coordinates(self):
+    """The message points at the two coordinates the bad bound falls between."""
+    data = self.input_data_with_media_and_rf
+    dates = data.media_time_coordinates.all_dates
+    off_coordinate = dates[10] + datetime.timedelta(days=1)
+    model_spec = spec.ModelSpec(
+        media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+        roi_calibration=spec.CalibrationSpec(
+            spec=[spec.DateRange(off_coordinate, dates[20])]
+        ),
+    )
+    with self.assertRaisesRegex(
+        ValueError, f"nearest time coordinates are {dates[10]} and {dates[11]}"
+    ):
+      _ = self._context(data, model_spec).compiled_roi_calibration_period
+
+  def test_compiled_holdout_rejects_off_coordinate_bound(self):
+    """The holdout path validates bounds too, not just calibration."""
+    data = self.input_data_with_media_and_rf
+    dates = data.time_coordinates.all_dates
+    off_coordinate = dates[10] + datetime.timedelta(days=1)
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(
+            spec=[spec.DateRange(off_coordinate, dates[20])]
+        )
+    )
+    with self.assertRaisesRegex(ValueError, "`holdout` has a `DateRange`"):
+      _ = self._context(data, model_spec).compiled_holdout_id
+
+  def test_compiled_per_geo_holdout_rejects_off_coordinate_bound(self):
+    data = self.input_data_with_media_and_rf
+    dates = data.time_coordinates.all_dates
+    off_coordinate = dates[10] + datetime.timedelta(days=1)
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(
+            spec=[
+                spec.GeoHoldoutSpec(
+                    geos=["geo_0"],
+                    date_ranges=[spec.DateRange(off_coordinate, dates[20])],
+                )
+            ]
+        )
+    )
+    with self.assertRaisesRegex(ValueError, "`holdout` has a `DateRange`"):
+      _ = self._context(data, model_spec).compiled_holdout_id
+
+  def test_omitted_date_range_bounds_are_not_validated(self):
+    """An open bound is not a coordinate, and must stay legal."""
+    data = self.input_data_with_media_and_rf
+    dates = data.media_time_coordinates.all_dates
+    model_spec = spec.ModelSpec(
+        media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+        roi_calibration=spec.CalibrationSpec(spec=[spec.DateRange()]),
+    )
+    compiled = self._context(data, model_spec).compiled_roi_calibration_period
+
+    assert compiled is not None
+    np.testing.assert_array_equal(
+        compiled, np.ones((len(dates), 3), dtype=bool)
+    )
+
+  # --- ROI calibration ------------------------------------------------------
+
+  def test_compiled_roi_calibration_period_unset_is_none(self):
+    model_context = self._context(
+        self.input_data_with_media_and_rf, spec.ModelSpec()
+    )
+    self.assertIsNone(model_context.compiled_roi_calibration_period)
+
+  def test_compiled_roi_calibration_period_passes_through_legacy_array(self):
+    data = self.input_data_with_media_and_rf
+    legacy = np.zeros((len(data.media_time), 3), dtype=bool)
+    legacy[5:10, 1] = True
+    model_context = self._context(
+        data, spec.ModelSpec(roi_calibration_period=legacy)
+    )
+    np.testing.assert_array_equal(
+        model_context.compiled_roi_calibration_period, legacy
+    )
+
+  def test_compiled_roi_calibration_period_prefers_legacy_over_declarative(
+      self,
+  ):
+    """The deprecated array wins, matching what `ModelSpec` warns it will do."""
+    data = self.input_data_with_media_and_rf
+    dates = data.media_time_coordinates.all_dates
+    legacy = np.zeros((len(dates), 3), dtype=bool)
+    legacy[0, 0] = True
+    with self.assertWarns(UserWarning):
+      model_spec = spec.ModelSpec(
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+          roi_calibration=spec.CalibrationSpec(
+              spec=[spec.DateRange(dates[10], dates[20])]
+          ),
+          roi_calibration_period=legacy,
+      )
+    model_context = self._context(data, model_spec)
+    np.testing.assert_array_equal(
+        model_context.compiled_roi_calibration_period, legacy
+    )
+
+  def test_compiled_roi_calibration_period_global_date_ranges(self):
+    """A global spec applies one date mask to every channel."""
+    data = self.input_data_with_media_and_rf
+    dates = data.media_time_coordinates.all_dates
+    model_spec = spec.ModelSpec(
+        media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+        roi_calibration=spec.CalibrationSpec(
+            spec=[spec.DateRange(dates[10], dates[20])]
+        ),
+    )
+    compiled = self._context(data, model_spec).compiled_roi_calibration_period
+
+    assert compiled is not None
+    self.assertEqual(compiled.shape, (len(dates), 3))
+    expected = np.zeros(len(dates), dtype=bool)
+    # `[start, end]`: both index 10 and index 20 are included.
+    expected[10:21] = True
+    for channel in range(3):
+      np.testing.assert_array_equal(compiled[:, channel], expected)
+
+  def test_compiled_roi_calibration_period_unions_multiple_date_ranges(self):
+    data = self.input_data_with_media_and_rf
+    dates = data.media_time_coordinates.all_dates
+    model_spec = spec.ModelSpec(
+        media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+        roi_calibration=spec.CalibrationSpec(
+            spec=[
+                spec.DateRange(dates[10], dates[20]),
+                spec.DateRange(dates[30], dates[35]),
+            ]
+        ),
+    )
+    compiled = self._context(data, model_spec).compiled_roi_calibration_period
+
+    assert compiled is not None
+    expected = np.zeros(len(dates), dtype=bool)
+    expected[10:21] = True
+    expected[30:36] = True
+    np.testing.assert_array_equal(compiled[:, 0], expected)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="both_bounds_open", start=None, end=None),
+      dict(testcase_name="open_start", start=None, end=10),
+      dict(testcase_name="open_end", start=10, end=None),
+  )
+  def test_compiled_roi_calibration_period_open_bounds(
+      self, start: int | None, end: int | None
+  ):
+    """An omitted bound is resolved against the data, not left empty."""
+    data = self.input_data_with_media_and_rf
+    dates = data.media_time_coordinates.all_dates
+    model_spec = spec.ModelSpec(
+        media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+        roi_calibration=spec.CalibrationSpec(
+            spec=[
+                spec.DateRange(
+                    dates[start] if start is not None else None,
+                    dates[end] if end is not None else None,
+                )
+            ]
+        ),
+    )
+    compiled = self._context(data, model_spec).compiled_roi_calibration_period
+
+    assert compiled is not None
+    expected = np.zeros(len(dates), dtype=bool)
+    # `end` is inclusive, but Python slicing is not, hence the `+ 1`.
+    expected[slice(start, end + 1 if end is not None else None)] = True
+    np.testing.assert_array_equal(compiled[:, 0], expected)
+
+  def test_compiled_roi_calibration_period_per_channel(self):
+    """Channels the spec does not name are left unrestricted, not zeroed."""
+    data = self.input_data_with_media_and_rf
+    dates = data.media_time_coordinates.all_dates
+    assert data.media_channel is not None
+    channels = list(data.media_channel.values)
+    model_spec = spec.ModelSpec(
+        media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+        roi_calibration=spec.CalibrationSpec(
+            spec=[
+                spec.ChannelCalibrationSpec(
+                    channels=[channels[1]],
+                    date_ranges=[spec.DateRange(dates[10], dates[20])],
+                )
+            ]
+        ),
+    )
+    compiled = self._context(data, model_spec).compiled_roi_calibration_period
+
+    assert compiled is not None
+    expected_named = np.zeros(len(dates), dtype=bool)
+    expected_named[10:21] = True
+    np.testing.assert_array_equal(compiled[:, 1], expected_named)
+
+    # An all-`False` column here would zero the channel's aggregated spend and
+    # make its ROI prior denominator zero, so unnamed channels must be `True`.
+    unrestricted = np.ones(len(dates), dtype=bool)
+    np.testing.assert_array_equal(compiled[:, 0], unrestricted)
+    np.testing.assert_array_equal(compiled[:, 2], unrestricted)
+
+  def test_compiled_roi_calibration_period_unknown_channel_fails(self):
+    data = self.input_data_with_media_and_rf
+    dates = data.media_time_coordinates.all_dates
+    model_spec = spec.ModelSpec(
+        media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+        roi_calibration=spec.CalibrationSpec(
+            spec=[
+                spec.ChannelCalibrationSpec(
+                    channels=["not_a_channel"],
+                    date_ranges=[spec.DateRange(dates[0], dates[5])],
+                )
+            ]
+        ),
+    )
+    with self.assertRaisesRegex(
+        ValueError,
+        r"`roi_calibration` refers to media channels that are not in the input"
+        r" data: \['not_a_channel'\]",
+    ):
+      _ = self._context(data, model_spec)
+
+  # --- RF ROI calibration ---------------------------------------------------
+
+  def test_compiled_rf_roi_calibration_period_global_date_ranges(self):
+    data = self.input_data_with_media_and_rf
+    dates = data.media_time_coordinates.all_dates
+    model_spec = spec.ModelSpec(
+        rf_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+        rf_roi_calibration=spec.CalibrationSpec(
+            spec=[spec.DateRange(dates[10], dates[20])]
+        ),
+    )
+    compiled = self._context(
+        data, model_spec
+    ).compiled_rf_roi_calibration_period
+
+    assert compiled is not None
+    self.assertEqual(compiled.shape, (len(dates), 2))
+    expected = np.zeros(len(dates), dtype=bool)
+    expected[10:21] = True
+    np.testing.assert_array_equal(compiled[:, 0], expected)
+
+  def test_compiled_rf_roi_calibration_period_unknown_channel_fails(self):
+    data = self.input_data_with_media_and_rf
+    dates = data.media_time_coordinates.all_dates
+    model_spec = spec.ModelSpec(
+        rf_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+        rf_roi_calibration=spec.CalibrationSpec(
+            spec=[
+                spec.ChannelCalibrationSpec(
+                    channels=["not_an_rf_channel"],
+                    date_ranges=[spec.DateRange(dates[0], dates[5])],
+                )
+            ]
+        ),
+    )
+    with self.assertRaisesRegex(
+        ValueError,
+        r"`rf_roi_calibration` refers to RF channels that are not in the input"
+        r" data: \['not_an_rf_channel'\]",
+    ):
+      _ = self._context(data, model_spec)
+
+  # --- Holdout --------------------------------------------------------------
+
+  def test_compiled_holdout_id_unset_is_none(self):
+    model_context = self._context(
+        self.input_data_with_media_and_rf, spec.ModelSpec()
+    )
+    self.assertIsNone(model_context.compiled_holdout_id)
+
+  def test_compiled_holdout_id_passes_through_legacy_array(self):
+    data = self.input_data_with_media_and_rf
+    legacy = np.zeros((len(data.geo), len(data.time)), dtype=bool)
+    legacy[0, :5] = True
+    model_context = self._context(data, spec.ModelSpec(holdout_id=legacy))
+    np.testing.assert_array_equal(model_context.compiled_holdout_id, legacy)
+
+  def test_compiled_holdout_id_prefers_legacy_over_declarative(self):
+    data = self.input_data_with_media_and_rf
+    dates = data.time_coordinates.all_dates
+    legacy = np.zeros((len(data.geo), len(dates)), dtype=bool)
+    legacy[0, :5] = True
+    with self.assertWarns(UserWarning):
+      model_spec = spec.ModelSpec(
+          holdout=spec.HoldoutSpec(spec=[spec.DateRange(dates[10], dates[20])]),
+          holdout_id=legacy,
+      )
+    model_context = self._context(data, model_spec)
+    np.testing.assert_array_equal(model_context.compiled_holdout_id, legacy)
+
+  def test_compiled_holdout_id_global_date_ranges(self):
+    """A global holdout applies the same date mask to every geo."""
+    data = self.input_data_with_media_and_rf
+    dates = data.time_coordinates.all_dates
+    n_geos = len(data.geo)
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(spec=[spec.DateRange(dates[10], dates[20])])
+    )
+    compiled = self._context(data, model_spec).compiled_holdout_id
+
+    assert compiled is not None
+    self.assertEqual(compiled.shape, (n_geos, len(dates)))
+    expected_row = np.zeros(len(dates), dtype=bool)
+    expected_row[10:21] = True
+    for geo in range(n_geos):
+      np.testing.assert_array_equal(compiled[geo], expected_row)
+
+  def test_compiled_holdout_id_per_geo(self):
+    """Geos the spec does not name are simply not held out."""
+    data = self.input_data_with_media_and_rf
+    dates = data.time_coordinates.all_dates
+    geos = [str(geo) for geo in data.geo.values]
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(
+            spec=[
+                spec.GeoHoldoutSpec(
+                    geos=[geos[1]],
+                    date_ranges=[spec.DateRange(dates[10], dates[20])],
+                )
+            ]
+        )
+    )
+    compiled = self._context(data, model_spec).compiled_holdout_id
+
+    assert compiled is not None
+    expected = np.zeros((len(geos), len(dates)), dtype=bool)
+    expected[1, 10:21] = True
+    np.testing.assert_array_equal(compiled, expected)
+
+  def test_compiled_holdout_id_unknown_geo_fails(self):
+    data = self.input_data_with_media_and_rf
+    dates = data.time_coordinates.all_dates
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(
+            spec=[
+                spec.GeoHoldoutSpec(
+                    geos=["not_a_geo"],
+                    date_ranges=[spec.DateRange(dates[0], dates[5])],
+                )
+            ]
+        )
+    )
+    with self.assertRaisesRegex(
+        ValueError,
+        r"`holdout` refers to geos that are not in the input data:"
+        r" \['not_a_geo'\]",
+    ):
+      _ = self._context(data, model_spec)
+
+  def test_compiled_holdout_id_random_holds_out_exact_ratio_per_geo(self):
+    """The draw is stratified: every geo holds out the same exact count."""
+    data = self.input_data_with_media_and_rf
+    n_times = len(data.time)
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(
+            spec=spec.RandomHoldoutSpec(ratio=0.2, seed=17)
+        )
+    )
+    compiled = self._context(data, model_spec).compiled_holdout_id
+
+    assert compiled is not None
+    self.assertEqual(compiled.shape, (len(data.geo), n_times))
+    expected_per_geo = round(0.2 * n_times)
+    np.testing.assert_array_equal(
+        compiled.sum(axis=1),
+        np.full(len(data.geo), expected_per_geo),
+    )
+    self.assertEqual(compiled.sum(), expected_per_geo * len(data.geo))
+
+  def test_compiled_holdout_id_balanced_random_is_balanced_across_times(self):
+    """Per-time holdout counts differ by at most one across time periods."""
+    data = self.input_data_with_media_and_rf
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(
+            spec=spec.RandomHoldoutSpec(ratio=0.2, seed=17, balanced=True)
+        )
+    )
+    compiled = self._context(data, model_spec).compiled_holdout_id
+
+    assert compiled is not None
+    per_time = compiled.sum(axis=0)
+    self.assertLessEqual(per_time.max() - per_time.min(), 1)
+    # 5 geos x round(0.2 * 200) = 200 cells over 200 periods: exactly one each.
+    np.testing.assert_array_equal(per_time, np.ones(len(data.time)))
+
+  def test_compiled_holdout_id_balanced_random_keeps_exact_ratio_per_geo(
+      self,
+  ):
+    """Balancing across times must not disturb the per-geo count."""
+    data = self.input_data_with_media_and_rf
+    n_times = len(data.time)
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(
+            spec=spec.RandomHoldoutSpec(ratio=0.2, seed=17, balanced=True)
+        )
+    )
+    compiled = self._context(data, model_spec).compiled_holdout_id
+
+    assert compiled is not None
+    np.testing.assert_array_equal(
+        compiled.sum(axis=1), np.full(len(data.geo), round(0.2 * n_times))
+    )
+
+  def test_compiled_holdout_id_random_draws_differ_across_geos(self):
+    """Stratification must not degenerate into the same draw for every geo."""
+    data = self.input_data_with_media_and_rf
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(
+            spec=spec.RandomHoldoutSpec(ratio=0.2, seed=17)
+        )
+    )
+    compiled = self._context(data, model_spec).compiled_holdout_id
+
+    assert compiled is not None
+    distinct_rows = {row.tobytes() for row in compiled}
+    self.assertLen(distinct_rows, len(data.geo))
+
+  def test_compiled_holdout_id_random_is_reproducible_for_a_seed(self):
+    data = self.input_data_with_media_and_rf
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(
+            spec=spec.RandomHoldoutSpec(ratio=0.3, seed=99)
+        )
+    )
+    first = self._context(data, model_spec).compiled_holdout_id
+    second = self._context(data, model_spec).compiled_holdout_id
+    np.testing.assert_array_equal(first, second)
+
+  def test_compiled_holdout_id_random_is_drawn_only_once(self):
+    """Without a seed the draw is random, so memoization must hold it fixed."""
+    data = self.input_data_with_media_and_rf
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(spec=spec.RandomHoldoutSpec(ratio=0.5))
+    )
+    model_context = self._context(data, model_spec)
+    np.testing.assert_array_equal(
+        model_context.compiled_holdout_id, model_context.compiled_holdout_id
+    )
+
+  def test_compiled_holdout_id_random_rejects_a_ratio_that_holds_out_nothing(
+      self,
+  ):
+    """A ratio too small for the data would silently disable the holdout."""
+    data = self.input_data_with_media_and_rf
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(
+            spec=spec.RandomHoldoutSpec(ratio=0.4 / len(data.time), seed=17)
+        )
+    )
+
+    with self.assertRaisesRegex(ValueError, "rounds to zero of the input data"):
+      _ = self._context(data, model_spec).compiled_holdout_id
+
+  def test_compiled_holdout_id_random_allows_a_single_held_out_period(self):
+    """One period per geo is the smallest viable draw, and it is legal."""
+    data = self.input_data_with_media_and_rf
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(
+            spec=spec.RandomHoldoutSpec(ratio=0.8 / len(data.time), seed=17)
+        )
+    )
+
+    compiled = self._context(data, model_spec).compiled_holdout_id
+
+    assert compiled is not None
+    np.testing.assert_array_equal(compiled.sum(axis=1), np.ones(len(data.geo)))
+
+  def test_compiled_holdout_id_resolved_wins_over_random_spec(self):
+    """A materialized draw is authoritative and is never re-drawn."""
+    data = self.input_data_with_media_and_rf
+    dates = data.time_coordinates.all_dates
+    geos = [str(geo) for geo in data.geo.values]
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(
+            spec=spec.RandomHoldoutSpec(ratio=0.5, seed=3),
+            resolved=[
+                spec.GeoHoldoutSpec(
+                    geos=[geos[0]],
+                    date_ranges=[spec.DateRange(dates[0], dates[5])],
+                )
+            ],
+        )
+    )
+    compiled = self._context(data, model_spec).compiled_holdout_id
+
+    assert compiled is not None
+    expected = np.zeros((len(geos), len(dates)), dtype=bool)
+    expected[0, 0:6] = True
+    np.testing.assert_array_equal(compiled, expected)
+    # A 0.5 draw would have held out roughly half the grid, not 6 cells.
+    self.assertEqual(compiled.sum(), 6)
+
+  def test_compiled_holdout_id_national_is_one_dimensional(self):
+    """National models keep the 1-D convention of the legacy attribute."""
+    data = self.national_input_data_media_and_rf
+    dates = data.time_coordinates.all_dates
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(spec=[spec.DateRange(dates[10], dates[20])])
+    )
+    compiled = self._context(data, model_spec).compiled_holdout_id
+
+    assert compiled is not None
+    self.assertEqual(compiled.shape, (len(dates),))
+    expected = np.zeros(len(dates), dtype=bool)
+    expected[10:21] = True
+    np.testing.assert_array_equal(compiled, expected)
+
+  # --- Population scaling ---------------------------------------------------
+
+  def test_compiled_control_population_scaling_id_unset_is_none(self):
+    model_context = self._context(
+        self.input_data_with_media_and_rf, spec.ModelSpec()
+    )
+    self.assertIsNone(model_context.compiled_control_population_scaling_id)
+
+  def test_compiled_control_population_scaling_id_from_names(self):
+    data = self.input_data_with_media_and_rf
+    assert data.control_variable is not None
+    controls = [str(control) for control in data.control_variable.values]
+    model_spec = spec.ModelSpec(population_scaled_controls=[controls[1]])
+    compiled = self._context(
+        data, model_spec
+    ).compiled_control_population_scaling_id
+
+    expected = np.zeros(len(controls), dtype=bool)
+    expected[1] = True
+    np.testing.assert_array_equal(compiled, expected)
+
+  def test_compiled_control_population_scaling_id_prefers_legacy(self):
+    data = self.input_data_with_media_and_rf
+    assert data.control_variable is not None
+    controls = [str(control) for control in data.control_variable.values]
+    legacy = np.zeros(len(controls), dtype=bool)
+    legacy[0] = True
+    with self.assertWarns(UserWarning):
+      model_spec = spec.ModelSpec(
+          population_scaled_controls=[controls[1]],
+          control_population_scaling_id=legacy,
+      )
+    compiled = self._context(
+        data, model_spec
+    ).compiled_control_population_scaling_id
+    np.testing.assert_array_equal(compiled, legacy)
+
+  def test_compiled_control_population_scaling_id_unknown_name_fails(self):
+    data = self.input_data_with_media_and_rf
+    model_spec = spec.ModelSpec(population_scaled_controls=["not_a_control"])
+    with self.assertRaisesRegex(
+        ValueError,
+        r"`population_scaled_controls` refers to control variables that are not"
+        r" in the input data: \['not_a_control'\]",
+    ):
+      _ = self._context(data, model_spec)
+
+  def test_compiled_non_media_population_scaling_id_from_names(self):
+    data = self.input_data_non_media_and_organic
+    assert data.non_media_channel is not None
+    channels = [str(channel) for channel in data.non_media_channel.values]
+    model_spec = spec.ModelSpec(
+        population_scaled_non_media_channels=[channels[0]]
+    )
+    compiled = self._context(
+        data, model_spec
+    ).compiled_non_media_population_scaling_id
+
+    expected = np.zeros(len(channels), dtype=bool)
+    expected[0] = True
+    np.testing.assert_array_equal(compiled, expected)
+
+  def test_compiled_non_media_population_scaling_id_unknown_name_fails(self):
+    data = self.input_data_non_media_and_organic
+    model_spec = spec.ModelSpec(
+        population_scaled_non_media_channels=["not_a_channel"]
+    )
+    with self.assertRaisesRegex(
+        ValueError,
+        r"`population_scaled_non_media_channels` refers to non-media channels"
+        r" that are not in the input data: \['not_a_channel'\]",
+    ):
+      _ = self._context(data, model_spec)
+
+  # --- Non-media baseline values --------------------------------------------
+
+  def test_compiled_non_media_baseline_values_unset_is_none(self):
+    model_context = self._context(
+        self.input_data_non_media_and_organic, spec.ModelSpec()
+    )
+    self.assertIsNone(model_context.compiled_non_media_baseline_values)
+
+  def test_compiled_non_media_baseline_values_sequence_is_passed_through(self):
+    data = self.input_data_non_media_and_organic
+    model_spec = spec.ModelSpec(non_media_baseline_values=["max", 1.5])
+    self.assertEqual(
+        self._context(data, model_spec).compiled_non_media_baseline_values,
+        ["max", 1.5],
+    )
+
+  def test_compiled_non_media_baseline_values_mapping_defaults_to_min(self):
+    """A mapping only names the channels that differ from the default."""
+    data = self.input_data_non_media_and_organic
+    assert data.non_media_channel is not None
+    channels = [str(channel) for channel in data.non_media_channel.values]
+    model_spec = spec.ModelSpec(non_media_baseline_values={channels[1]: "max"})
+    self.assertEqual(
+        self._context(data, model_spec).compiled_non_media_baseline_values,
+        [constants.NON_MEDIA_BASELINE_MIN, "max"],
+    )
+
+  def test_compiled_non_media_baseline_values_unknown_channel_fails(self):
+    data = self.input_data_non_media_and_organic
+    model_spec = spec.ModelSpec(
+        non_media_baseline_values={"not_a_channel": "max"}
+    )
+    with self.assertRaisesRegex(
+        ValueError,
+        r"`non_media_baseline_values` refers to non-media channels that are not"
+        r" in the input data: \['not_a_channel'\]",
+    ):
+      _ = self._context(data, model_spec)
+
+
+class CompiledModelSpecConsumerTest(
+    test_utils.MeridianTestCase,
+    model_test_data.WithInputDataSamples,
+):
+  """Tests that `ModelContext`'s consumers read the compiled model spec.
+
+  `CompiledModelSpecTest` covers the `compiled_*` properties in isolation.
+  These cases cover the layer above them: the properties the model engine
+  actually reads -- `holdout_id`, the two population-scaling transformers, and
+  the media and RF tensors -- must derive from the compiled values. A
+  legacy-only model must be unaffected, and a declaratively specified model
+  must behave like the legacy model it is equivalent to.
+  """
+
+  input_data_samples = model_test_data.WithInputDataSamples
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    model_test_data.WithInputDataSamples.setup()
+
+  def _context(
+      self,
+      data: input_data.InputData,
+      model_spec: spec.ModelSpec,
+  ) -> context.ModelContext:
+    return context.ModelContext(input_data=data, model_spec=model_spec)
+
+  def _assert_population_scaled_columns(
+      self,
+      transformer: Any,
+      expected_selection: Sequence[bool],
+  ):
+    """Asserts the transformer scales exactly the selected columns.
+
+    `CenteringAndScalingTransformer` stores a `(n_geos, n_channels)` factor
+    matrix whose column is the geo populations where the channel is selected
+    and all ones where it is not. Asserting against ones rather than against
+    the populations keeps the check exact and independent of the float dtype.
+
+    Args:
+      transformer: The `CenteringAndScalingTransformer` under test.
+      expected_selection: One boolean per channel, in channel order.
+    """
+    factors = transformer._population_scaling_factors  # pylint: disable=protected-access
+    self.assertIsNotNone(factors)
+    ones = backend.ones_like(factors[:, 0])
+    for channel, selected in enumerate(expected_selection):
+      if selected:
+        test_utils.assert_not_allequal(
+            factors[:, channel],
+            ones,
+            err_msg=f"Channel {channel} should be scaled by population.",
+        )
+      else:
+        test_utils.assert_allequal(
+            factors[:, channel],
+            ones,
+            err_msg=f"Channel {channel} should not be scaled by population.",
+        )
+
+  # --- `holdout_id` ---------------------------------------------------------
+
+  def test_holdout_id_from_legacy_array(self):
+    data = self.input_data_with_media_and_rf
+    legacy = np.zeros((len(data.geo), len(data.time)), dtype=bool)
+    legacy[0, :5] = True
+    model_context = self._context(data, spec.ModelSpec(holdout_id=legacy))
+    test_utils.assert_allequal(model_context.holdout_id, legacy)
+
+  def test_holdout_id_national_legacy_array_gains_leading_axis(self):
+    """A national model carries a 1-D holdout, broadcast to a single geo."""
+    data = self.national_input_data_media_and_rf
+    legacy = np.zeros((len(data.time),), dtype=bool)
+    legacy[:5] = True
+    model_context = self._context(data, spec.ModelSpec(holdout_id=legacy))
+    test_utils.assert_allequal(model_context.holdout_id, legacy[np.newaxis, :])
+
+  def test_holdout_id_from_declarative_spec(self):
+    data = self.input_data_with_media_and_rf
+    dates = data.time_coordinates.all_dates
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(spec=[spec.DateRange(dates[10], dates[20])])
+    )
+    expected = np.zeros((len(data.geo), len(dates)), dtype=bool)
+    # `[start, end]`: both index 10 and index 20 are included.
+    expected[:, 10:21] = True
+    test_utils.assert_allequal(
+        self._context(data, model_spec).holdout_id, expected
+    )
+
+  def test_holdout_id_national_declarative_spec_gains_leading_axis(self):
+    data = self.national_input_data_media_and_rf
+    dates = data.time_coordinates.all_dates
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(spec=[spec.DateRange(dates[10], dates[20])])
+    )
+    expected = np.zeros((1, len(dates)), dtype=bool)
+    expected[0, 10:21] = True
+    test_utils.assert_allequal(
+        self._context(data, model_spec).holdout_id, expected
+    )
+
+  def test_holdout_id_prefers_legacy_over_declarative(self):
+    data = self.input_data_with_media_and_rf
+    dates = data.time_coordinates.all_dates
+    legacy = np.zeros((len(data.geo), len(dates)), dtype=bool)
+    legacy[0, :5] = True
+    with self.assertWarns(UserWarning):
+      model_spec = spec.ModelSpec(
+          holdout=spec.HoldoutSpec(spec=[spec.DateRange(dates[10], dates[20])]),
+          holdout_id=legacy,
+      )
+    declarative = np.zeros((len(data.geo), len(dates)), dtype=bool)
+    declarative[:, 10:21] = True
+
+    holdout_id = self._context(data, model_spec).holdout_id
+    test_utils.assert_allequal(holdout_id, legacy)
+    test_utils.assert_not_allequal(holdout_id, declarative)
+
+  def test_both_holdout_attributes_warn_that_legacy_takes_precedence(self):
+    """Pins the warning text to the precedence the context actually applies."""
+    data = self.input_data_with_media_and_rf
+    dates = data.time_coordinates.all_dates
+    legacy = np.zeros((len(data.geo), len(dates)), dtype=bool)
+    legacy[0, :5] = True
+    with self.assertWarnsRegex(
+        UserWarning,
+        r"`holdout_id` takes precedence for backward compatibility",
+    ):
+      spec.ModelSpec(
+          holdout=spec.HoldoutSpec(spec=[spec.DateRange(dates[10], dates[20])]),
+          holdout_id=legacy,
+      )
+
+  # --- Population scaling ---------------------------------------------------
+
+  def test_controls_transformer_scales_legacy_selected_controls(self):
+    data = self.input_data_with_media_and_rf
+    assert data.control_variable is not None
+    legacy = np.zeros(len(data.control_variable), dtype=bool)
+    legacy[1] = True
+    model_context = self._context(
+        data, spec.ModelSpec(control_population_scaling_id=legacy)
+    )
+    self._assert_population_scaled_columns(
+        model_context.controls_transformer, [False, True]
+    )
+
+  def test_controls_transformer_scales_declaratively_named_controls(self):
+    data = self.input_data_with_media_and_rf
+    assert data.control_variable is not None
+    controls = [str(control) for control in data.control_variable.values]
+    model_context = self._context(
+        data, spec.ModelSpec(population_scaled_controls=[controls[1]])
+    )
+    self._assert_population_scaled_columns(
+        model_context.controls_transformer, [False, True]
+    )
+
+  def test_controls_transformer_prefers_legacy_over_declarative(self):
+    data = self.input_data_with_media_and_rf
+    assert data.control_variable is not None
+    controls = [str(control) for control in data.control_variable.values]
+    legacy = np.zeros(len(controls), dtype=bool)
+    legacy[0] = True
+    with self.assertWarns(UserWarning):
+      model_spec = spec.ModelSpec(
+          population_scaled_controls=[controls[1]],
+          control_population_scaling_id=legacy,
+      )
+    # The two selections are disjoint, so the assertion cannot pass vacuously.
+    self._assert_population_scaled_columns(
+        self._context(data, model_spec).controls_transformer, [True, False]
+    )
+
+  def test_non_media_transformer_scales_declaratively_named_channels(self):
+    data = self.input_data_non_media_and_organic
+    assert data.non_media_channel is not None
+    channels = [str(channel) for channel in data.non_media_channel.values]
+    model_context = self._context(
+        data,
+        spec.ModelSpec(population_scaled_non_media_channels=[channels[1]]),
+    )
+    self._assert_population_scaled_columns(
+        model_context.non_media_transformer, [False, True]
+    )
+
+  def test_non_media_transformer_prefers_legacy_over_declarative(self):
+    data = self.input_data_non_media_and_organic
+    assert data.non_media_channel is not None
+    channels = [str(channel) for channel in data.non_media_channel.values]
+    legacy = np.zeros(len(channels), dtype=bool)
+    legacy[0] = True
+    with self.assertWarns(UserWarning):
+      model_spec = spec.ModelSpec(
+          population_scaled_non_media_channels=[channels[1]],
+          non_media_population_scaling_id=legacy,
+      )
+    self._assert_population_scaled_columns(
+        self._context(data, model_spec).non_media_transformer, [True, False]
+    )
+
+  # --- ROI calibration ------------------------------------------------------
+
+  def test_media_tensors_honor_declarative_roi_calibration(self):
+    """A declarative calibration period produces the legacy tensors exactly."""
+    data = self.input_data_with_media_and_rf
+    dates = data.media_time_coordinates.all_dates
+    assert data.media_channel is not None
+    legacy = np.zeros((len(dates), len(data.media_channel)), dtype=bool)
+    legacy[10:21, :] = True
+    legacy_tensors = self._context(
+        data,
+        spec.ModelSpec(
+            media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+            roi_calibration_period=legacy,
+        ),
+    ).media_tensors
+    declarative_tensors = self._context(
+        data,
+        spec.ModelSpec(
+            media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+            roi_calibration=spec.CalibrationSpec(
+                spec=[spec.DateRange(dates[10], dates[20])]
+            ),
+        ),
+    ).media_tensors
+
+    # Before the calibration period was threaded through from the context, a
+    # declarative spec left this `None` and the model calibrated over the
+    # whole time window.
+    self.assertIsNotNone(declarative_tensors.prior_media_scaled_counterfactual)
+    test_utils.assert_allclose(
+        declarative_tensors.prior_media_scaled_counterfactual,
+        legacy_tensors.prior_media_scaled_counterfactual,
+    )
+    test_utils.assert_allclose(
+        declarative_tensors.prior_denominator,
+        legacy_tensors.prior_denominator,
+    )
+
+  def test_media_tensors_prefer_legacy_roi_calibration_period(self):
+    data = self.input_data_with_media_and_rf
+    dates = data.media_time_coordinates.all_dates
+    assert data.media_channel is not None
+    n_media_channels = len(data.media_channel)
+    legacy = np.zeros((len(dates), n_media_channels), dtype=bool)
+    legacy[:5, :] = True
+    declarative = spec.CalibrationSpec(
+        spec=[spec.DateRange(dates[10], dates[20])]
+    )
+    with self.assertWarns(UserWarning):
+      both = spec.ModelSpec(
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+          roi_calibration=declarative,
+          roi_calibration_period=legacy,
+      )
+
+    counterfactual = self._context(
+        data, both
+    ).media_tensors.prior_media_scaled_counterfactual
+    test_utils.assert_allclose(
+        counterfactual,
+        self._context(
+            data,
+            spec.ModelSpec(
+                media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+                roi_calibration_period=legacy,
+            ),
+        ).media_tensors.prior_media_scaled_counterfactual,
+    )
+    # The two periods are disjoint, so this distinguishes them.
+    test_utils.assert_not_allequal(
+        counterfactual,
+        self._context(
+            data,
+            spec.ModelSpec(
+                media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+                roi_calibration=declarative,
+            ),
+        ).media_tensors.prior_media_scaled_counterfactual,
+    )
+
+  def test_rf_tensors_honor_declarative_roi_calibration(self):
+    data = self.input_data_with_media_and_rf
+    dates = data.media_time_coordinates.all_dates
+    assert data.rf_channel is not None
+    legacy = np.zeros((len(dates), len(data.rf_channel)), dtype=bool)
+    legacy[10:21, :] = True
+    legacy_tensors = self._context(
+        data,
+        spec.ModelSpec(
+            rf_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+            rf_roi_calibration_period=legacy,
+        ),
+    ).rf_tensors
+    declarative_tensors = self._context(
+        data,
+        spec.ModelSpec(
+            rf_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+            rf_roi_calibration=spec.CalibrationSpec(
+                spec=[spec.DateRange(dates[10], dates[20])]
+            ),
+        ),
+    ).rf_tensors
+
+    self.assertIsNotNone(declarative_tensors.prior_reach_scaled_counterfactual)
+    test_utils.assert_allclose(
+        declarative_tensors.prior_reach_scaled_counterfactual,
+        legacy_tensors.prior_reach_scaled_counterfactual,
+    )
+    test_utils.assert_allclose(
+        declarative_tensors.prior_denominator,
+        legacy_tensors.prior_denominator,
+    )
+
+
+class HoldoutMaskInversionTest(parameterized.TestCase):
+  """Tests inverting a resolved holdout mask back into declarative ranges."""
+
+  # Five weekly coordinates, so that a run can start at the first index, end at
+  # the last, and be separated from another run by exactly one period.
+  _DATES = (
+      datetime.date(2021, 1, 4),
+      datetime.date(2021, 1, 11),
+      datetime.date(2021, 1, 18),
+      datetime.date(2021, 1, 25),
+      datetime.date(2021, 2, 1),
+  )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="single_period_at_the_first_index",
+          mask=[1, 0, 0, 0, 0],
+          expected=[(0, 0)],
+      ),
+      dict(
+          testcase_name="single_period_at_the_last_index",
+          mask=[0, 0, 0, 0, 1],
+          expected=[(4, 4)],
+      ),
+      dict(
+          testcase_name="single_period_in_the_middle",
+          mask=[0, 0, 1, 0, 0],
+          expected=[(2, 2)],
+      ),
+      dict(
+          testcase_name="two_runs_separated_by_one_period",
+          mask=[1, 1, 0, 1, 1],
+          expected=[(0, 1), (3, 4)],
+      ),
+      dict(
+          testcase_name="two_runs_separated_by_two_periods",
+          mask=[1, 0, 0, 1, 1],
+          expected=[(0, 0), (3, 4)],
+      ),
+      dict(
+          testcase_name="run_ending_at_the_last_index",
+          mask=[0, 0, 1, 1, 1],
+          expected=[(2, 4)],
+      ),
+      dict(
+          testcase_name="every_period",
+          mask=[1, 1, 1, 1, 1],
+          expected=[(0, 4)],
+      ),
+      dict(
+          testcase_name="alternating_periods",
+          mask=[1, 0, 1, 0, 1],
+          expected=[(0, 0), (2, 2), (4, 4)],
+      ),
+      dict(testcase_name="no_period", mask=[0, 0, 0, 0, 0], expected=[]),
+  )
+  def test_contiguous_runs_become_one_closed_range_each(
+      self, mask: list[int], expected: list[tuple[int, int]]
+  ):
+    """Two runs one period apart must not be merged into one range.
+
+    The separating period is not held out. Merging the runs would quietly add
+    it to the holdout, which is the off-by-one this inversion is most prone to.
+    """
+    ranges = context._contiguous_date_ranges(  # pylint: disable=protected-access
+        np.array(mask, dtype=bool), self._DATES
+    )
+
+    self.assertEqual(
+        ranges,
+        [
+            spec.DateRange(self._DATES[start], self._DATES[end])
+            for start, end in expected
+        ],
+    )
+
+  def test_geo_with_nothing_held_out_is_omitted(self):
+    """A geo no entry mentions is not held out, so it needs no entry."""
+    mask = np.array(
+        [[1, 1, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 1, 1]], dtype=bool
+    )
+
+    geo_specs = context._mask_to_geo_holdout_specs(  # pylint: disable=protected-access
+        mask, self._DATES, ["geo_0", "geo_1", "geo_2"]
+    )
+
+    self.assertEqual(
+        geo_specs,
+        [
+            spec.GeoHoldoutSpec(
+                geos=["geo_0"],
+                date_ranges=[spec.DateRange(self._DATES[0], self._DATES[1])],
+            ),
+            spec.GeoHoldoutSpec(
+                geos=["geo_2"],
+                date_ranges=[spec.DateRange(self._DATES[3], self._DATES[4])],
+            ),
+        ],
+    )
+
+
+class DrawRandomHoldoutTest(parameterized.TestCase):
+  """Tests the guarantees of `_draw_random_holdout`."""
+
+  @parameterized.named_parameters(
+      # 3 x round(0.3 * 7) = 6 cells over 7 periods: counts in {0, 1}.
+      dict(testcase_name="fewer_cells_than_periods", n_geos=3, n_times=7),
+      # 7 x round(0.3 * 5) = 14 cells over 5 periods: counts in {2, 3}.
+      dict(testcase_name="more_cells_than_periods", n_geos=7, n_times=5),
+      # 5 x round(0.3 * 10) = 15 cells over 10 periods: counts in {1, 2}.
+      dict(testcase_name="cells_wrap_around_periods", n_geos=5, n_times=10),
+      dict(testcase_name="single_geo", n_geos=1, n_times=13),
+      # round(0.3 * 1) is zero, so the only period needs a larger ratio.
+      dict(testcase_name="single_period", n_geos=4, n_times=1, ratio=0.6),
+      dict(testcase_name="many_geos", n_geos=50, n_times=13),
+  )
+  def test_balanced_draw_is_balanced_across_geos_and_times(
+      self, n_geos, n_times, ratio=0.3
+  ):
+    n_holdout = min(round(ratio * n_times), n_times)
+    for seed in range(5):
+      mask = context._draw_random_holdout(
+          spec.RandomHoldoutSpec(ratio=ratio, seed=seed, balanced=True),
+          n_geos,
+          n_times,
+      )
+      with self.subTest(seed=seed):
+        self.assertEqual(mask.shape, (n_geos, n_times))
+        self.assertEqual(mask.dtype, bool)
+        np.testing.assert_array_equal(
+            mask.sum(axis=1), np.full(n_geos, n_holdout)
+        )
+        per_time = mask.sum(axis=0)
+        self.assertLessEqual(per_time.max() - per_time.min(), 1)
+        total = n_geos * n_holdout
+        self.assertEqual(per_time.min(), total // n_times)
+        self.assertEqual(per_time.max(), -(-total // n_times))
+
+  def test_balanced_draw_does_not_force_adjacent_geos_to_be_disjoint(self):
+    """Pairwise trades break up the disjoint geo groups left by the fill.
+
+    With 20 periods held out of 100, the initial fill partitions geos into
+    groups of five with pairwise-disjoint holdouts. Under a uniform balanced
+    draw any two geos would instead share about 20 * 20 / 100 = 4 periods on
+    average (slightly less, since the column sums are fixed). The trades should
+    bring adjacent geos in input order back near that figure.
+    """
+    n_geos, n_times = 50, 100
+    overlaps = []
+    for seed in range(5):
+      mask = context._draw_random_holdout(
+          spec.RandomHoldoutSpec(ratio=0.2, seed=seed, balanced=True),
+          n_geos,
+          n_times,
+      )
+      overlaps.append(
+          np.mean(
+              [np.sum(mask[geo] & mask[geo + 1]) for geo in range(n_geos - 1)]
+          )
+      )
+    self.assertGreater(min(overlaps), 2.0)
+    self.assertLess(max(overlaps), 6.0)
+
+  def test_unbalanced_draw_holds_out_exact_count_per_geo_only(self):
+    """The default draw is stratified by geo but not balanced across times."""
+    n_geos, n_times = 50, 100
+    mask = context._draw_random_holdout(
+        spec.RandomHoldoutSpec(ratio=0.2, seed=0), n_geos, n_times
+    )
+    np.testing.assert_array_equal(mask.sum(axis=1), np.full(n_geos, 20))
+    # Independent per-geo samples leave the per-time counts spread out well
+    # beyond the +/- 1 that a balanced draw guarantees.
+    per_time = mask.sum(axis=0)
+    self.assertGreater(per_time.max() - per_time.min(), 1)
+
+  def test_balanced_draw_is_reproducible_for_a_seed(self):
+    first = context._draw_random_holdout(
+        spec.RandomHoldoutSpec(ratio=0.2, seed=5, balanced=True), 12, 30
+    )
+    second = context._draw_random_holdout(
+        spec.RandomHoldoutSpec(ratio=0.2, seed=5, balanced=True), 12, 30
+    )
+    np.testing.assert_array_equal(first, second)
+
+  def test_balanced_draw_breaks_ties_at_random(self):
+    """Equally held-out periods are not always picked in index order."""
+    masks = {
+        context._draw_random_holdout(
+            spec.RandomHoldoutSpec(ratio=0.5, seed=seed, balanced=True),
+            n_geos=1,
+            n_times=20,
+        ).tobytes()
+        for seed in range(10)
+    }
+    self.assertGreater(len(masks), 1)
+
+
+class ResolvedRandomHoldoutTest(
+    test_utils.MeridianTestCase,
+    model_test_data.WithInputDataSamples,
+):
+  """Tests `ModelContext.resolved_random_holdout`."""
+
+  input_data_samples = model_test_data.WithInputDataSamples
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    model_test_data.WithInputDataSamples.setup()
+
+  def _context(
+      self,
+      model_spec: spec.ModelSpec,
+      data: input_data.InputData | None = None,
+  ) -> context.ModelContext:
+    return context.ModelContext(
+        input_data=self.input_data_with_media_and_rf if data is None else data,
+        model_spec=model_spec,
+    )
+
+  def test_the_draw_recompiles_to_the_same_mask(self):
+    """The inversion must be faithful, or a saved model reloads differently."""
+    drawn = self._context(
+        spec.ModelSpec(
+            holdout=spec.HoldoutSpec(spec=spec.RandomHoldoutSpec(ratio=0.2))
+        )
+    )
+    resolved = drawn.resolved_random_holdout
+    self.assertIsNotNone(resolved)
+
+    recompiled = self._context(
+        spec.ModelSpec(
+            holdout=spec.HoldoutSpec(
+                spec=spec.RandomHoldoutSpec(ratio=0.2), resolved=resolved
+            )
+        )
+    )
+
+    np.testing.assert_array_equal(
+        recompiled.compiled_holdout_id, drawn.compiled_holdout_id
+    )
+
+  def test_national_draw_recompiles_to_the_same_mask(self):
+    """A national model's mask is 1-D and still inverts to one geo entry."""
+    data = self.national_input_data_media_and_rf
+    drawn = self._context(
+        spec.ModelSpec(
+            holdout=spec.HoldoutSpec(spec=spec.RandomHoldoutSpec(ratio=0.2))
+        ),
+        data,
+    )
+    resolved = drawn.resolved_random_holdout
+    self.assertLen(resolved, 1)
+
+    recompiled = self._context(
+        spec.ModelSpec(
+            holdout=spec.HoldoutSpec(
+                spec=spec.RandomHoldoutSpec(ratio=0.2), resolved=resolved
+            )
+        ),
+        data,
+    )
+
+    np.testing.assert_array_equal(
+        recompiled.compiled_holdout_id, drawn.compiled_holdout_id
+    )
+
+  def test_holdout_id_leaves_no_draw_to_record(self):
+    """`holdout_id` governs, so the random spec never drew anything.
+
+    Recording a draw here would misrepresent the user's own array as the
+    outcome of a draw that did not happen.
+    """
+    legacy = np.zeros(
+        [
+            len(self.input_data_with_media_and_rf.geo),
+            len(self.input_data_with_media_and_rf.time),
+        ],
+        dtype=bool,
+    )
+    legacy[:, :3] = True
+    with warnings.catch_warnings():
+      warnings.simplefilter("ignore")
+      model_spec = spec.ModelSpec(
+          holdout=spec.HoldoutSpec(spec=spec.RandomHoldoutSpec(ratio=0.2)),
+          holdout_id=legacy,
+      )
+
+    self.assertIsNone(self._context(model_spec).resolved_random_holdout)
+
+  def test_an_existing_resolved_draw_is_returned_unchanged(self):
+    """A `resolved` draw is authoritative and must never be re-drawn."""
+    dates = self.input_data_with_media_and_rf.time_coordinates.all_dates
+    geos = [str(geo) for geo in self.input_data_with_media_and_rf.geo.values]
+    resolved = [
+        spec.GeoHoldoutSpec(
+            geos=[geos[0]], date_ranges=[spec.DateRange(dates[0], dates[2])]
+        )
+    ]
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(
+            spec=spec.RandomHoldoutSpec(ratio=0.2), resolved=resolved
+        )
+    )
+
+    returned = self._context(model_spec).resolved_random_holdout
+
+    self.assertIsNotNone(returned)
+    assert returned is not None  # Narrows the type for the comparison below.
+    self.assertEqual(list(returned), resolved)
+
+  def test_a_declarative_date_range_holdout_is_not_a_draw(self):
+    dates = self.input_data_with_media_and_rf.time_coordinates.all_dates
+    model_spec = spec.ModelSpec(
+        holdout=spec.HoldoutSpec(spec=[spec.DateRange(dates[0], dates[2])])
+    )
+
+    self.assertIsNone(self._context(model_spec).resolved_random_holdout)
+
+  def test_no_holdout_has_no_draw(self):
+    self.assertIsNone(self._context(spec.ModelSpec()).resolved_random_holdout)
+
+
+_ModelSpecWithChangepoints = spec._ModelSpecWithChangepoints  # pylint: disable=protected-access
+_PriorDistributionWithChangepoints = (
+    prior_distribution._PriorDistributionWithChangepoints  # pylint: disable=protected-access
+)
+
+
+def _normal_prior() -> backend.tfd.Distribution:
+  """A prior that allows negative values."""
+  return backend.tfd.Normal(
+      backend.np_float_dtype(0.5), backend.np_float_dtype(1.0)
+  )
+
+
+class ChangepointsTest(
+    test_utils.MeridianTestCase,
+    model_test_data.WithInputDataSamples,
+):
+  """Tests the time-varying media effects members of `ModelContext`."""
+
+  # pylint: disable=protected-access
+
+  input_data_samples = model_test_data.WithInputDataSamples
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    model_test_data.WithInputDataSamples.setup()
+
+  def setUp(self):
+    super().setUp()
+    data = self.input_data_with_media_and_rf
+    assert data.media_channel is not None and data.rf_channel is not None
+    self.media = [str(name) for name in data.media_channel.values]
+    self.rf = [str(name) for name in data.rf_channel.values]
+    self.dates = data.time_coordinates.all_dates
+
+  def _context(
+      self,
+      model_spec: spec.ModelSpec,
+      data: input_data.InputData | None = None,
+  ) -> context.ModelContext:
+    return context.ModelContext(
+        input_data=(
+            data if data is not None else self.input_data_with_media_and_rf
+        ),
+        model_spec=model_spec,
+    )
+
+  @parameterized.named_parameters(
+      ("model_spec", spec.ModelSpec),
+      ("no_changepoints", _ModelSpecWithChangepoints),
+      (
+          "empty_changepoints",
+          lambda: _ModelSpecWithChangepoints(changepoints={}),
+      ),
+  )
+  def test_model_without_changepoints(
+      self, make_model_spec: Callable[[], spec.ModelSpec]
+  ):
+    model_context = self._context(make_model_spec())
+    self.assertEqual(model_context._changepoints, {})
+    self.assertEqual(model_context._changepoint_max_intervals, 0)
+    self.assertIsNone(model_context._media_changepoint_info)
+    self.assertIsNone(model_context._rf_changepoint_info)
+    self.assertIs(
+        type(model_context.prior_broadcast),
+        prior_distribution.PriorDistribution,
+    )
+    self.assertNotIn(
+        constants.CHANGEPOINT_INTERVAL,
+        model_context.create_inference_data_coords(n_chains=1, n_draws=1),
+    )
+    self.assertNotIn(
+        constants.VARPHI_M, model_context.create_inference_data_dims()
+    )
+
+  def test_changepoint_info_of_media_and_rf_channels(self):
+    model_context = self._context(
+        _ModelSpecWithChangepoints(
+            changepoints={
+                self.rf[0]: [self.dates[100]],
+                self.media[1]: [str(self.dates[50]), self.dates[10]],
+            }
+        )
+    )
+
+    self.assertEqual(
+        model_context._changepoints,
+        {self.media[1]: (10, 50), self.rf[0]: (100,)},
+    )
+    self.assertEqual(model_context._changepoint_max_intervals, 3)
+    media_info = model_context._media_changepoint_info
+    rf_info = model_context._rf_changepoint_info
+    assert media_info is not None and rf_info is not None
+    self.assertEqual(media_info.channel_names, (self.media[1],))
+    self.assertEqual(media_info.channel_indices.tolist(), [1])
+    self.assertEqual(media_info.interval_starts, ((0, 10, 50),))
+    self.assertEqual(media_info.weights.shape, (1, 3, self._N_TIMES))
+    self.assertEqual(media_info.mask.tolist(), [[True, True, True]])
+    self.assertEqual(rf_info.channel_names, (self.rf[0],))
+    self.assertEqual(rf_info.mask.tolist(), [[True, True, False]])
+
+  def test_inference_data_coords_and_dims(self):
+    model_context = self._context(
+        _ModelSpecWithChangepoints(
+            changepoints={
+                self.rf[0]: [self.dates[100]],
+                self.media[1]: [self.dates[50], self.dates[10]],
+            }
+        )
+    )
+    coords = model_context.create_inference_data_coords(n_chains=1, n_draws=1)
+    self.assertEqual(
+        list(coords[constants.CHANGEPOINT_MEDIA_CHANNEL]), [self.media[1]]
+    )
+    self.assertEqual(
+        list(coords[constants.CHANGEPOINT_RF_CHANNEL]), [self.rf[0]]
+    )
+    np.testing.assert_array_equal(
+        coords[constants.CHANGEPOINT_INTERVAL], [0, 1, 2]
+    )
+    dims = model_context.create_inference_data_dims()
+    self.assertEqual(
+        dims[constants.ZETA_RF],
+        [constants.CHAIN, constants.DRAW, constants.CHANGEPOINT_RF_CHANNEL],
+    )
+    self.assertEqual(
+        dims[constants.VARPHI_M],
+        [
+            constants.CHAIN,
+            constants.DRAW,
+            constants.CHANGEPOINT_MEDIA_CHANNEL,
+            constants.CHANGEPOINT_INTERVAL,
+        ],
+    )
+
+  def _calibration(self, *channels: str) -> spec.CalibrationSpec:
+    """Calibrates `channels`, or every channel if none, on part of the data."""
+    dates = self.input_data_with_media_and_rf.media_time_coordinates.all_dates
+    date_ranges = [spec.DateRange(dates[10], dates[20])]
+    if not channels:
+      return spec.CalibrationSpec(spec=date_ranges)
+    return spec.CalibrationSpec(
+        spec=[spec.ChannelCalibrationSpec(list(channels), date_ranges)]
+    )
+
+  @parameterized.named_parameters(
+      ("media_channel", "roi_calibration", "media"),
+      ("all_channels", "roi_calibration", None),
+      ("rf_channel", "rf_roi_calibration", "rf"),
+  )
+  def test_roi_calibration_of_channel_with_changepoints_raises(
+      self, attribute: str, channel_type: str | None
+  ):
+    if channel_type is None:
+      calibration = self._calibration()
+      expected = [self.media[1]]
+    else:
+      channel = self.media[1] if channel_type == "media" else self.rf[0]
+      calibration = self._calibration(channel)
+      expected = [channel]
+    changepoints_spec = {
+        self.media[1]: [self.dates[50]],
+        self.rf[0]: [self.dates[50]],
+    }
+    if attribute == "roi_calibration":
+      model_spec = _ModelSpecWithChangepoints(
+          changepoints=changepoints_spec, roi_calibration=calibration
+      )
+    else:
+      model_spec = _ModelSpecWithChangepoints(
+          changepoints=changepoints_spec, rf_roi_calibration=calibration
+      )
+    with self.assertRaisesRegex(
+        ValueError,
+        "ROI calibration is not supported for channels with `changepoints`.*"
+        + re.escape(f"`{attribute}` sets a calibration period for {expected}"),
+    ):
+      self._context(model_spec)
+
+  def test_legacy_roi_calibration_period_of_channel_with_changepoints_raises(
+      self,
+  ):
+    data = self.input_data_with_media_and_rf
+    period = np.ones((len(data.media_time), len(self.media)), dtype=bool)
+    period[:10, 1] = False
+    model_spec = _ModelSpecWithChangepoints(
+        changepoints={self.media[1]: [self.dates[50]]},
+        roi_calibration_period=period,
+    )
+    with self.assertRaisesRegex(
+        ValueError, "`roi_calibration_period` sets a calibration period"
+    ):
+      self._context(model_spec)
+
+  def test_roi_calibration_of_other_channels_is_allowed(self):
+    model_spec = _ModelSpecWithChangepoints(
+        changepoints={self.media[1]: [self.dates[50]]},
+        roi_calibration=self._calibration(self.media[0]),
+        # A period that covers every media time period doesn't restrict it.
+        rf_roi_calibration=spec.CalibrationSpec(spec=[spec.DateRange()]),
+    )
+    calibration_period = self._context(
+        model_spec
+    ).compiled_roi_calibration_period
+    assert calibration_period is not None
+    self.assertFalse(np.all(calibration_period[:, 0]))
+    self.assertTrue(np.all(calibration_period[:, 1]))
+
+  def test_only_media_channels_have_changepoints(self):
+    model_context = self._context(
+        _ModelSpecWithChangepoints(
+            changepoints={self.media[0]: [self.dates[5]]}
+        )
+    )
+    self.assertIsNotNone(model_context._media_changepoint_info)
+    self.assertIsNone(model_context._rf_changepoint_info)
+
+  def test_changepoints_are_validated_at_model_build(self):
+    with self.assertRaisesRegex(ValueError, "not one of the input data's time"):
+      self._context(
+          _ModelSpecWithChangepoints(
+              changepoints={self.media[0]: ["2000-01-03"]}
+          )
+      )
+
+  def test_organic_channel_raises(self):
+    data = self.input_data_non_media_and_organic
+    assert data.organic_media_channel is not None
+    organic = str(data.organic_media_channel.values[0])
+    with self.assertRaisesRegex(ValueError, "organic media or a non-media"):
+      self._context(
+          _ModelSpecWithChangepoints(
+              changepoints={organic: [data.time_coordinates.all_dates[5]]}
+          ),
+          data=data,
+      )
+
+  def test_prior_broadcast_adds_zeta_priors(self):
+    model_spec = _ModelSpecWithChangepoints(
+        changepoints={
+            self.media[0]: [self.dates[10]],
+            self.media[2]: [self.dates[20]],
+            self.rf[1]: [self.dates[30]],
+        }
+    )
+    broadcast = self._context(model_spec).prior_broadcast
+    expected = self._context(spec.ModelSpec()).prior_broadcast
+
+    self.assertIsInstance(broadcast, _PriorDistributionWithChangepoints)
+    assert isinstance(broadcast, _PriorDistributionWithChangepoints)
+    self.assertEqual(broadcast.zeta_m.batch_shape, (2,))
+    self.assertEqual(broadcast.zeta_rf.batch_shape, (1,))
+    for field in dataclasses.fields(prior_distribution.PriorDistribution):
+      self.assertTrue(
+          prior_distribution.distributions_are_equal(
+              getattr(broadcast, field.name), getattr(expected, field.name)
+          ),
+          msg=field.name,
+      )
+
+  def test_prior_with_changepoints_is_ignored_without_changepoints(self):
+    model_spec = _ModelSpecWithChangepoints(
+        prior=_PriorDistributionWithChangepoints()
+    )
+    with self.assertWarnsRegex(UserWarning, "`zeta_rf` priors are ignored"):
+      broadcast = self._context(model_spec).prior_broadcast
+    expected = self._context(spec.ModelSpec()).prior_broadcast
+
+    self.assertIs(type(broadcast), prior_distribution.PriorDistribution)
+    for field in dataclasses.fields(prior_distribution.PriorDistribution):
+      self.assertTrue(
+          prior_distribution.distributions_are_equal(
+              getattr(broadcast, field.name), getattr(expected, field.name)
+          ),
+          msg=field.name,
+      )
+
+  def test_prior_broadcast_custom_zeta_per_channel(self):
+    zeta_m = backend.tfd.HalfNormal(
+        np.array([0.2, 0.4], dtype=backend.np_float_dtype)
+    )
+    model_spec = _ModelSpecWithChangepoints(
+        prior=_PriorDistributionWithChangepoints(zeta_m=zeta_m),
+        changepoints={
+            self.media[0]: [self.dates[10]],
+            self.media[2]: [self.dates[20]],
+        },
+    )
+    broadcast = self._context(model_spec).prior_broadcast
+    assert isinstance(broadcast, _PriorDistributionWithChangepoints)
+    test_utils.assert_allclose(broadcast.zeta_m.distribution.scale, [0.2, 0.4])
+    self.assertEqual(broadcast.zeta_rf.batch_shape, (0,))
+
+  def test_prior_broadcast_custom_zeta_length_mismatch_raises(self):
+    zeta_m = backend.tfd.HalfNormal(
+        np.array([0.2, 0.4], dtype=backend.np_float_dtype)
+    )
+    model_context = self._context(
+        _ModelSpecWithChangepoints(
+            prior=_PriorDistributionWithChangepoints(zeta_m=zeta_m),
+            changepoints={self.media[0]: [self.dates[10]]},
+        )
+    )
+    with self.assertRaisesRegex(ValueError, "media channels with changepoints"):
+      _ = model_context.prior_broadcast
+
+  def _national_context(
+      self,
+      prior: prior_distribution.PriorDistribution,
+      *,
+      rf: bool,
+      changepoint_media_effects_dist: str = constants.MEDIA_EFFECTS_LOG_NORMAL,
+      prior_type: str = constants.TREATMENT_PRIOR_TYPE_ROI,
+  ) -> context.ModelContext:
+    """Builds a national model with changepoints on one media or RF channel."""
+    data = self.national_input_data_media_and_rf
+    channels = data.rf_channel if rf else data.media_channel
+    assert channels is not None
+    return self._context(
+        _ModelSpecWithChangepoints(
+            prior=prior,
+            changepoints={
+                str(channels.values[0]): [data.time_coordinates.all_dates[50]]
+            },
+            changepoint_media_effects_dist=changepoint_media_effects_dist,
+            media_prior_type=prior_type,
+            changepoint_media_prior_type=prior_type,
+        ),
+        data=data,
+    )
+
+  def test_changepoint_media_effects_dist_applies_to_national_models(self):
+    model_context = self._national_context(
+        prior_distribution.PriorDistribution(), rf=False
+    )
+    self.assertEqual(
+        model_context.media_effects_dist, constants.MEDIA_EFFECTS_NORMAL
+    )
+    self.assertEqual(
+        model_context._changepoint_media_effects_dist,
+        constants.MEDIA_EFFECTS_LOG_NORMAL,
+    )
+
+  @parameterized.named_parameters(("media", False), ("rf", True))
+  def test_negative_prior_of_log_normal_channel_with_changepoints_raises(
+      self, rf: bool
+  ):
+    normal = _normal_prior()
+    if rf:
+      prior = prior_distribution.PriorDistribution(roi_rf=normal)
+      channel = self.national_input_data_media_and_rf.rf_channel
+    else:
+      prior = prior_distribution.PriorDistribution(roi_m=normal)
+      channel = self.national_input_data_media_and_rf.media_channel
+    assert channel is not None
+    with self.assertRaisesRegex(
+        ValueError,
+        re.escape(
+            "Media priors must have non-negative support when"
+            ' `changepoint_media_effects_dist`="log_normal"'
+        ),
+    ):
+      self._national_context(prior, rf=rf)
+
+  def test_negative_prior_check_follows_changepoint_prior_type(self):
+    # The check runs when the channels' prior type is set, like for
+    # `media_prior_type`. `changepoint_media_prior_type` is `'roi'` by default,
+    # so it runs without setting it.
+    data = self.national_input_data_media_and_rf
+    assert data.media_channel is not None
+    with self.assertRaisesRegex(
+        ValueError, "`changepoint_media_effects_dist`"
+    ):
+      self._context(
+          _ModelSpecWithChangepoints(
+              prior=prior_distribution.PriorDistribution(
+                  roi_m=_normal_prior()
+              ),
+              changepoints={
+                  str(data.media_channel.values[0]): [
+                      data.time_coordinates.all_dates[50]
+                  ]
+              },
+          ),
+          data=data,
+      )
+
+  def test_negative_prior_of_normal_channel_with_changepoints_is_allowed(
+      self,
+  ):
+    model_context = self._national_context(
+        prior_distribution.PriorDistribution(roi_m=_normal_prior()),
+        rf=False,
+        changepoint_media_effects_dist=constants.MEDIA_EFFECTS_NORMAL,
+    )
+    self.assertIsNotNone(model_context._media_changepoint_info)
+
+  def _geo_context_with_roi_lower_bounds(
+      self, roi_lower_bounds: Sequence[float]
+  ) -> context.ModelContext:
+    """Builds a geo model whose normal channel `media[1]` has changepoints."""
+    roi_m = backend.tfd.Uniform(
+        low=np.asarray(roi_lower_bounds, dtype=backend.np_float_dtype),
+        high=np.ones(len(roi_lower_bounds), dtype=backend.np_float_dtype),
+    )
+    return self._context(
+        _ModelSpecWithChangepoints(
+            prior=prior_distribution.PriorDistribution(roi_m=roi_m),
+            changepoints={self.media[1]: [self.dates[50]]},
+            changepoint_media_effects_dist=constants.MEDIA_EFFECTS_NORMAL,
+            # The existing check only runs for an explicitly set prior type.
+            media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+        )
+    )
+
+  def test_negative_prior_of_normal_channel_with_changepoints_in_geo_model(
+      self,
+  ):
+    lower_bounds = [0.0] * len(self.media)
+    lower_bounds[1] = -1.0
+    model_context = self._geo_context_with_roi_lower_bounds(lower_bounds)
+    self.assertEqual(
+        model_context.media_effects_dist, constants.MEDIA_EFFECTS_LOG_NORMAL
+    )
+
+  def test_negative_prior_of_log_normal_channel_without_changepoints_raises(
+      self,
+  ):
+    lower_bounds = [0.0] * len(self.media)
+    lower_bounds[0] = -1.0
+    with self.assertRaisesRegex(
+        ValueError, "Media priors must have non-negative support"
+    ):
+      self._geo_context_with_roi_lower_bounds(lower_bounds)
+
+  @parameterized.named_parameters(
+      ("log_normal", constants.MEDIA_EFFECTS_LOG_NORMAL),
+      ("normal", constants.MEDIA_EFFECTS_NORMAL),
+  )
+  def test_prior_length_mismatch_raises_custom_priors_error(
+      self, changepoint_media_effects_dist: str
+  ):
+    roi_m = backend.tfd.LogNormal(
+        np.zeros(len(self.media) - 1, dtype=backend.np_float_dtype),
+        backend.np_float_dtype(1.0),
+    )
+    model_context = self._context(
+        _ModelSpecWithChangepoints(
+            prior=prior_distribution.PriorDistribution(roi_m=roi_m),
+            changepoints={self.media[1]: [self.dates[50]]},
+            changepoint_media_effects_dist=changepoint_media_effects_dist,
+            media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+        )
+    )
+    with self.assertRaisesRegex(ValueError, "Custom priors length"):
+      _ = model_context.prior_broadcast
+
+  @parameterized.named_parameters(("media", False), ("rf", True))
+  def test_prior_tensors_use_changepoint_prior_type(self, rf: bool):
+    channel = self.rf[1] if rf else self.media[1]
+    model_context = self._context(
+        _ModelSpecWithChangepoints(
+            changepoints={channel: [self.dates[10]]},
+            changepoint_media_prior_type="mroi",
+            changepoint_rf_prior_type="mroi",
+        )
+    )
+    roi = self._context(spec.ModelSpec())
+    mroi = self._context(
+        spec.ModelSpec(media_prior_type="mroi", rf_prior_type="mroi")
+    )
+    if rf:
+      tensors, roi_tensors, mroi_tensors = (
+          model_context.rf_tensors,
+          roi.rf_tensors,
+          mroi.rf_tensors,
+      )
+      counterfactual = tensors.prior_reach_scaled_counterfactual
+      mroi_counterfactual = mroi_tensors.prior_reach_scaled_counterfactual
+    else:
+      tensors, roi_tensors, mroi_tensors = (
+          model_context.media_tensors,
+          roi.media_tensors,
+          mroi.media_tensors,
+      )
+      counterfactual = tensors.prior_media_scaled_counterfactual
+      mroi_counterfactual = mroi_tensors.prior_media_scaled_counterfactual
+    expected_denominator = np.array(roi_tensors.prior_denominator)
+    expected_denominator[1] = np.asarray(mroi_tensors.prior_denominator)[1]
+    test_utils.assert_allclose(tensors.prior_denominator, expected_denominator)
+    # ROI priors without calibration have no counterfactual, so zeros.
+    expected_counterfactual = np.zeros_like(np.asarray(mroi_counterfactual))
+    expected_counterfactual[..., 1] = np.asarray(mroi_counterfactual)[..., 1]
+    test_utils.assert_allclose(counterfactual, expected_counterfactual)
+
+  def test_prior_type_of_type_without_changepoints_is_ignored(self):
+    model_context = self._context(
+        _ModelSpecWithChangepoints(
+            changepoints={self.media[0]: [self.dates[10]]},
+            rf_prior_type="coefficient",
+        )
+    )
+    self.assertIsNone(model_context._rf_changepoint_info)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="some_channels_with_changepoints",
+          changepoint_channels=(1,),
+          expected={
+              "coefficient": [True, False, True],
+              "roi": [False, True, False],
+              "mroi": [False, False, False],
+          },
+      ),
+      dict(
+          testcase_name="all_channels_with_changepoints",
+          changepoint_channels=(0, 1, 2),
+          expected={
+              "coefficient": [False, False, False],
+              "roi": [True, True, True],
+          },
+      ),
+      dict(
+          testcase_name="no_changepoints",
+          changepoint_channels=(),
+          expected={
+              "coefficient": [True, True, True],
+              "roi": [False, False, False],
+          },
+      ),
+  )
+  def test_channels_using_prior_type(
+      self,
+      changepoint_channels: Sequence[int],
+      expected: Mapping[str, Sequence[bool]],
+  ):
+    model_context = self._context(
+        _ModelSpecWithChangepoints(
+            changepoints={
+                self.media[channel]: [self.dates[10]]
+                for channel in changepoint_channels
+            },
+            media_prior_type="coefficient",
+            changepoint_media_prior_type="roi",
+        )
+    )
+    for prior_type, uses_prior_type in expected.items():
+      with self.subTest(prior_type):
+        np.testing.assert_array_equal(
+            model_context._channels_using_prior_type(False, prior_type),
+            uses_prior_type,
+        )
+    # The RF channels have no changepoints, so they use `rf_prior_type`.
+    np.testing.assert_array_equal(
+        model_context._channels_using_prior_type(True, "roi"), [True, True]
+    )
+
+  def test_channels_using_prior_type_with_matching_prior_types(self):
+    model_context = self._context(
+        _ModelSpecWithChangepoints(
+            changepoints={self.media[1]: [self.dates[10]]}
+        )
+    )
+    np.testing.assert_array_equal(
+        model_context._channels_using_prior_type(False, "roi"),
+        [True, True, True],
+    )
+
+  def test_channels_using_prior_type_without_channels_of_the_type(self):
+    data = self.input_data_with_media_only
+    assert data.media_channel is not None
+    model_context = self._context(
+        _ModelSpecWithChangepoints(
+            changepoints={
+                str(data.media_channel.values[0]): [
+                    data.time_coordinates.all_dates[10]
+                ]
+            }
+        ),
+        data=data,
+    )
+    self.assertEmpty(model_context._channels_using_prior_type(True, "roi"))
+
+  def test_prior_support_uses_changepoint_prior_type(self):
+    with self.assertRaisesRegex(
+        ValueError, "non-negative support when `changepoint_media_effects_dist`"
+    ):
+      self._national_context(
+          prior_distribution.PriorDistribution(mroi_m=_normal_prior()),
+          rf=False,
+          prior_type="mroi",
+      )
+
+  def test_priors_used_by_channels_with_changepoints_are_not_ignored(self):
+    def custom_prior() -> backend.tfd.Distribution:
+      return backend.tfd.LogNormal(
+          backend.np_float_dtype(0.5), backend.np_float_dtype(0.5)
+      )
+
+    with warnings.catch_warnings(record=True) as caught:
+      warnings.simplefilter("always")
+      self._context(
+          _ModelSpecWithChangepoints(
+              prior=prior_distribution.PriorDistribution(
+                  roi_m=custom_prior(),
+                  beta_m=custom_prior(),
+                  mroi_m=custom_prior(),
+              ),
+              changepoints={self.media[1]: [self.dates[10]]},
+              media_prior_type="coefficient",
+              changepoint_media_prior_type="roi",
+          )
+      )
+    self.assertEqual(
+        [str(w.message) for w in caught if "are ignored" in str(w.message)],
+        [
+            "Custom prior(s) `mroi_m` are ignored when `media_prior_type` is"
+            ' set to "coefficient" and `changepoint_media_prior_type` is set'
+            ' to "roi".'
+        ],
+    )
+
+  def _non_revenue_context(self, **spec_kwargs) -> context.ModelContext:
+    """Builds a non-revenue model without revenue per KPI."""
+    data = self.input_data_non_revenue_no_revenue_per_kpi
+    assert data.media_channel is not None
+    return self._context(
+        _ModelSpecWithChangepoints(
+            changepoints={
+                str(data.media_channel.values[0]): [
+                    data.time_coordinates.all_dates[10]
+                ]
+            },
+            **spec_kwargs,
+        ),
+        data=data,
+    )
+
+  def test_non_revenue_default_mroi_prior_of_channels_with_changepoints(self):
+    with self.assertRaisesRegex(
+        ValueError,
+        "Custom priors should be set on `mroi_m` when"
+        ' `changepoint_media_prior_type` is "mroi"',
+    ):
+      self._non_revenue_context(
+          media_prior_type="coefficient", changepoint_media_prior_type="mroi"
+      )
+
+  @parameterized.named_parameters(
+      (
+          "roi_without_changepoints",
+          "roi",
+          "coefficient",
+          "media_prior_type",
+      ),
+      (
+          "roi_with_changepoints",
+          "coefficient",
+          "roi",
+          "changepoint_media_prior_type",
+      ),
+  )
+  def test_non_revenue_default_roi_prior_of_some_channels_raises(
+      self,
+      media_prior_type: str,
+      changepoint_media_prior_type: str,
+      roi_setting: str,
+  ):
+    # The total media contribution prior needs every paid channel to use the
+    # default ROI prior.
+    with self.assertRaisesRegex(
+        ValueError,
+        f'Custom priors should be set on `roi_m` when `{roi_setting}` is "roi"',
+    ):
+      self._non_revenue_context(
+          media_prior_type=media_prior_type,
+          changepoint_media_prior_type=changepoint_media_prior_type,
+      )
+
+  def _non_revenue_rf_context(
+      self, n_changepoint_channels: int, **spec_kwargs
+  ) -> context.ModelContext:
+    """Builds a non-revenue model with RF channels, without revenue per KPI.
+
+    Args:
+      n_changepoint_channels: The number of RF channels with changepoints.
+      **spec_kwargs: Other arguments of the model spec.
+
+    Returns:
+      The model context.
+    """
+    data = self.input_data_media_and_rf_non_revenue_no_revenue_per_kpi
+    assert data.rf_channel is not None
+    return self._context(
+        _ModelSpecWithChangepoints(
+            changepoints={
+                str(channel): [data.time_coordinates.all_dates[10]]
+                for channel in data.rf_channel.values[:n_changepoint_channels]
+            },
+            **spec_kwargs,
+        ),
+        data=data,
+    )
+
+  @parameterized.named_parameters(
+      ("roi_without_changepoints", "roi", "coefficient"),
+      ("roi_with_changepoints", "coefficient", "roi"),
+  )
+  def test_non_revenue_default_roi_prior_of_some_rf_channels_raises(
+      self, rf_prior_type: str, changepoint_rf_prior_type: str
+  ):
+    # Every media channel uses the default ROI prior, but only some RF channels
+    # do, so the total media contribution prior can't be used.
+    with self.assertRaisesRegex(
+        ValueError,
+        "Custom priors should be set on `roi_m` when `media_prior_type` is"
+        ' "roi"',
+    ):
+      self._non_revenue_rf_context(
+          n_changepoint_channels=1,
+          rf_prior_type=rf_prior_type,
+          changepoint_rf_prior_type=changepoint_rf_prior_type,
+      )
+
+  def test_non_revenue_default_roi_prior_of_rf_channels_with_changepoints(
+      self,
+  ):
+    data = self.input_data_media_and_rf_non_revenue_no_revenue_per_kpi
+    assert data.rf_channel is not None
+    # `rf_prior_type` is ignored, because every RF channel has changepoints.
+    with self.assertWarnsRegex(UserWarning, "total media contribution prior"):
+      model_context = self._non_revenue_rf_context(
+          n_changepoint_channels=len(data.rf_channel),
+          rf_prior_type="coefficient",
+      )
+    self.assertTrue(model_context._set_total_media_contribution_prior)
+
+  def test_non_revenue_default_roi_prior_of_no_rf_channel_is_allowed(self):
+    model_context = self._non_revenue_rf_context(
+        n_changepoint_channels=1,
+        prior=prior_distribution.PriorDistribution(
+            roi_m=backend.tfd.LogNormal(
+                backend.np_float_dtype(0.5), backend.np_float_dtype(0.5)
+            )
+        ),
+        rf_prior_type="coefficient",
+        changepoint_rf_prior_type="contribution",
+    )
+    self.assertFalse(model_context._set_total_media_contribution_prior)
+
+  def _changepoint_warnings(
+      self,
+      changepoints_spec: Mapping[str, Sequence[int]],
+      about: str,
+      data: input_data.InputData | None = None,
+      **spec_kwargs,
+  ) -> tuple[context.ModelContext, list[str]]:
+    """Builds a model and returns some of the warnings of its build.
+
+    Args:
+      changepoints_spec: Maps channels to the time periods of their
+        changepoints.
+      about: Text that the returned warnings contain.
+      data: The input data. Default: a geo model with media and RF channels.
+      **spec_kwargs: Other arguments of the model spec, such as `knots`.
+
+    Returns:
+      The model context, and the messages of the warnings that contain
+      `about`.
+    """
+    data = data if data is not None else self.input_data_with_media_and_rf
+    dates = data.time_coordinates.all_dates
+    with warnings.catch_warnings(record=True) as caught:
+      warnings.simplefilter("always")
+      model_context = self._context(
+          _ModelSpecWithChangepoints(
+              changepoints={
+                  channel: [dates[index] for index in indices]
+                  for channel, indices in changepoints_spec.items()
+              },
+              **spec_kwargs,
+          ),
+          data=data,
+      )
+    messages = [
+        str(warning.message)
+        for warning in caught
+        if about in str(warning.message)
+    ]
+    return model_context, messages
+
+  def _knot_warnings(
+      self,
+      changepoints_spec: Mapping[str, Sequence[int]],
+      data: input_data.InputData | None = None,
+      **spec_kwargs,
+  ) -> tuple[context.ModelContext, list[str]]:
+    """Builds a model and returns the knot warnings of its build."""
+    return self._changepoint_warnings(
+        changepoints_spec, "knots", data=data, **spec_kwargs
+    )
+
+  @parameterized.named_parameters(
+      ("list", [0, 10, 100], 10),
+      ("number", 5, 49),
+      ("default", None, 10),
+  )
+  def test_geo_changepoint_on_knot_warns(
+      self, knots: int | list[int] | None, changepoint: int
+  ):
+    # `knots=5` puts knots at 0, 49, 99, 149 and 199, and the default geo knots
+    # are on every time period.
+    _, knot_warnings = self._knot_warnings(
+        {self.media[0]: [changepoint]}, knots=knots
+    )
+    self.assertEqual(
+        knot_warnings,
+        [
+            "There are overlapping knots (for mu_t) and changepoints (for beta)"
+            " in a geo model. If convergence is an issue, consider dropping"
+            " either one of the overlapping knots or changepoints, or"
+            " replacing the knots with control variables.\nChangepoints on a"
+            f" knot: {self.media[0]}: {self.dates[changepoint].isoformat()}."
+        ],
+    )
+
+  def test_geo_changepoint_on_automatically_selected_knot_warns(self):
+    data, expected_knot_info = (
+        data_test_utils.sample_input_data_for_aks_with_expected_knot_info()
+    )
+    assert data.media_channel is not None
+    channel = str(data.media_channel.values[0])
+    knot = int(expected_knot_info.knot_locations[1])
+    _, knot_warnings = self._knot_warnings(
+        {channel: [knot]}, data=data, enable_aks=True
+    )
+    self.assertLen(knot_warnings, 1)
+    self.assertEndsWith(
+        knot_warnings[0],
+        "Changepoints on a knot:"
+        f" {channel}: {data.time_coordinates.all_dates[knot].isoformat()}.",
+    )
+
+  def test_knot_overlap_warning_lists_each_channel(self):
+    # The default geo knots are on every time period.
+    _, knot_warnings = self._knot_warnings(
+        {self.media[0]: [20, 10], self.rf[0]: [30]}
+    )
+    self.assertLen(knot_warnings, 1)
+    self.assertEndsWith(
+        knot_warnings[0],
+        f"Changepoints on a knot: {self.media[0]}:"
+        f" {self.dates[10].isoformat()}, {self.dates[20].isoformat()};"
+        f" {self.rf[0]}: {self.dates[30].isoformat()}.",
+    )
+
+  def test_geo_changepoint_off_knots_doesnt_warn(self):
+    model_context, knot_warnings = self._knot_warnings(
+        {self.media[0]: [50]}, knots=[0, 10, 100]
+    )
+    self.assertEmpty(knot_warnings)
+    self.assertIsNone(model_context._national_changepoint_knot_error())
+
+  def test_geo_changepoint_on_knot_isnt_an_error(self):
+    model_context, _ = self._knot_warnings(
+        {self.media[0]: [10]}, knots=[0, 10, 100]
+    )
+    self.assertIsNone(model_context._national_changepoint_knot_error())
+
+  def _national_knot_warnings(
+      self, changepoint: int
+  ) -> tuple[context.ModelContext, list[str], str, str]:
+    """Builds a national model with knots at 0, 50 and 100.
+
+    Args:
+      changepoint: The time period of the changepoint of the first media
+        channel.
+
+    Returns:
+      The model context, the messages of the warnings about knots, the channel
+      and the date of the changepoint.
+    """
+    data = self.national_input_data_media_and_rf
+    assert data.media_channel is not None
+    channel = str(data.media_channel.values[0])
+    model_context, knot_warnings = self._knot_warnings(
+        {channel: [changepoint]}, data=data, knots=[0, 50, 100]
+    )
+    date = data.time_coordinates.all_dates[changepoint].isoformat()
+    return model_context, knot_warnings, channel, date
+
+  def test_national_model_with_knots_warns(self):
+    _, knot_warnings, _, _ = self._national_knot_warnings(60)
+    self.assertEqual(
+        knot_warnings,
+        [
+            "You have enabled the time-varying feature with more than one knot"
+            " in a national model. If the model doesn't converge, consider"
+            " using `knots=1` and/or replacing knots with control variables."
+        ],
+    )
+
+  def test_national_changepoint_on_knot_warns_at_build(self):
+    # The build already shows the error that posterior sampling raises.
+    _, knot_warnings, channel, date = self._national_knot_warnings(50)
+    self.assertLen(knot_warnings, 2)
+    self.assertStartsWith(
+        knot_warnings[0],
+        "You have enabled the time-varying feature with more than one knot",
+    )
+    self.assertEqual(
+        knot_warnings[1],
+        "There are overlapping knots (for mu_t) and changepoints (for beta)"
+        " in a national model. The model is unidentifiable and hurts"
+        " convergence. Consider dropping either one of the overlapping knots"
+        " or changepoints, or replacing the knots with control variables.\n"
+        f"Changepoints on a knot: {channel}: {date}.\n"
+        "`sample_posterior` raises this as an error until no changepoint is"
+        " on a knot.",
+    )
+
+  def test_national_changepoint_on_knot_is_an_error(self):
+    model_context, _, channel, date = self._national_knot_warnings(50)
+    self.assertEqual(
+        model_context._national_changepoint_knot_error(),
+        "There are overlapping knots (for mu_t) and changepoints (for beta)"
+        " in a national model. The model is unidentifiable and hurts"
+        " convergence. Consider dropping either one of the overlapping knots"
+        " or changepoints, or replacing the knots with control variables.\n"
+        f"Changepoints on a knot: {channel}: {date}.",
+    )
+
+  def test_national_changepoint_off_knots_isnt_an_error(self):
+    model_context, _, _, _ = self._national_knot_warnings(60)
+    self.assertIsNone(model_context._national_changepoint_knot_error())
+
+  def test_national_model_with_one_knot_doesnt_warn(self):
+    data = self.national_input_data_media_and_rf
+    assert data.rf_channel is not None
+    model_context, knot_warnings = self._knot_warnings(
+        {str(data.rf_channel.values[0]): [50]}, data=data
+    )
+    self.assertEqual(model_context.knot_info.n_knots, 1)
+    self.assertEmpty(knot_warnings)
+    self.assertIsNone(model_context._national_changepoint_knot_error())
+
+  def test_national_knot_error_uses_loaded_knots(self):
+    data = self.national_input_data_media_and_rf
+    assert data.media_channel is not None
+    model_context, _ = self._knot_warnings(
+        {str(data.media_channel.values[0]): [50]}, data=data
+    )
+    self.assertIsNone(model_context._national_changepoint_knot_error())
+    # Loading a saved model can replace the knots after the model is built.
+    model_context._inject_legacy_knot_info_for_serde([0, 50])
+    self.assertIsNotNone(model_context._national_changepoint_knot_error())
+
+  @parameterized.named_parameters(("geo", False), ("national", True))
+  def test_model_without_changepoints_doesnt_check_knots(self, national: bool):
+    data = (
+        self.national_input_data_media_and_rf
+        if national
+        else self.input_data_with_media_and_rf
+    )
+    with warnings.catch_warnings(record=True) as caught:
+      warnings.simplefilter("always")
+      model_context = self._context(
+          spec.ModelSpec(knots=[0, 10, 100]), data=data
+      )
+    self.assertEmpty(
+        [warning for warning in caught if "knots" in str(warning.message)]
+    )
+    self.assertIsNone(model_context._national_changepoint_knot_error())
+    # Neither the build nor the check before posterior sampling computes the
+    # knots.
+    self.assertNotIn("knot_info", vars(model_context))
+
+  def _shared_changepoint_warnings(
+      self,
+      changepoints_spec: Mapping[str, Sequence[int]],
+      data: input_data.InputData | None = None,
+      **spec_kwargs,
+  ) -> tuple[context.ModelContext, list[str]]:
+    """Builds a model and returns its warnings about shared changepoints."""
+    return self._changepoint_warnings(
+        changepoints_spec, "overlapping changepoints", data=data, **spec_kwargs
+    )
+
+  def _national_channels(self) -> tuple[str, str]:
+    """The first media channel and RF channel of the national data."""
+    data = self.national_input_data_media_and_rf
+    assert data.media_channel is not None and data.rf_channel is not None
+    return str(data.media_channel.values[0]), str(data.rf_channel.values[0])
+
+  @parameterized.named_parameters(
+      ("media_channels", False), ("media_and_rf_channels", True)
+  )
+  def test_geo_shared_changepoint_warns(self, with_rf: bool):
+    other = self.rf[0] if with_rf else self.media[1]
+    model_context, shared_warnings = self._shared_changepoint_warnings(
+        {self.media[0]: [20], other: [20, 30]}
+    )
+    self.assertEqual(
+        shared_warnings,
+        [
+            "There are overlapping changepoints from two (or more) media"
+            " channels in a geo model. If convergence is an issue, consider"
+            " dropping either one of the overlapping changepoints.\n"
+            "Changepoints on the same date:"
+            f" {self.dates[20].isoformat()}: {self.media[0]}, {other}."
+        ],
+    )
+    self.assertIsNone(model_context._national_shared_changepoints_error())
+    self.assertIsNone(model_context._national_changepoint_error())
+
+  def test_shared_changepoint_warning_lists_each_date(self):
+    # The channels are listed in the order of the paid media and RF channels,
+    # and the dates in order.
+    _, shared_warnings = self._shared_changepoint_warnings({
+        self.rf[0]: [10, 40],
+        self.media[1]: [40],
+        self.media[0]: [10, 40],
+        self.rf[1]: [20],
+    })
+    self.assertLen(shared_warnings, 1)
+    self.assertEndsWith(
+        shared_warnings[0],
+        "Changepoints on the same date:"
+        f" {self.dates[10].isoformat()}: {self.media[0]}, {self.rf[0]};"
+        f" {self.dates[40].isoformat()}: {self.media[0]}, {self.media[1]},"
+        f" {self.rf[0]}.",
+    )
+
+  def test_geo_changepoints_on_different_dates_dont_warn(self):
+    model_context, shared_warnings = self._shared_changepoint_warnings(
+        {self.media[0]: [10, 20], self.media[1]: [30], self.rf[0]: [40]}
+    )
+    self.assertEmpty(shared_warnings)
+    self.assertEmpty(model_context._shared_changepoints())
+
+  def test_national_changepoints_on_different_dates_arent_an_error(self):
+    media, rf = self._national_channels()
+    model_context, shared_warnings = self._shared_changepoint_warnings(
+        {media: [20], rf: [30]}, data=self.national_input_data_media_and_rf
+    )
+    self.assertEmpty(shared_warnings)
+    self.assertIsNone(model_context._national_shared_changepoints_error())
+    self.assertIsNone(model_context._national_changepoint_error())
+
+  @parameterized.named_parameters(
+      ("media_channels", False), ("media_and_rf_channels", True)
+  )
+  def test_national_shared_changepoint_is_an_error(self, with_rf: bool):
+    data = self.national_input_data_media_and_rf
+    assert data.media_channel is not None and data.rf_channel is not None
+    media = str(data.media_channel.values[0])
+    other = str(
+        data.rf_channel.values[0] if with_rf else data.media_channel.values[1]
+    )
+    dates = data.time_coordinates.all_dates
+    model_context, shared_warnings = self._shared_changepoint_warnings(
+        {media: [20], other: [20]}, data=data
+    )
+    expected = (
+        "There are overlapping changepoints from two (or more) media channels"
+        " in a national model. The model is unidentifiable and hurts"
+        " convergence. Consider dropping either one of the overlapping"
+        " changepoints.\n"
+        f"Changepoints on the same date: {dates[20].isoformat()}:"
+        f" {media}, {other}."
+    )
+    self.assertEqual(
+        model_context._national_shared_changepoints_error(), expected
+    )
+    # The national model has one knot, so no changepoint is on a knot.
+    self.assertIsNone(model_context._national_changepoint_knot_error())
+    self.assertEqual(model_context._national_changepoint_error(), expected)
+    # The build already shows the error that posterior sampling raises.
+    self.assertEqual(
+        shared_warnings,
+        [
+            f"{expected}\n`sample_posterior` raises this as an error until no"
+            " two channels have a changepoint on the same date."
+        ],
+    )
+
+  def test_national_error_has_knot_and_shared_changepoint_messages(self):
+    media, rf = self._national_channels()
+    date = self.national_input_data_media_and_rf.time_coordinates.all_dates[50]
+    model_context, shared_warnings = self._shared_changepoint_warnings(
+        {media: [50], rf: [50]},
+        data=self.national_input_data_media_and_rf,
+        knots=[0, 50, 100],
+    )
+    self.assertEqual(
+        model_context._national_changepoint_error(),
+        "There are overlapping knots (for mu_t) and changepoints (for beta)"
+        " in a national model. The model is unidentifiable and hurts"
+        " convergence. Consider dropping either one of the overlapping knots"
+        " or changepoints, or replacing the knots with control variables.\n"
+        f"Changepoints on a knot: {media}: {date.isoformat()};"
+        f" {rf}: {date.isoformat()}.\n"
+        "\n"
+        "There are overlapping changepoints from two (or more) media channels"
+        " in a national model. The model is unidentifiable and hurts"
+        " convergence. Consider dropping either one of the overlapping"
+        " changepoints.\n"
+        f"Changepoints on the same date: {date.isoformat()}: {media}, {rf}.",
+    )
+    self.assertLen(shared_warnings, 1)
+
+  def test_model_without_changepoints_has_no_shared_changepoints(self):
+    with (
+        warnings.catch_warnings(record=True) as caught,
+        mock.patch.object(
+            changepoints, "shared_changepoints", autospec=True
+        ) as shared_changepoints,
+    ):
+      warnings.simplefilter("always")
+      model_context = self._context(
+          spec.ModelSpec(), data=self.national_input_data_media_and_rf
+      )
+      self.assertEmpty(model_context._shared_changepoints())
+      self.assertIsNone(model_context._national_changepoint_error())
+    self.assertEmpty([
+        warning
+        for warning in caught
+        if "overlapping changepoints" in str(warning.message)
+    ])
+    # Neither the build nor the check before posterior sampling looks for
+    # shared changepoints.
+    shared_changepoints.assert_not_called()
+    # Neither the build nor the check before posterior sampling computes the
+    # knots.
+    self.assertNotIn("knot_info", vars(model_context))
+
+
+def _week(index: int) -> datetime.date:
+  return datetime.date(2024, 1, 1) + datetime.timedelta(weeks=index)
+
+
+class CompileChangepointsTest(parameterized.TestCase):
+
+  _DATES = [_week(i) for i in range(5)]
+
+  def _compile(
+      self, changepoints_spec: Mapping[str, Sequence[datetime.date]]
+  ) -> changepoints.ChangepointIndices:
+    return context._compile_changepoints(  # pylint: disable=protected-access
+        changepoints_spec,
+        dates=self._DATES,
+        paid_channels=["Search", "TV", "YouTube"],
+        other_channels=["Organic"],
+    )
+
+  def test_dates_become_sorted_indices_in_channel_order(self):
+    compiled = self._compile(
+        {"YouTube": [_week(2)], "TV": [_week(3), _week(1)]}
+    )
+    self.assertEqual(compiled, {"TV": (1, 3), "YouTube": (2,)})
+    self.assertEqual(list(compiled), ["TV", "YouTube"])
+
+  def test_three_changepoints_is_the_maximum(self):
+    # Five time periods allow at most four intervals, so three changepoints.
+    compiled = self._compile({"TV": [_week(1), _week(2), _week(3)]})
+    self.assertEqual(compiled, {"TV": (1, 2, 3)})
+
+  def test_empty_mapping_returns_empty(self):
+    self.assertEqual(self._compile({}), {})
+
+  @parameterized.named_parameters(
+      ("organic_channel", {"Organic": [_week(1)]}, "organic media or a non"),
+      ("unknown_channel", {"Radio": [_week(1)]}, "not a paid media or RF"),
+      (
+          "not_a_time_coordinate",
+          {"TV": [datetime.date(2024, 1, 9)]},
+          (
+              "time coordinates. The nearest time coordinates are 2024-01-08"
+              " and 2024-01-15."
+          ),
+      ),
+      (
+          "before_the_data",
+          {"TV": [datetime.date(2023, 12, 25)]},
+          (
+              "not one of the input data's time coordinates. The time periods"
+              " in the data are between 2024-01-01 and 2024-01-29"
+              r" \(inclusive\)."
+          ),
+      ),
+      (
+          "after_the_data",
+          {"TV": [datetime.date(2024, 2, 5)]},
+          "The time periods in the data are between 2024-01-01 and 2024-01-29",
+      ),
+      ("first_date", {"TV": [_week(0)]}, "is the first time coordinate"),
+      ("duplicate", {"TV": [_week(1), _week(1)]}, "more than once"),
+      (
+          "every_time_period",
+          {"TV": [_week(1), _week(2), _week(3), _week(4)]},
+          "at most 3 changepoints",
+      ),
+  )
+  def test_invalid_changepoints_raise(self, changepoints_spec, message):
+    with self.assertRaisesRegex(ValueError, message):
+      self._compile(changepoints_spec)
+
+
+if __name__ == "__main__":
+  absltest.main()

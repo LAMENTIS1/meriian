@@ -1,0 +1,159 @@
+================================================================================
+GOOGLE MERIDIAN - WHAT IT DOES, CORE CONCEPTS & AGENTIFICATION GUIDE
+================================================================================
+
+1. WHAT MERIDIAN DOES IN PLAIN TERMS
+--------------------------------------------------------------------------------
+Imagine a company like Nike, Uber, or an E-Commerce brand:
+- They spend $50 Million/year across Google Ads, Meta (Instagram/Facebook), YouTube,
+  TV, and TikTok.
+- At the same time, sales fluctuate because of competitor discounts, inflation,
+  promotions, seasonality, and natural brand equity.
+- Because of modern privacy regulations (Apple iOS 14.5 ATT, third-party cookie
+  deprecation), direct click-tracking/MTA attribution no longer tells the true story.
+  If someone sees a YouTube ad on Sunday and clicks a Google Search link on Thursday,
+  who gets credit?
+
+Google Meridian is a Bayesian Marketing Mix Model (MMM).
+It analyzes aggregated historical data (Geos x Weeks) to answer 4 fundamental questions:
+  1. Baseline vs. Marketing: How many sales would occur if we spent $0 on marketing?
+  2. True Incrementality: Exactly how many sales did Meta Ads drive vs. Google Ads?
+  3. Diminishing Returns (Hill Curves): When does spending more on TikTok stop giving
+     returns because the target audience is saturated?
+  4. Optimal Budget Allocation: "If I have $10 Million next quarter, exactly how
+     should I split it between channels to maximize revenue?"
+
+
+2. THE 3 CORE CONCEPTS THE AGENT MUST UNDERSTAND
+--------------------------------------------------------------------------------
+
+  [Ad Spend / Impressions]
+            │
+            ▼
+    1. Adstock Carryover  -----> (Ad impact lasts across multiple weeks)
+            │
+            ▼
+    2. Hill Saturation    -----> (Diminishing marginal returns / S-curve)
+            │
+            ▼
+  [Incremental Conversions / Revenue]
+
+  A. Adstock (Decay Effect):
+     When you run a major campaign today, consumers remember and purchase over weeks.
+     Meridian models this memory effect with geometric or Weibull decay parameters.
+
+  B. Hill Saturation Curve (Diminishing Marginal Returns):
+     The first $100k in ad spend captures low-hanging fruit. The 10th $100k reaches
+     people who already purchased or are not interested. Meridian estimates the
+     exact saturation point so marketing dollars are not wasted.
+
+  C. Geo-Hierarchical Bayesian Pooling:
+     Meridian groups data by geographic regions (e.g., New York, Chicago, Atlanta).
+     Large markets inform smaller markets through Bayesian shrinkage without wiping
+     out unique regional differences.
+
+
+3. AGENT INTENT MAPPING & TOOL CALLING ARCHITECTURE
+--------------------------------------------------------------------------------
+When an autonomous AI Agent receives user commands, it maps user intents to specific
+modular functions from `meridian_complete_toolkit.py`:
+
+User Intent                                Function to Call
+---------------------------------------    -------------------------------------
+1. Load & Validate Ingested Data           fn_01_load_data
+                                           fn_03_inspect_input_data
+                                           fn_04_plot_eda_correlation
+
+2. Specify Model & Priors                  fn_07_build_model_spec
+                                           fn_08_set_roi_priors
+                                           fn_58_calibrate_with_experiments
+
+3. Run Bayesian MCMC Training              fn_12_fit_model
+
+4. Check Convergence & Model Health        fn_13_run_health_review
+                                           fn_15_get_rhat_summary
+                                           fn_16_get_predictive_accuracy
+                                           fn_17_get_negative_baseline_prob
+
+5. Extract ROIs & Business Metrics         fn_19_get_roi
+                                           fn_20_get_mroi
+                                           fn_21_get_cpik
+                                           fn_22_get_incremental_kpi
+
+6. Generate Diagnostic & Business Charts   fn_30_plot_spend_vs_contribution
+                                           fn_31_plot_response_curves
+                                           fn_34_plot_model_fit
+                                           fn_38_plot_adstock_decay
+                                           fn_40_plot_waterfall
+                                           fn_43_plot_roi_bar
+                                           fn_45_plot_roi_vs_mroi
+
+7. Scenario Planning & Budget Optimization fn_48_optimize_fixed_budget
+                                           fn_49_optimize_target_roi
+                                           fn_50_optimize_target_mroi
+                                           fn_51_create_optimization_grid
+                                           fn_52_save_optimization_report
+
+8. Model Persistence & Looker Export       fn_53_generate_html_summary
+                                           fn_54_save_model / fn_55_load_model
+                                           fn_56_export_proto
+
+
+4. REAL-WORLD AGENT SCENARIOS & SAMPLE EXECUTIONS
+--------------------------------------------------------------------------------
+
+SCENARIO 1: "We ran a Geo-lift experiment on TikTok with ROI=2.2. Incorporate this."
+- Why: Meridian mathematically infuses experimental ground truth as Bayesian priors.
+- Tool Call:
+    calibrated_priors = fn_58_calibrate_with_experiments(
+        df=df,
+        input_data=input_data,
+        channel="TikTok",
+        point_estimate=2.2,
+        standard_error=0.3,
+        start_date="2023-05-01",
+        end_date="2023-05-28"
+    )
+
+SCENARIO 2: "Is this model reliable and ready for business decisions?"
+- Why: Validates R-hat convergence (<1.05) and non-negative baseline probabilities.
+- Tool Call:
+    health = fn_13_run_health_review(df, mmm)
+    rhat = fn_15_get_rhat_summary(df, mmm)
+    accuracy = fn_16_get_predictive_accuracy(df, mmm)
+- Agent Response to User:
+    "The model converged with max R-hat of 1.02 and national R² of 0.995.
+    Baseline negative probability is 0.0000. The model is statistically sound."
+
+SCENARIO 3: "We have $5 Million to spend next quarter. How should we allocate it?"
+- Why: Runs gradient-based constrained optimization along Hill curves.
+- Tool Call:
+    opt_plan = fn_48_optimize_fixed_budget(
+        df=df,
+        mmm=mmm,
+        budget=5_000_000.0,
+        spend_lower=0.3,
+        spend_upper=0.5
+    )
+- Agent Response to User:
+    "Optimal allocation recommends shifting $400k from Meta (which has entered
+    saturation) to YouTube and Search, increasing expected conversions by 8.4%."
+
+SCENARIO 4: "Generate an executive report and export to Looker Studio."
+- Why: Creates standalone interactive HTML dashboard and Google Protobuf payload.
+- Tool Call:
+    fn_53_generate_html_summary(df, mmm)
+    fn_56_export_proto(df, mmm, output_file="./meridian_toolkit_output/mmm_schema_export.pb")
+
+
+5. WHY THIS MODULAR DESIGN ENABLES SEAMLESS AGENTIFICATION
+--------------------------------------------------------------------------------
+1. Uniform Function Signature: Every single function takes `df: pl.DataFrame` as
+   its first argument.
+2. Fully Decoupled Execution: An agent answering an ROI question doesn't need to
+   retrain the model; it simply loads the checkpoint (`fn_55_load_model`) and runs
+   `fn_19_get_roi`.
+3. Deterministic Tool Calling: Explicit Python type hints, default fallbacks, and
+   descriptive docstrings allow LLMs (e.g., Gemini, OpenAI, Claude) to automatically
+   parse schemas and call functions without syntax errors.
+================================================================================

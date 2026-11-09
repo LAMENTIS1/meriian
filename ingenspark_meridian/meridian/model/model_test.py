@@ -1,0 +1,2029 @@
+# Copyright 2026 The Meridian Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import dataclasses
+import os
+from unittest import mock
+
+from absl import flags
+from absl.testing import absltest
+from absl.testing import parameterized
+import arviz as az
+from ingenspark_meridian.meridian import backend
+from ingenspark_meridian.meridian import constants
+from ingenspark_meridian.meridian.analysis.review import configs
+from ingenspark_meridian.meridian.analysis.review import results
+from ingenspark_meridian.meridian.analysis.review import reviewer
+from ingenspark_meridian.meridian.backend import config as backend_config
+from ingenspark_meridian.meridian.backend import test_utils
+from ingenspark_meridian.meridian.common import errors
+from ingenspark_meridian.meridian.data import test_utils as data_test_utils
+from ingenspark_meridian.meridian.model import equations
+from ingenspark_meridian.meridian.model import model
+from ingenspark_meridian.meridian.model import model_test_data
+from ingenspark_meridian.meridian.model import posterior_sampler
+from ingenspark_meridian.meridian.model import prior_distribution
+from ingenspark_meridian.meridian.model import prior_sampler
+from ingenspark_meridian.meridian.model import spec
+from ingenspark_meridian.meridian.model.eda import eda_engine
+from ingenspark_meridian.meridian.model.eda import eda_outcome
+from ingenspark_meridian.meridian.model.eda import eda_spec as eda_spec_module
+import numpy as np
+import xarray as xr
+
+
+def _no_op_progress_callback(snapshot) -> None:
+  del snapshot
+
+
+CONVERGENCE_CHECK_RESULT_NOT_CONVERGED = results.ConvergenceCheckResult(
+    case=results.ConvergenceCases.NOT_CONVERGED,
+    config=mock.create_autospec(
+        results.configs.ConvergenceConfig, spec_set=True
+    ),
+    max_r_hat=1.5,
+    max_parameter="beta",
+)
+CONVERGENCE_CHECK_RESULT_CONVERGED = results.ConvergenceCheckResult(
+    case=results.ConvergenceCases.CONVERGED,
+    config=mock.create_autospec(
+        results.configs.ConvergenceConfig, spec_set=True
+    ),
+    max_r_hat=1.01,
+    max_parameter="beta",
+)
+BASELINE_CHECK_RESULT_PASS = results.BaselineCheckResult(
+    case=results.BaselineCases.PASS,
+    config=mock.create_autospec(results.configs.BaselineConfig, spec_set=True),
+    negative_baseline_prob=0.0,
+)
+GOODNESS_OF_FIT_CHECK_RESULT_PASS = results.GoodnessOfFitCheckResult(
+    case=results.GoodnessOfFitCases.PASS,
+    metrics=mock.create_autospec(results.GoodnessOfFitMetrics, spec_set=True),
+)
+BAYESIAN_PPP_CHECK_RESULT_PASS = results.BayesianPPPCheckResult(
+    case=results.BayesianPPPCases.PASS,
+    config=mock.create_autospec(
+        results.configs.BayesianPPPConfig, spec_set=True
+    ),
+    bayesian_ppp=0.5,
+)
+PRIOR_POSTERIOR_SHIFT_CHECK_RESULT_PASS = (
+    results.PriorPosteriorShiftCheckResult(
+        case=results.PriorPosteriorShiftAggregateCases.PASS,
+        channel_results=[
+            mock.create_autospec(
+                results.PriorPosteriorShiftChannelResult,
+                instance=True,
+                spec_set=True,
+            )
+            for _ in range(3)
+        ],
+        no_shift_channels=[],
+    )
+)
+ROI_CONSISTENCY_CHECK_RESULT_PASS = results.ROIConsistencyCheckResult(
+    case=results.ROIConsistencyAggregateCases.PASS,
+    channel_results=[
+        mock.create_autospec(
+            results.ROIConsistencyChannelResult,
+            instance=True,
+            spec_set=True,
+        )
+        for _ in range(3)
+    ],
+    aggregate_details={},
+)
+
+CONVERGENCE_ONLY_SET_TEST = (CONVERGENCE_CHECK_RESULT_NOT_CONVERGED,)
+MODEL_LEVEL_SET_TEST = (
+    CONVERGENCE_CHECK_RESULT_CONVERGED,
+    BASELINE_CHECK_RESULT_PASS,
+    GOODNESS_OF_FIT_CHECK_RESULT_PASS,
+    BAYESIAN_PPP_CHECK_RESULT_PASS,
+)
+PPS_SET_TEST = MODEL_LEVEL_SET_TEST + (PRIOR_POSTERIOR_SHIFT_CHECK_RESULT_PASS,)
+ROI_SET_TEST = PPS_SET_TEST + (ROI_CONSISTENCY_CHECK_RESULT_PASS,)
+
+
+def _simple_posterior(n_chains: int = 2, n_draws: int = 10) -> xr.Dataset:
+  """Creates a simple posterior Dataset for testing."""
+  return xr.Dataset(
+      data_vars={
+          "param": (
+              (constants.CHAIN, constants.DRAW),
+              np.arange(n_chains * n_draws).reshape((n_chains, n_draws)),
+          ),
+          "draw_id": (
+              (constants.CHAIN, constants.DRAW),
+              np.tile(np.arange(n_draws), (n_chains, 1)),
+          ),
+      },
+      coords={
+          constants.CHAIN: np.arange(n_chains),
+          constants.DRAW: np.arange(n_draws),
+      },
+  )
+
+
+class ModelTest(
+    test_utils.MeridianTestCase,
+    model_test_data.WithInputDataSamples,
+):
+
+  input_data_samples = model_test_data.WithInputDataSamples
+  _N_GEOS_SMALL = 3
+  _N_TIMES_SMALL = 5
+  _N_MEDIA_TIMES_SMALL = 6
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    model_test_data.WithInputDataSamples.setup()
+
+  def setUp(self):
+    super().setUp()
+    flags.FLAGS.mark_as_parsed()
+    self.small_data = (
+        data_test_utils.sample_input_data_non_revenue_no_revenue_per_kpi(
+            n_geos=self._N_GEOS_SMALL,
+            n_times=self._N_TIMES_SMALL,
+            n_media_times=self._N_MEDIA_TIMES_SMALL,
+            n_media_channels=self._N_MEDIA_CHANNELS,
+            n_non_media_channels=self._N_NON_MEDIA_CHANNELS,
+            seed=0,
+        )
+    )
+    self.small_data_no_revenue_per_kpi = (
+        data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+            n_geos=self._N_GEOS_SMALL,
+            n_times=self._N_TIMES_SMALL,
+            n_media_times=self._N_MEDIA_TIMES_SMALL,
+            n_media_channels=self._N_MEDIA_CHANNELS,
+            n_non_media_channels=self._N_NON_MEDIA_CHANNELS,
+            seed=0,
+        )
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="with_default_spec",
+          eda_spec_kwargs={},
+          expected_eda_spec=eda_spec_module.EDASpec(),
+      ),
+      dict(
+          testcase_name="with_custom_spec",
+          eda_spec_kwargs={
+              "eda_spec": eda_spec_module.EDASpec(
+                  vif_spec=eda_spec_module.VIFSpec(geo_threshold=500.0)
+              )
+          },
+          expected_eda_spec=eda_spec_module.EDASpec(
+              vif_spec=eda_spec_module.VIFSpec(geo_threshold=500.0)
+          ),
+      ),
+  )
+  def test_eda_engine_and_spec_initialization(
+      self, eda_spec_kwargs, expected_eda_spec
+  ):
+    meridian = model.Meridian(
+        input_data=self.input_data_with_media_only, **eda_spec_kwargs
+    )
+
+    self.assertIsInstance(meridian.eda_engine, eda_engine.EDAEngine)
+    self.assertEqual(meridian.eda_spec, expected_eda_spec)
+
+  def test_equations_initialization(self):
+    meridian = model.Meridian(input_data=self.input_data_with_media_only)
+    self.assertIsInstance(meridian.model_equations, equations.ModelEquations)
+
+  def test_base_geo_properties(self):
+    meridian = model.Meridian(input_data=self.input_data_with_media_and_rf)
+    self.assertIsNotNone(meridian.prior_broadcast)
+    self.assertIsNotNone(meridian.inference_data)
+    self.assertIsNotNone(meridian.eda_engine)
+    self.assertNotIn(constants.PRIOR, meridian.inference_data.attrs)
+    self.assertNotIn(constants.POSTERIOR, meridian.inference_data.attrs)
+
+  def test_base_national_properties(self):
+    meridian = model.Meridian(input_data=self.national_input_data_media_only)
+    self.assertIsNotNone(meridian.prior_broadcast)
+    self.assertIsNotNone(meridian.inference_data)
+    self.assertIsNotNone(meridian.eda_engine)
+    self.assertNotIn(constants.PRIOR, meridian.inference_data.attrs)
+    self.assertNotIn(constants.POSTERIOR, meridian.inference_data.attrs)
+
+  @parameterized.named_parameters(
+      (
+          "tensorflow",
+          backend_config.ComputationBackend.TENSORFLOW,
+          "TENSORFLOW",
+      ),
+      ("jax", backend_config.ComputationBackend.JAX, "JAX"),
+  )
+  def test_computation_backend_property(self, backend_enum, expected_name):
+    with mock.patch.object(
+        backend, "computation_backend", return_value=backend_enum
+    ):
+      meridian = model.Meridian(input_data=self.input_data_with_media_only)
+      self.assertEqual(meridian.computation_backend, expected_name)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="rf_prior_type_roi",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+          organic_media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          non_media_treatments_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          error_msg=(
+              '`kpi_scaled` cannot be constant with `rf_prior_type` = "roi".'
+          ),
+      ),
+      dict(
+          testcase_name="media_prior_type_mroi",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_MROI,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          non_media_treatments_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          error_msg=(
+              "`kpi_scaled` cannot be constant with"
+              ' `media_prior_type` = "mroi".'
+          ),
+      ),
+      dict(
+          testcase_name="organic_media_prior_type_contribution",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_media_prior_type=constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+          organic_rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          non_media_treatments_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          error_msg=(
+              "`kpi_scaled` cannot be constant with"
+              ' `organic_media_prior_type` = "contribution".'
+          ),
+      ),
+      dict(
+          testcase_name="organic_rf_prior_type_contribution",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_rf_prior_type=constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+          non_media_treatments_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          error_msg=(
+              "`kpi_scaled` cannot be constant with"
+              ' `organic_rf_prior_type` = "contribution".'
+          ),
+      ),
+      dict(
+          testcase_name="non_media_treatments_prior_type_contribution",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          non_media_treatments_prior_type=constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+          error_msg=(
+              "`kpi_scaled` cannot be constant with"
+              ' `non_media_treatments_prior_type` = "contribution".'
+          ),
+      ),
+  )
+  def test_init_validate_kpi_transformer_geo_model(
+      self,
+      media_prior_type: str,
+      rf_prior_type: str,
+      organic_media_prior_type: str,
+      organic_rf_prior_type: str,
+      non_media_treatments_prior_type: str,
+      error_msg: str,
+  ):
+    valid_input_data = self.input_data_non_media_and_organic
+    kpi = valid_input_data.kpi
+    kpi.data = np.zeros_like(kpi.data)
+    zero_kpi_input_data = dataclasses.replace(
+        valid_input_data,
+        kpi=kpi,
+    )
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        error_msg,
+    ):
+      model.Meridian(
+          input_data=zero_kpi_input_data,
+          model_spec=spec.ModelSpec(
+              media_prior_type=media_prior_type,
+              rf_prior_type=rf_prior_type,
+              organic_media_prior_type=organic_media_prior_type,
+              organic_rf_prior_type=organic_rf_prior_type,
+              non_media_treatments_prior_type=non_media_treatments_prior_type,
+          ),
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="media_prior_type_roi",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          non_media_treatments_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          error_msg=(
+              '`kpi_scaled` cannot be constant with `media_prior_type` = "roi".'
+          ),
+      ),
+      dict(
+          testcase_name="media_prior_type_mroi",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_MROI,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          non_media_treatments_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          error_msg=(
+              "`kpi_scaled` cannot be constant with `media_prior_type` ="
+              ' "mroi".'
+          ),
+      ),
+      dict(
+          testcase_name="rf_prior_type_roi",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+          organic_media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          non_media_treatments_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          error_msg=(
+              '`kpi_scaled` cannot be constant with `rf_prior_type` = "roi".'
+          ),
+      ),
+      dict(
+          testcase_name="rf_prior_type_mroi",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_MROI,
+          organic_media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          non_media_treatments_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          error_msg=(
+              '`kpi_scaled` cannot be constant with `rf_prior_type` = "mroi".'
+          ),
+      ),
+      dict(
+          testcase_name="organic_media_prior_type_contribution",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_media_prior_type=constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+          organic_rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          non_media_treatments_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          error_msg=(
+              "`kpi_scaled` cannot be constant with `organic_media_prior_type`"
+              ' = "contribution".'
+          ),
+      ),
+      dict(
+          testcase_name="organic_rf_prior_type_contribution",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_rf_prior_type=constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+          non_media_treatments_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          error_msg=(
+              "`kpi_scaled` cannot be constant with `organic_rf_prior_type` ="
+              ' "contribution".'
+          ),
+      ),
+      dict(
+          testcase_name="non_media_treatments_prior_type_contribution",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          non_media_treatments_prior_type=constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+          error_msg=(
+              "`kpi_scaled` cannot be constant with"
+              ' `non_media_treatments_prior_type` = "contribution".'
+          ),
+      ),
+  )
+  def test_init_validate_kpi_transformer_national_model(
+      self,
+      media_prior_type: str,
+      rf_prior_type: str,
+      organic_media_prior_type: str,
+      organic_rf_prior_type: str,
+      non_media_treatments_prior_type: str,
+      error_msg: str,
+  ):
+    valid_input_data = self.national_input_data_non_media_and_organic
+    kpi = valid_input_data.kpi
+    kpi.data = np.zeros_like(kpi.data)
+    zero_kpi_input_data = dataclasses.replace(
+        valid_input_data,
+        kpi=kpi,
+    )
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        error_msg,
+    ):
+      model.Meridian(
+          input_data=zero_kpi_input_data,
+          model_spec=spec.ModelSpec(
+              media_prior_type=media_prior_type,
+              rf_prior_type=rf_prior_type,
+              organic_media_prior_type=organic_media_prior_type,
+              organic_rf_prior_type=organic_rf_prior_type,
+              non_media_treatments_prior_type=non_media_treatments_prior_type,
+              # National models always use normal media effects.
+              media_effects_dist=constants.MEDIA_EFFECTS_NORMAL,
+          ),
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="geo",
+          input_data_type="geo",
+      ),
+      dict(
+          testcase_name="national",
+          input_data_type="national",
+      ),
+  )
+  def test_init_validate_kpi_transformer_ok(self, input_data_type):
+    valid_input_data = (
+        self.national_input_data_non_media_and_organic
+        if input_data_type == "national"
+        else self.input_data_non_media_and_organic
+    )
+    kpi = valid_input_data.kpi
+    kpi.data = np.zeros_like(kpi.data)
+    zero_kpi_input_data = dataclasses.replace(
+        valid_input_data,
+        kpi=kpi,
+    )
+
+    prior_type = constants.TREATMENT_PRIOR_TYPE_COEFFICIENT
+    meridian = model.Meridian(
+        input_data=zero_kpi_input_data,
+        model_spec=spec.ModelSpec(
+            media_prior_type=prior_type,
+            rf_prior_type=prior_type,
+            organic_media_prior_type=prior_type,
+            organic_rf_prior_type=prior_type,
+            non_media_treatments_prior_type=prior_type,
+        ),
+    )
+    self.assertIsNotNone(meridian)
+    # `Analyzer` and posterior sampling evaluate every cached property.
+    meridian.model_context.populate_cached_properties()
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="geo",
+          input_data_type="geo",
+      ),
+      dict(
+          testcase_name="national",
+          input_data_type="national",
+      ),
+  )
+  def test_init_validate_kpi_transformer_allows_negative_aggregate_baseline_false(
+      self, input_data_type
+  ):
+    valid_input_data = (
+        self.national_input_data_non_media_and_organic
+        if input_data_type == "national"
+        else self.input_data_non_media_and_organic
+    )
+    kpi = valid_input_data.kpi.copy(deep=True)
+    kpi.data = np.zeros_like(kpi.data)
+    zero_kpi_input_data = dataclasses.replace(
+        valid_input_data,
+        kpi=kpi,
+    )
+
+    prior_type = constants.TREATMENT_PRIOR_TYPE_COEFFICIENT
+    with self.assertRaisesWithLiteralMatch(
+        ValueError,
+        "`kpi_scaled` cannot be constant when"
+        " `allows_negative_aggregate_baseline=False` because standardizing"
+        " the baseline threshold requires non-zero KPI variability"
+        " (`population_scaled_stdev > 0`). Please verify that `kpi` varies"
+        " across geos or time periods, or set"
+        " `allows_negative_aggregate_baseline=True`.",
+    ):
+      model.Meridian(
+          input_data=zero_kpi_input_data,
+          model_spec=spec.ModelSpec(
+              media_prior_type=prior_type,
+              rf_prior_type=prior_type,
+              organic_media_prior_type=prior_type,
+              organic_rf_prior_type=prior_type,
+              non_media_treatments_prior_type=prior_type,
+              allows_negative_aggregate_baseline=False,
+          ),
+      )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="geo", is_national=False),
+      dict(testcase_name="national", is_national=True),
+  )
+  def test_validate_kpi_transformer_with_kpi_variability(
+      self, is_national: bool
+  ):
+    valid_input_data = (
+        self.national_input_data_non_media_and_organic
+        if is_national
+        else self.input_data_non_media_and_organic
+    )
+    meridian = model.Meridian(
+        input_data=valid_input_data,
+        model_spec=spec.ModelSpec(),
+    )
+    self.assertIsNotNone(meridian)
+
+  def test_run_model_fitting_guardrail_error_message(self):
+    finding_corr_1 = eda_outcome.EDAFinding(
+        severity=eda_outcome.EDASeverity.FAIL,
+        explanation="Error explanation for PAIRWISE_CORR 1.",
+        finding_cause=eda_outcome.FindingCause.MULTICOLLINEARITY,
+    )
+    finding_corr_2 = eda_outcome.EDAFinding(
+        severity=eda_outcome.EDASeverity.FAIL,
+        explanation="Error explanation for PAIRWISE_CORR 2.",
+        finding_cause=eda_outcome.FindingCause.MULTICOLLINEARITY,
+    )
+    finding_vif_1 = eda_outcome.EDAFinding(
+        severity=eda_outcome.EDASeverity.FAIL,
+        explanation="Error explanation for MULTICOLLINEARITY 1.",
+        finding_cause=eda_outcome.FindingCause.MULTICOLLINEARITY,
+    )
+
+    outcome_corr = eda_outcome.EDAOutcome(
+        check_type=eda_outcome.EDACheckType.PAIRWISE_CORRELATION,
+        findings=[finding_corr_1, finding_corr_2],
+        analysis_artifacts=[],
+    )
+    outcome_vif = eda_outcome.EDAOutcome(
+        check_type=eda_outcome.EDACheckType.MULTICOLLINEARITY,
+        findings=[finding_vif_1],
+        analysis_artifacts=[],
+    )
+    outcome_kpi = eda_outcome.EDAOutcome(
+        check_type=eda_outcome.EDACheckType.KPI_INVARIABILITY,
+        findings=[],
+        analysis_artifacts=[],
+    )
+
+    critical_outcomes = eda_outcome.CriticalCheckEDAOutcomes(
+        kpi_invariability=outcome_kpi,
+        multicollinearity=outcome_vif,
+        pairwise_correlation=outcome_corr,
+    )
+
+    mock_eda_outcomes = self.enter_context(
+        mock.patch.object(
+            model.Meridian,
+            "eda_outcomes",
+            new_callable=mock.PropertyMock,
+            return_value=critical_outcomes,
+        )
+    )
+    meridian = model.Meridian(input_data=self.input_data_with_media_only)
+
+    # The error message order is deterministic based on
+    # `eda_outcome.CriticalCheckEDAOutcomes` dataclass field order:
+    # 1. kpi (empty)
+    # 2. multicollinearity
+    # 3. pairwise_correlation
+    expected_error_message = (
+        "Model has critical EDA issues. Please fix before running"
+        " `sample_posterior`.\n\n"
+        "Check type: MULTICOLLINEARITY\n"
+        "- Error explanation for MULTICOLLINEARITY 1.\n"
+        "Check type: PAIRWISE_CORRELATION\n"
+        "- Error explanation for PAIRWISE_CORR 1.\n"
+        "- Error explanation for PAIRWISE_CORR 2.\n"
+        "For further details, please refer to `Meridian.eda_outcomes`."
+    )
+    with self.assertRaisesWithLiteralMatch(
+        model.ModelFittingError, expected_error_message
+    ):
+      meridian.sample_posterior(n_chains=1, n_adapt=1, n_burnin=1, n_keep=1)
+    mock_eda_outcomes.assert_called_once()
+
+  def test_sample_posterior_national_changepoint_on_knot_raises(self):
+    data = self.national_input_data_media_and_rf
+    assert data.media_channel is not None
+    channel = str(data.media_channel.values[0])
+    date = data.time_coordinates.all_dates[50]
+    meridian = model.Meridian(
+        input_data=data,
+        model_spec=spec._ModelSpecWithChangepoints(  # pylint: disable=protected-access
+            changepoints={channel: [date]}, knots=[0, 50, 100]
+        ),
+    )
+    # Prior sampling still works.
+    meridian.sample_prior(n_draws=1)
+    with self.assertRaisesWithLiteralMatch(
+        model.ModelFittingError,
+        "There are overlapping knots (for mu_t) and changepoints (for beta) in"
+        " a national model. The model is unidentifiable and hurts convergence."
+        " Consider dropping either one of the overlapping knots or"
+        " changepoints, or replacing the knots with control variables.\n"
+        f"Changepoints on a knot: {channel}: {date.isoformat()}.",
+    ):
+      meridian.sample_posterior(n_chains=1, n_adapt=1, n_burnin=1, n_keep=1)
+
+  def test_sample_posterior_national_shared_changepoint_raises(self):
+    data = self.national_input_data_media_and_rf
+    assert data.media_channel is not None and data.rf_channel is not None
+    media = str(data.media_channel.values[0])
+    rf = str(data.rf_channel.values[0])
+    date = data.time_coordinates.all_dates[50]
+    meridian = model.Meridian(
+        input_data=data,
+        model_spec=spec._ModelSpecWithChangepoints(  # pylint: disable=protected-access
+            changepoints={media: [date], rf: [date]}
+        ),
+    )
+    # Prior sampling still works.
+    meridian.sample_prior(n_draws=1)
+    with self.assertRaisesWithLiteralMatch(
+        model.ModelFittingError,
+        "There are overlapping changepoints from two (or more) media channels"
+        " in a national model. The model is unidentifiable and hurts"
+        " convergence. Consider dropping either one of the overlapping"
+        " changepoints.\n"
+        f"Changepoints on the same date: {date.isoformat()}: {media}, {rf}.",
+    ):
+      meridian.sample_posterior(n_chains=1, n_adapt=1, n_burnin=1, n_keep=1)
+
+  def test_health_summary_attribute(self):
+    meridian = model.Meridian(input_data=self.input_data_with_media_only)
+    self.assertIsNone(meridian.health_summary)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="with_convergence_only_set",
+          fake_results=CONVERGENCE_ONLY_SET_TEST,
+          overall_status=results.Status.FAIL,
+          health_score=0.0,
+      ),
+      dict(
+          testcase_name="with_model_level_set",
+          fake_results=MODEL_LEVEL_SET_TEST,
+          overall_status=results.Status.PASS,
+          health_score=90.0,
+      ),
+      dict(
+          testcase_name="with_pps_set",
+          fake_results=PPS_SET_TEST,
+          overall_status=results.Status.PASS,
+          health_score=90.0,
+      ),
+      dict(
+          testcase_name="with_roi_set",
+          fake_results=ROI_SET_TEST,
+          overall_status=results.Status.PASS,
+          health_score=90.0,
+      ),
+  )
+  def test_health_summary_injection_succeeds(
+      self, fake_results, overall_status, health_score
+  ):
+    summary = results.ReviewSummary(
+        overall_status=overall_status,
+        summary_message="Injected summary",
+        results=fake_results,
+        health_score=health_score,
+    )
+    meridian = model.Meridian(
+        input_data=self.input_data_with_media_only, health_summary=summary
+    )
+    self.assertIsNotNone(meridian.health_summary)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="wrong_shape",
+          fake_results=MODEL_LEVEL_SET_TEST
+          + (
+              results.PriorPosteriorShiftCheckResult(
+                  case=results.PriorPosteriorShiftAggregateCases.PASS,
+                  channel_results=[
+                      mock.create_autospec(
+                          results.PriorPosteriorShiftChannelResult,
+                          instance=True,
+                          spec_set=True,
+                      ),
+                  ],
+                  no_shift_channels=[],
+              ),
+          ),
+          expected_error_regex=(
+              "Injected PriorPosteriorShiftCheckResult contains 1 channels,"
+              " but model expects 3."
+          ),
+          health_score=88.8,
+      ),
+      dict(
+          testcase_name="disallowed_subset",
+          # Only convergence but it CONVERGED (expects other model-level checks
+          # to follow).
+          fake_results=(CONVERGENCE_CHECK_RESULT_CONVERGED,),
+          expected_error_regex=(
+              "Injected health summary results do not form a valid subset."
+          ),
+          health_score=100.0,
+      ),
+  )
+  def test_health_summary_injection_raises_error(
+      self, fake_results, expected_error_regex, health_score
+  ):
+    summary = results.ReviewSummary(
+        overall_status=results.Status.PASS,
+        summary_message="Injected summary",
+        results=fake_results,
+        health_score=health_score,
+    )
+    with self.assertRaisesRegex(ValueError, expected_error_regex):
+      model.Meridian(
+          input_data=self.input_data_with_media_only, health_summary=summary
+      )
+
+  def test_review_called_before_fitting_raises_error(self):
+    meridian = model.Meridian(input_data=self.input_data_with_media_only)
+    with self.assertRaisesWithLiteralMatch(
+        errors.NotFittedModelError,
+        "The model must be fitted before calling review().",
+    ):
+      meridian.review()
+
+  @mock.patch.object(reviewer, "ModelReviewer", autospec=True, spec_set=True)
+  def test_review_method(self, mock_model_reviewer):
+    meridian = model.Meridian(input_data=self.input_data_with_media_only)
+    meridian._inference_data = az.convert_to_inference_data(
+        {"dummy": [1.0]}, group=constants.POSTERIOR
+    )
+
+    mock_review_run = mock_model_reviewer.return_value.run
+    expected_results = results.ReviewSummary(
+        overall_status=results.Status.PASS,
+        summary_message="summary",
+        results=[],
+        health_score=0.0,
+    )
+    mock_review_run.return_value = expected_results
+
+    meridian.review()
+
+    mock_model_reviewer.assert_called_once_with(
+        model_context=meridian.model_context,
+        inference_data=meridian.inference_data,
+        convergence_check_config=None,
+        post_convergence_checks=None,
+    )
+    mock_review_run.assert_called_once()
+    self.assertIs(meridian.health_summary, expected_results)
+
+  @mock.patch.object(reviewer, "ModelReviewer", autospec=True, spec_set=True)
+  def test_review_method_with_custom_checks(self, mock_model_reviewer):
+    meridian = model.Meridian(input_data=self.input_data_with_media_only)
+    meridian._inference_data = az.convert_to_inference_data(
+        {"dummy": [1.0]}, group=constants.POSTERIOR
+    )
+
+    mock_review_run = mock_model_reviewer.return_value.run
+    expected_results = results.ReviewSummary(
+        overall_status=results.Status.PASS,
+        summary_message="summary",
+        results=[],
+        health_score=0.0,
+    )
+    mock_review_run.return_value = expected_results
+
+    custom_conv = configs.ConvergenceConfig(convergence_threshold=1.1)
+    custom_checks: reviewer.ChecksBattery = {
+        reviewer.checks.BaselineCheck: configs.BaselineConfig()
+    }
+    meridian.review(
+        convergence_check_config=custom_conv,
+        post_convergence_checks=custom_checks,
+    )
+
+    mock_model_reviewer.assert_called_once_with(
+        model_context=meridian.model_context,
+        inference_data=meridian.inference_data,
+        convergence_check_config=custom_conv,
+        post_convergence_checks=custom_checks,
+    )
+    mock_review_run.assert_called_once()
+    self.assertIs(meridian.health_summary, expected_results)
+
+  def test_sample_posterior_and_review_method(self):
+    mock_sample_posterior = self.enter_context(
+        mock.patch.object(model.Meridian, "sample_posterior", autospec=True)
+    )
+    mock_review = self.enter_context(
+        mock.patch.object(model.Meridian, "review", autospec=True)
+    )
+    meridian = model.Meridian(input_data=self.input_data_with_media_only)
+    n_chains, n_adapt, n_burnin, n_keep = 1, 2, 3, 4
+    kwarg = "test"
+    meridian.sample_posterior_and_review(
+        n_chains=n_chains,
+        n_adapt=n_adapt,
+        n_burnin=n_burnin,
+        n_keep=n_keep,
+        test=kwarg,
+    )
+
+    mock_sample_posterior.assert_called_once_with(
+        meridian,
+        n_chains=n_chains,
+        n_adapt=n_adapt,
+        n_burnin=n_burnin,
+        n_keep=n_keep,
+        current_state=None,
+        init_step_size=None,
+        dual_averaging_kwargs=None,
+        max_tree_depth=10,
+        max_energy_diff=500.0,
+        unrolled_leapfrog_steps=1,
+        parallel_iterations=10,
+        seed=None,
+        reconstruction_batch_size=constants.DEFAULT_RECONSTRUCTION_BATCH_SIZE,
+        progress_callback=None,
+        test=kwarg,
+    )
+    mock_review.assert_called_once_with(
+        meridian,
+        convergence_check_config=None,
+        post_convergence_checks=None,
+    )
+
+  def test_sample_posterior_and_review_passes_progress_callback(self):
+    mock_sample_posterior = self.enter_context(
+        mock.patch.object(model.Meridian, "sample_posterior", autospec=True)
+    )
+    self.enter_context(
+        mock.patch.object(model.Meridian, "review", autospec=True)
+    )
+    meridian = model.Meridian(input_data=self.input_data_with_media_only)
+    progress_callback = mock.create_autospec(_no_op_progress_callback)
+
+    meridian.sample_posterior_and_review(
+        n_chains=1,
+        n_adapt=1,
+        n_burnin=1,
+        n_keep=1,
+        progress_callback=progress_callback,
+    )
+
+    self.assertIs(
+        mock_sample_posterior.call_args.kwargs["progress_callback"],
+        progress_callback,
+    )
+
+  def test_sample_posterior_passes_progress_callback_to_sampler(self):
+    mock_sampler = self.enter_context(
+        mock.patch.object(
+            posterior_sampler.PosteriorMCMCSampler,
+            "__call__",
+            autospec=True,
+            return_value=az.InferenceData(),
+        )
+    )
+    meridian = model.Meridian(input_data=self.input_data_with_media_only)
+    progress_callback = mock.create_autospec(_no_op_progress_callback)
+
+    meridian.sample_posterior(
+        n_chains=1,
+        n_adapt=1,
+        n_burnin=1,
+        n_keep=1,
+        progress_callback=progress_callback,
+    )
+
+    self.assertIs(
+        mock_sampler.call_args.kwargs["progress_callback"], progress_callback
+    )
+
+  def test_sample_prior_passes_progress_callback_to_sampler(self):
+    mock_sampler = self.enter_context(
+        mock.patch.object(
+            prior_sampler.PriorDistributionSampler,
+            "__call__",
+            autospec=True,
+            return_value=self.test_dist_media_only,
+        )
+    )
+    meridian = model.Meridian(input_data=self.short_input_data_with_media_only)
+    progress_callback = mock.create_autospec(_no_op_progress_callback)
+
+    meridian.sample_prior(
+        n_draws=self._N_DRAWS, progress_callback=progress_callback
+    )
+
+    self.assertIs(
+        mock_sampler.call_args.kwargs["progress_callback"], progress_callback
+    )
+
+  def test_sample_posterior_and_review_method_with_custom_checks(self):
+    mock_sample_posterior = self.enter_context(
+        mock.patch.object(model.Meridian, "sample_posterior", autospec=True)
+    )
+    mock_review = self.enter_context(
+        mock.patch.object(model.Meridian, "review", autospec=True)
+    )
+    meridian = model.Meridian(input_data=self.input_data_with_media_only)
+    custom_conv = configs.ConvergenceConfig(convergence_threshold=1.1)
+    custom_checks: reviewer.ChecksBattery = {
+        reviewer.checks.BaselineCheck: configs.BaselineConfig()
+    }
+    meridian.sample_posterior_and_review(
+        n_chains=1,
+        n_adapt=1,
+        n_burnin=1,
+        n_keep=1,
+        convergence_check_config=custom_conv,
+        post_convergence_checks=custom_checks,
+    )
+
+    mock_sample_posterior.assert_called_once()
+    mock_review.assert_called_once_with(
+        meridian,
+        convergence_check_config=custom_conv,
+        post_convergence_checks=custom_checks,
+    )
+
+  def _meridian_with_posterior(self, posterior: xr.Dataset) -> model.Meridian:
+    meridian = model.Meridian(input_data=self.input_data_with_media_only)
+    meridian.inference_data.posterior = posterior  # pyrefly: ignore[missing-attribute]
+    return meridian
+
+  def test_posterior_thinning_preserves_chains(self):
+    values = np.arange(3 * 10 * 2).reshape((3, 10, 2))
+    meridian = self._meridian_with_posterior(xr.Dataset(
+        data_vars={
+            "param": (
+                (constants.CHAIN, constants.DRAW, "channel"),
+                values,
+            ),
+            "draw_id": (
+                (constants.CHAIN, constants.DRAW),
+                np.tile(np.arange(10), (3, 1)),
+            ),
+        },
+        coords={
+            constants.CHAIN: np.arange(3),
+            constants.DRAW: np.arange(10),
+            "channel": ["a", "b"],
+        },
+    ))
+
+    thinned = meridian.posterior_thinning(n_draws=4, seed=7)
+
+    self.assertEqual(thinned.sizes[constants.CHAIN], 3)
+    self.assertEqual(thinned.sizes[constants.DRAW], 4)
+    self.assertEqual(thinned.sizes["channel"], 2)
+    self.assertEqual(
+        thinned.attrs["posterior_selected_draw_count_per_chain"], 4
+    )
+    self.assertTrue(thinned.attrs["posterior_is_thinned"])
+    self.assertEqual(
+        thinned.attrs["posterior_thinning_method"], "systematic"
+    )
+    for chain in range(3):
+      with self.subTest(chain=chain):
+        selected_draws = thinned["draw_id"].sel(chain=chain).values
+        self.assertLen(set(selected_draws.tolist()), 4)
+        self.assertTrue(np.all(np.diff(selected_draws) >= 1))
+        self.assertTrue(np.all(selected_draws >= 0))
+        self.assertTrue(np.all(selected_draws < 10))
+        selected_values = thinned["param"].sel(chain=chain).values[:, 0]
+        self.assertTrue(np.all(selected_values >= chain * 20))
+        self.assertTrue(np.all(selected_values < (chain + 1) * 20))
+
+    restored = meridian.restore_full_posterior()
+
+    self.assertEqual(restored.sizes[constants.CHAIN], 3)
+    self.assertEqual(restored.sizes[constants.DRAW], 10)
+    np.testing.assert_array_equal(restored["param"].values, values)
+
+  def test_posterior_thinning_accepts_thinning_method_enum(self):
+    meridian = self._meridian_with_posterior(_simple_posterior())
+
+    thinned = meridian.posterior_thinning(
+        n_draws=4, method=model.ThinningMethod.SYSTEMATIC, seed=7
+    )
+
+    self.assertEqual(
+        thinned.attrs["posterior_thinning_method"], "systematic"
+    )
+
+  def test_posterior_thinning_supports_non_leading_draw_dimension(self):
+    values = np.arange(2 * 3 * 10).reshape((2, 3, 10))
+    meridian = self._meridian_with_posterior(xr.Dataset(
+        data_vars={
+            "param": (
+                ("channel", constants.CHAIN, constants.DRAW),
+                values,
+            ),
+        },
+        coords={
+            "channel": ["a", "b"],
+            constants.CHAIN: np.arange(3),
+            constants.DRAW: np.arange(10),
+        },
+    ))
+
+    thinned = meridian.posterior_thinning(n_draws=4, seed=7)
+
+    self.assertEqual(
+        thinned["param"].dims, ("channel", constants.CHAIN, constants.DRAW)
+    )
+    self.assertEqual(thinned.sizes[constants.CHAIN], 3)
+    self.assertEqual(thinned.sizes[constants.DRAW], 4)
+    self.assertEqual(thinned.sizes["channel"], 2)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="ten_to_four", n_original_draws=10, n_selected_draws=4
+      ),
+      dict(
+          testcase_name="eleven_to_six", n_original_draws=11, n_selected_draws=6
+      ),
+      dict(testcase_name="same_count", n_original_draws=5, n_selected_draws=5),
+  )
+  def test_systematic_draw_indices_returns_exact_count(
+      self, n_original_draws, n_selected_draws
+  ):
+    selected = model._systematic_draw_indices(
+        n_original_draws=n_original_draws,
+        n_selected_draws=n_selected_draws,
+        rng=np.random.default_rng(7),
+    )
+
+    self.assertLen(selected, n_selected_draws)
+    self.assertLen(set(selected.tolist()), n_selected_draws)
+    self.assertTrue(np.all(np.diff(selected) >= 1))
+    self.assertTrue(np.all(selected >= 0))
+    self.assertTrue(np.all(selected < n_original_draws))
+
+  def test_posterior_thinning_seed_reproducible(self):
+    values = np.arange(2 * 30).reshape((2, 30))
+    first_meridian = self._meridian_with_posterior(xr.Dataset(
+        data_vars={
+            "param": (
+                (constants.CHAIN, constants.DRAW),
+                values,
+            ),
+        },
+        coords={
+            constants.CHAIN: np.arange(2),
+            constants.DRAW: np.arange(30),
+        },
+    ))
+    second_meridian = self._meridian_with_posterior(
+        first_meridian.inference_data.posterior.copy(deep=True)  # pyrefly: ignore[missing-attribute]
+    )
+
+    first = first_meridian.posterior_thinning(n_draws=5, seed=7)
+    second = second_meridian.posterior_thinning(n_draws=5, seed=7)
+
+    self.assertEqual(first.attrs["posterior_thinning_seed"], 7)
+    np.testing.assert_array_equal(first["param"].values, second["param"].values)
+
+  def test_posterior_thinning_requires_posterior(self):
+    meridian = model.Meridian(input_data=self.input_data_with_media_only)
+
+    with self.assertRaises(errors.NotFittedModelError):
+      meridian.posterior_thinning(sampling_rate=0.1)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="missing", kwargs={}),
+      dict(testcase_name="both", kwargs={"sampling_rate": 0.1, "n_draws": 2}),
+  )
+  def test_posterior_thinning_requires_exactly_one_draw_argument(
+      self, kwargs
+  ):
+    meridian = self._meridian_with_posterior(_simple_posterior())
+
+    with self.assertRaisesRegex(ValueError, "Exactly one"):
+      meridian.posterior_thinning(**kwargs)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="zero", kwargs={"n_draws": 0}),
+      dict(testcase_name="too_many", kwargs={"n_draws": 11}),
+  )
+  def test_posterior_thinning_rejects_invalid_n_draws(self, kwargs):
+    meridian = self._meridian_with_posterior(_simple_posterior())
+
+    with self.assertRaisesRegex(ValueError, "`n_draws`"):
+      meridian.posterior_thinning(**kwargs)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="zero", kwargs={"sampling_rate": 0}),
+      dict(testcase_name="too_large", kwargs={"sampling_rate": 1.1}),
+  )
+  def test_posterior_thinning_rejects_invalid_sampling_rate(self, kwargs):
+    meridian = self._meridian_with_posterior(_simple_posterior())
+
+    with self.assertRaisesRegex(ValueError, "`sampling_rate`"):
+      meridian.posterior_thinning(**kwargs)
+
+  def test_posterior_thinning_rejects_invalid_method(self):
+    meridian = self._meridian_with_posterior(_simple_posterior())
+
+    with self.assertRaisesRegex(ValueError, "Unsupported"):
+      meridian.posterior_thinning(n_draws=4, method=mock.MagicMock())
+
+  def test_posterior_thinning_rejects_thinning_twice(self):
+    meridian = self._meridian_with_posterior(_simple_posterior())
+
+    meridian.posterior_thinning(n_draws=4, seed=7)
+
+    with self.assertRaisesRegex(ValueError, "already been thinned"):
+      meridian.posterior_thinning(n_draws=2)
+
+  def test_sample_prior_populates_inference_data(self):
+    meridian = model.Meridian(input_data=self.input_data_with_media_only)
+    self.assertFalse(hasattr(meridian.inference_data, constants.PRIOR))
+
+    n_draws = 5
+    meridian.sample_prior(n_draws=n_draws, seed=42)
+
+    self.assertTrue(hasattr(meridian.inference_data, constants.PRIOR))
+    prior_group = meridian.inference_data[constants.PRIOR]
+    self.assertEqual(prior_group.sizes[constants.CHAIN], 1)
+    self.assertEqual(prior_group.sizes[constants.DRAW], n_draws)
+
+
+class ModelPersistenceTest(
+    test_utils.MeridianTestCase,
+    model_test_data.WithInputDataSamples,
+):
+
+  input_data_samples = model_test_data.WithInputDataSamples
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    model_test_data.WithInputDataSamples.setup()
+
+  def setUp(self):
+    super().setUp()
+    # The create_tempdir() method below internally uses command line flag
+    # (--test_tmpdir) and such flags are not marked as parsed by default
+    # when running with pytest. Marking as parsed directly here to make the
+    # pytest run pass.
+    flags.FLAGS.mark_as_parsed()
+    self.file_path = os.path.join(self.create_tempdir().full_path, "joblib")
+
+  def test_save_and_load_works(self):
+    mmm = model.Meridian(input_data=self.input_data_with_media_and_rf)
+    model.save_mmm(mmm, str(self.file_path))
+    self.assertTrue(os.path.exists(self.file_path))
+    new_mmm = model.load_mmm(self.file_path)
+    for attr in dir(mmm):
+      if isinstance(getattr(mmm, attr), (int, bool)):
+        with self.subTest(name=attr):
+          self.assertEqual(getattr(mmm, attr), getattr(new_mmm, attr))
+      elif isinstance(getattr(mmm, attr), backend.Tensor):
+        with self.subTest(name=attr):
+          test_utils.assert_allclose(getattr(mmm, attr), getattr(new_mmm, attr))
+
+  def test_save_and_load_bare_filename(self):
+    mmm = model.Meridian(input_data=self.input_data_with_media_and_rf)
+    old_cwd = os.getcwd()
+    try:
+      os.chdir(self.create_tempdir().full_path)
+      model.save_mmm(mmm, "joblib.pkl")
+      self.assertTrue(os.path.exists("joblib.pkl"))
+      new_mmm = model.load_mmm("joblib.pkl")
+      self.assertEqual(mmm.n_geos, new_mmm.n_geos)
+    finally:
+      os.chdir(old_cwd)
+
+  def test_load_error(self):
+    with self.assertRaisesWithLiteralMatch(
+        FileNotFoundError, "No such file or directory: this/path/does/not/exist"
+    ):
+      model.load_mmm("this/path/does/not/exist")
+
+  def test_save_and_load_warning(self):
+    mmm = model.Meridian(input_data=self.input_data_with_media_and_rf)
+    with self.assertWarns(DeprecationWarning):
+      model.save_mmm(mmm, str(self.file_path))
+    with self.assertWarns(DeprecationWarning):
+      model.load_mmm(self.file_path)
+
+  # TODO: Move this integration test to a separate module.
+  def test_get_joint_dist_constants(self):
+    zero = backend.np_float_dtype(0.0)
+    model_spec = spec.ModelSpec(
+        # `beta_m`, `beta_rf`, `contribution_m`, and `contribution_rf` are
+        # omitted because they are ignored with the default ROI prior types.
+        prior=prior_distribution.PriorDistribution(
+            knot_values=backend.tfd.Deterministic(zero),
+            tau_g_excl_baseline=backend.tfd.Deterministic(zero),
+            beta_om=backend.tfd.Deterministic(zero),
+            beta_orf=backend.tfd.Deterministic(zero),
+            contribution_om=backend.tfd.Deterministic(zero),
+            contribution_orf=backend.tfd.Deterministic(zero),
+            contribution_n=backend.tfd.Deterministic(zero),
+            eta_m=backend.tfd.Deterministic(zero),
+            eta_rf=backend.tfd.Deterministic(zero),
+            eta_om=backend.tfd.Deterministic(zero),
+            eta_orf=backend.tfd.Deterministic(zero),
+            gamma_c=backend.tfd.Deterministic(zero),
+            xi_c=backend.tfd.Deterministic(zero),
+            gamma_n=backend.tfd.Deterministic(zero),
+            xi_n=backend.tfd.Deterministic(zero),
+            alpha_m=backend.tfd.Deterministic(zero),
+            alpha_rf=backend.tfd.Deterministic(zero),
+            alpha_om=backend.tfd.Deterministic(zero),
+            alpha_orf=backend.tfd.Deterministic(zero),
+            sigma=backend.tfd.Deterministic(zero),
+            roi_m=backend.tfd.Deterministic(zero),
+            roi_rf=backend.tfd.Deterministic(zero),
+        ),
+        media_effects_dist=constants.MEDIA_EFFECTS_NORMAL,
+    )
+    meridian = model.Meridian(
+        input_data=self.short_input_data_non_media,
+        model_spec=model_spec,
+    )
+    sample = (
+        meridian.posterior_sampler_callable._get_joint_dist_unpinned().sample(
+            self._N_DRAWS, seed=self.get_next_rng_seed_or_key()
+        )
+    )
+    test_utils.assert_allequal(
+        sample.y,
+        backend.zeros(shape=(self._N_DRAWS, self._N_GEOS, self._N_TIMES_SHORT)),
+    )
+
+  # TODO: Move this integration test to a separate module.
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="default_normal_failing",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+          organic_media_prior_type=constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+          organic_rf_prior_type=constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+          non_media_treatments_prior_type=constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+          media_effects_dist=constants.MEDIA_EFFECTS_NORMAL,
+      ),
+      dict(
+          testcase_name="mixed_log_normal_ok",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_MROI,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_ROI,
+          organic_media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          organic_rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          non_media_treatments_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          media_effects_dist=constants.MEDIA_EFFECTS_LOG_NORMAL,
+      ),
+      dict(
+          testcase_name="mixed_normal_failing",
+          media_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          rf_prior_type=constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+          organic_media_prior_type=constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+          organic_rf_prior_type=constants.TREATMENT_PRIOR_TYPE_COEFFICIENT,
+          non_media_treatments_prior_type=constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
+          media_effects_dist=constants.MEDIA_EFFECTS_NORMAL,
+      ),
+  )
+  def test_get_joint_dist_with_log_prob_non_media(
+      self,
+      media_prior_type: str,
+      rf_prior_type: str,
+      organic_media_prior_type: str,
+      organic_rf_prior_type: str,
+      non_media_treatments_prior_type: str,
+      media_effects_dist: str,
+  ):
+    model_spec = spec.ModelSpec(
+        media_prior_type=media_prior_type,
+        rf_prior_type=rf_prior_type,
+        organic_media_prior_type=organic_media_prior_type,
+        organic_rf_prior_type=organic_rf_prior_type,
+        non_media_treatments_prior_type=non_media_treatments_prior_type,
+        media_effects_dist=media_effects_dist,
+    )
+    meridian = model.Meridian(
+        model_spec=model_spec,
+        input_data=self.short_input_data_non_media_and_organic,
+    )
+
+    # Take a single draw of all parameters from the prior distribution.
+    par_structtuple = (
+        meridian.posterior_sampler_callable._get_joint_dist_unpinned().sample(
+            1, seed=self.get_next_rng_seed_or_key()
+        )
+    )
+    par = par_structtuple._asdict()
+
+    # Note that "y" is a draw from the prior predictive (transformed) outcome
+    # distribution. We drop it because "y" is already "pinned" in
+    # meridian._get_joint_dist() and is not actually a parameter.
+    del par["y"]
+
+    # Note that the actual (transformed) outcome data is "pinned" as "y".
+    log_prob_parts_structtuple = (
+        meridian.posterior_sampler_callable._get_joint_dist().log_prob_parts(
+            par
+        )
+    )
+    log_prob_parts = {
+        k: v._asdict() for k, v in log_prob_parts_structtuple._asdict().items()
+    }
+
+    derived_params = [
+        constants.BETA_GM,
+        constants.BETA_GRF,
+        constants.BETA_GOM,
+        constants.BETA_GORF,
+        constants.GAMMA_GC,
+        constants.GAMMA_GN,
+        constants.MU_T,
+        constants.TAU_G,
+    ]
+    prior_distribution_params = [
+        constants.KNOT_VALUES,
+        constants.ETA_M,
+        constants.ETA_RF,
+        constants.ETA_OM,
+        constants.ETA_ORF,
+        constants.GAMMA_C,
+        constants.XI_C,
+        constants.XI_N,
+        constants.ALPHA_M,
+        constants.ALPHA_RF,
+        constants.ALPHA_OM,
+        constants.ALPHA_ORF,
+        constants.EC_M,
+        constants.EC_RF,
+        constants.EC_OM,
+        constants.EC_ORF,
+        constants.SLOPE_M,
+        constants.SLOPE_RF,
+        constants.SLOPE_OM,
+        constants.SLOPE_ORF,
+        constants.SIGMA,
+    ]
+    if media_prior_type == constants.TREATMENT_PRIOR_TYPE_ROI:
+      derived_params.append(constants.BETA_M)
+      prior_distribution_params.append(constants.ROI_M)
+    elif media_prior_type == constants.TREATMENT_PRIOR_TYPE_MROI:
+      derived_params.append(constants.BETA_M)
+      prior_distribution_params.append(constants.MROI_M)
+    elif media_prior_type == constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION:
+      derived_params.append(constants.BETA_M)
+      prior_distribution_params.append(constants.CONTRIBUTION_M)
+    elif media_prior_type == constants.TREATMENT_PRIOR_TYPE_COEFFICIENT:
+      prior_distribution_params.append(constants.BETA_M)
+    else:
+      raise ValueError(f"Unsupported media prior type: {media_prior_type}")
+
+    if rf_prior_type == constants.TREATMENT_PRIOR_TYPE_ROI:
+      derived_params.append(constants.BETA_RF)
+      prior_distribution_params.append(constants.ROI_RF)
+    elif rf_prior_type == constants.TREATMENT_PRIOR_TYPE_MROI:
+      derived_params.append(constants.BETA_RF)
+      prior_distribution_params.append(constants.MROI_RF)
+    elif rf_prior_type == constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION:
+      derived_params.append(constants.BETA_RF)
+      prior_distribution_params.append(constants.CONTRIBUTION_RF)
+    elif rf_prior_type == constants.TREATMENT_PRIOR_TYPE_COEFFICIENT:
+      prior_distribution_params.append(constants.BETA_RF)
+    else:
+      raise ValueError(f"Unsupported RF prior type: {rf_prior_type}")
+
+    if organic_media_prior_type == constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION:
+      derived_params.append(constants.BETA_OM)
+      prior_distribution_params.append(constants.CONTRIBUTION_OM)
+    elif organic_media_prior_type == constants.TREATMENT_PRIOR_TYPE_COEFFICIENT:
+      prior_distribution_params.append(constants.BETA_OM)
+    else:
+      raise ValueError(
+          f"Unsupported organic media prior type: {organic_media_prior_type}"
+      )
+
+    if organic_rf_prior_type == constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION:
+      derived_params.append(constants.BETA_ORF)
+      prior_distribution_params.append(constants.CONTRIBUTION_ORF)
+    elif organic_rf_prior_type == constants.TREATMENT_PRIOR_TYPE_COEFFICIENT:
+      prior_distribution_params.append(constants.BETA_ORF)
+    else:
+      raise ValueError(
+          f"Unsupported organic RF prior type: {organic_rf_prior_type}"
+      )
+
+    if (
+        non_media_treatments_prior_type
+        == constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION
+    ):
+      derived_params.append(constants.GAMMA_N)
+      prior_distribution_params.append(constants.CONTRIBUTION_N)
+    elif (
+        non_media_treatments_prior_type
+        == constants.TREATMENT_PRIOR_TYPE_COEFFICIENT
+    ):
+      prior_distribution_params.append(constants.GAMMA_N)
+    else:
+      raise ValueError(
+          "Unsupported non-media treatments prior type:"
+          f" {non_media_treatments_prior_type}"
+      )
+
+    # Parameters that are derived from other parameters via Deterministic()
+    # should have zero contribution to log_prob.
+    for parname in derived_params:
+      test_utils.assert_allequal(log_prob_parts["unpinned"][parname][0], 0)
+
+    prior_distribution_logprobs = {}
+    for parname in prior_distribution_params:
+      prior_distribution_logprobs[parname] = backend.reduce_sum(
+          getattr(meridian.prior_broadcast, parname).log_prob(par[parname])
+      )
+      test_utils.assert_allclose(
+          prior_distribution_logprobs[parname],
+          log_prob_parts["unpinned"][parname][0],
+      )
+
+    coef_params = [
+        constants.BETA_GM_DEV,
+        constants.BETA_GRF_DEV,
+        constants.BETA_GOM_DEV,
+        constants.BETA_GORF_DEV,
+        constants.GAMMA_GC_DEV,
+        constants.GAMMA_GN_DEV,
+    ]
+    coef_logprobs = {}
+    for parname in coef_params:
+      coef_logprobs[parname] = backend.reduce_sum(
+          backend.tfd.Normal(
+              backend.np_float_dtype(0), backend.np_float_dtype(1)
+          ).log_prob(par[parname])
+      )
+      test_utils.assert_allclose(
+          coef_logprobs[parname], log_prob_parts["unpinned"][parname][0]
+      )
+    transformed_media = meridian.model_equations.adstock_hill_media(
+        media=meridian.media_tensors.media_scaled,  # pyrefly: ignore[bad-argument-type]
+        alpha=par[constants.ALPHA_M],
+        ec=par[constants.EC_M],
+        slope=par[constants.SLOPE_M],
+        decay_functions=meridian.adstock_decay_spec.media,
+    )[0, :, :, :]
+    transformed_reach = meridian.model_equations.adstock_hill_rf(
+        reach=meridian.rf_tensors.reach_scaled,  # pyrefly: ignore[bad-argument-type]
+        frequency=meridian.rf_tensors.frequency,  # pyrefly: ignore[bad-argument-type]
+        alpha=par[constants.ALPHA_RF],
+        ec=par[constants.EC_RF],
+        slope=par[constants.SLOPE_RF],
+        decay_functions=meridian.adstock_decay_spec.rf,
+    )[0, :, :, :]
+    transformed_organic_media = meridian.model_equations.adstock_hill_media(
+        media=meridian.organic_media_tensors.organic_media_scaled,  # pyrefly: ignore[bad-argument-type]
+        alpha=par[constants.ALPHA_OM],
+        ec=par[constants.EC_OM],
+        slope=par[constants.SLOPE_OM],
+        decay_functions=meridian.adstock_decay_spec.organic_media,
+    )[0, :, :, :]
+    transformed_organic_reach = meridian.model_equations.adstock_hill_rf(
+        reach=meridian.organic_rf_tensors.organic_reach_scaled,  # pyrefly: ignore[bad-argument-type]
+        frequency=meridian.organic_rf_tensors.organic_frequency,  # pyrefly: ignore[bad-argument-type]
+        alpha=par[constants.ALPHA_ORF],
+        ec=par[constants.EC_ORF],
+        slope=par[constants.SLOPE_ORF],
+        decay_functions=meridian.adstock_decay_spec.organic_rf,
+    )[0, :, :, :]
+    combined_transformed_media = backend.concatenate(
+        [
+            transformed_media,
+            transformed_reach,
+            transformed_organic_media,
+            transformed_organic_reach,
+        ],
+        axis=-1,
+    )
+
+    combined_beta = backend.concatenate(
+        [
+            par[constants.BETA_GM][0, :, :],
+            par[constants.BETA_GRF][0, :, :],
+            par[constants.BETA_GOM][0, :, :],
+            par[constants.BETA_GORF][0, :, :],
+        ],
+        axis=-1,
+    )
+    y_means = (
+        par[constants.TAU_G][0, :, None]
+        + par[constants.MU_T][0, None, :]
+        + backend.einsum(
+            "gtm,gm->gt", combined_transformed_media, combined_beta
+        )
+        + backend.einsum(
+            "gtc,gc->gt",
+            meridian.controls_scaled,
+            par[constants.GAMMA_GC][0, :, :],
+        )
+        + backend.einsum(
+            "gtn,gn->gt",
+            meridian.non_media_treatments_normalized,
+            par[constants.GAMMA_GN][0, :, :],
+        )
+    )
+    y_means_logprob = backend.reduce_sum(
+        backend.tfd.Normal(y_means, par[constants.SIGMA]).log_prob(
+            meridian.kpi_scaled
+        )
+    )
+    test_utils.assert_allclose(
+        y_means_logprob, log_prob_parts["pinned"]["y"][0]
+    )
+
+    tau_g_logprob = backend.reduce_sum(
+        getattr(
+            meridian.prior_broadcast, constants.TAU_G_EXCL_BASELINE
+        ).log_prob(par[constants.TAU_G_EXCL_BASELINE])
+    )
+    test_utils.assert_allclose(
+        tau_g_logprob,
+        log_prob_parts["unpinned"][constants.TAU_G_EXCL_BASELINE][0],
+    )
+
+    posterior_unnormalized_logprob = (
+        sum(prior_distribution_logprobs.values())
+        + sum(coef_logprobs.values())
+        + y_means_logprob
+        + tau_g_logprob
+    )
+    test_utils.assert_allclose(
+        posterior_unnormalized_logprob,
+        meridian.posterior_sampler_callable._get_joint_dist().log_prob(par)[0],
+        rtol=1e-3,
+    )
+
+  # TODO: Move this integration test to a separate module.
+  def test_validate_injected_inference_data_correct_shapes(self):
+    """Checks validation passes with correct shapes."""
+    data = self.input_data_non_media_and_organic
+    model_spec = spec.ModelSpec()
+    meridian = model.Meridian(
+        input_data=data,
+        model_spec=model_spec,
+    )
+    n_chains = 1
+    n_draws = 10
+    prior_samples = meridian.prior_sampler_callable(n_draws, seed=1)
+    prior_coords = meridian.model_context.create_inference_data_coords(
+        n_chains, n_draws
+    )
+    prior_dims = meridian.model_context.create_inference_data_dims()
+    inference_data = az.convert_to_inference_data(
+        prior_samples,
+        coords=prior_coords,
+        dims=prior_dims,
+        group=constants.PRIOR,
+    )
+
+    # This should not raise an error
+    meridian_with_inference_data = model.Meridian(
+        input_data=data,
+        model_spec=model_spec,
+        inference_data=inference_data,
+    )
+
+    self.assertEqual(
+        meridian_with_inference_data.inference_data, inference_data
+    )
+
+  # TODO: Move this integration test to a separate module.
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="non_media_channels",
+          coord=constants.NON_MEDIA_CHANNEL,
+          mismatched_priors={
+              constants.GAMMA_GN: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_GEOS,
+                  input_data_samples._N_NON_MEDIA_CHANNELS + 1,
+              ),
+              constants.GAMMA_N: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_NON_MEDIA_CHANNELS + 1,
+              ),
+              constants.XI_N: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_NON_MEDIA_CHANNELS + 1,
+              ),
+              constants.CONTRIBUTION_N: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_NON_MEDIA_CHANNELS + 1,
+              ),
+          },
+          mismatched_coord_size=input_data_samples._N_NON_MEDIA_CHANNELS + 1,
+          expected_coord_size=input_data_samples._N_NON_MEDIA_CHANNELS,
+      ),
+      dict(
+          testcase_name="organic_rf_channels",
+          coord=constants.ORGANIC_RF_CHANNEL,
+          mismatched_priors={
+              constants.ALPHA_ORF: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_ORGANIC_RF_CHANNELS + 1,
+              ),
+              constants.BETA_ORF: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_ORGANIC_RF_CHANNELS + 1,
+              ),
+              constants.BETA_GORF: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_GEOS,
+                  input_data_samples._N_ORGANIC_RF_CHANNELS + 1,
+              ),
+              constants.EC_ORF: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_ORGANIC_RF_CHANNELS + 1,
+              ),
+              constants.ETA_ORF: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_ORGANIC_RF_CHANNELS + 1,
+              ),
+              constants.SLOPE_ORF: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_ORGANIC_RF_CHANNELS + 1,
+              ),
+              constants.CONTRIBUTION_ORF: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_ORGANIC_RF_CHANNELS + 1,
+              ),
+          },
+          mismatched_coord_size=input_data_samples._N_ORGANIC_RF_CHANNELS + 1,
+          expected_coord_size=input_data_samples._N_ORGANIC_RF_CHANNELS,
+      ),
+  )
+  def test_validate_injected_inference_data_prior_incorrect_coordinates(
+      self, coord, mismatched_priors, mismatched_coord_size, expected_coord_size
+  ):
+    """Checks validation fails with incorrect coordinates."""
+    data = self.input_data_non_media_and_organic
+    model_spec = spec.ModelSpec()
+    meridian = model.Meridian(
+        input_data=data,
+        model_spec=model_spec,
+    )
+    prior_samples = meridian.prior_sampler_callable(self._N_DRAWS, seed=1)
+    prior_coords = meridian.model_context.create_inference_data_coords(
+        1, self._N_DRAWS
+    )
+    prior_dims = meridian.model_context.create_inference_data_dims()
+
+    prior_samples = dict(prior_samples)
+    for param in mismatched_priors:
+      prior_samples[param] = backend.zeros(mismatched_priors[param])
+    prior_coords = dict(prior_coords)
+    prior_coords[coord] = np.arange(mismatched_coord_size)
+
+    inference_data = az.convert_to_inference_data(
+        prior_samples,
+        coords=prior_coords,
+        dims=prior_dims,
+        group=constants.PRIOR,
+    )
+
+    with self.assertRaisesRegex(
+        ValueError,
+        "Injected inference data prior has incorrect coordinate"
+        f" '{coord}': expected"
+        f" {expected_coord_size}, got"
+        f" {mismatched_coord_size}",
+    ):
+      _ = model.Meridian(
+          input_data=self.input_data_non_media_and_organic,
+          model_spec=model_spec,
+          inference_data=inference_data,
+      )
+
+  # TODO: Move this integration test to a separate module.
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="sigma_dims_unique_sigma",
+          coord=constants.GEO,
+          mismatched_priors={
+              constants.BETA_GOM: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_GEOS + 1,
+                  input_data_samples._N_ORGANIC_MEDIA_CHANNELS,
+              ),
+              constants.BETA_GORF: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_GEOS + 1,
+                  input_data_samples._N_ORGANIC_RF_CHANNELS,
+              ),
+              constants.GAMMA_GN: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_GEOS + 1,
+                  input_data_samples._N_NON_MEDIA_CHANNELS,
+              ),
+              constants.GAMMA_GC: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_GEOS + 1,
+                  input_data_samples._N_CONTROLS,
+              ),
+              constants.TAU_G: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_GEOS + 1,
+                  input_data_samples._N_CONTROLS,
+              ),
+              constants.TAU_G_EXCL_BASELINE: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_GEOS + 1,
+              ),
+              constants.BETA_GM: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_GEOS + 1,
+                  input_data_samples._N_MEDIA_CHANNELS,
+              ),
+              constants.BETA_GRF: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_GEOS + 1,
+                  input_data_samples._N_RF_CHANNELS,
+              ),
+              constants.BETA_GOM_DEV: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_GEOS + 1,
+                  input_data_samples._N_ORGANIC_MEDIA_CHANNELS,
+              ),
+              constants.BETA_GORF_DEV: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_GEOS + 1,
+                  input_data_samples._N_ORGANIC_RF_CHANNELS,
+              ),
+              constants.GAMMA_GN_DEV: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_GEOS + 1,
+                  input_data_samples._N_NON_MEDIA_CHANNELS,
+              ),
+              constants.GAMMA_GC_DEV: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_GEOS + 1,
+                  input_data_samples._N_CONTROLS,
+              ),
+              constants.SIGMA: (
+                  1,
+                  input_data_samples._N_DRAWS,
+                  input_data_samples._N_GEOS + 1,
+              ),
+          },
+          mismatched_coord_size=input_data_samples._N_GEOS + 1,
+          expected_coord_size=input_data_samples._N_GEOS,
+      ),
+  )
+  def test_validate_injected_inference_data_prior_incorrect_sigma_coordinates(
+      self,
+      coord,
+      mismatched_priors,
+      mismatched_coord_size,
+      expected_coord_size,
+  ):
+    """Checks validation fails with incorrect coordinates for sigma."""
+    data = self.input_data_non_media_and_organic
+    model_spec = spec.ModelSpec(unique_sigma_for_each_geo=True)
+    meridian = model.Meridian(
+        input_data=data,
+        model_spec=model_spec,
+    )
+    prior_samples = meridian.prior_sampler_callable(self._N_DRAWS, seed=1)
+    prior_coords = meridian.model_context.create_inference_data_coords(
+        1, self._N_DRAWS
+    )
+    prior_dims = meridian.model_context.create_inference_data_dims()
+
+    prior_samples = dict(prior_samples)
+    for param in mismatched_priors:
+      prior_samples[param] = backend.zeros(mismatched_priors[param])
+    prior_coords = dict(prior_coords)
+    prior_coords[coord] = np.arange(mismatched_coord_size)
+    prior_coords[constants.GEO] = np.arange(mismatched_coord_size)
+
+    inference_data = az.convert_to_inference_data(
+        prior_samples,
+        coords=prior_coords,
+        dims=prior_dims,
+        group=constants.PRIOR,
+    )
+
+    with self.assertRaisesRegex(
+        ValueError,
+        "Injected inference data prior has incorrect coordinate"
+        f" '{coord}': expected"
+        f" {expected_coord_size}, got"
+        f" {mismatched_coord_size}",
+    ):
+      _ = model.Meridian(
+          input_data=data,
+          model_spec=model_spec,
+          inference_data=inference_data,
+      )
+
+
+class ModelEquationsDelegateTest(test_utils.MeridianTestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.mock_equations = mock.create_autospec(
+        equations.ModelEquations, instance=True, spec_set=True
+    )
+    # Patch ModelEquations to return our mock
+    self.enter_context(
+        mock.patch.object(
+            equations, "ModelEquations", return_value=self.mock_equations
+        )
+    )
+    # We need a minimal Meridian object. We can mock input_data.
+    self.mock_input_data = mock.create_autospec(
+        model.data.InputData, instance=True, spec_set=True
+    )
+    # We need to mock ModelContext as well since Meridian init creates it
+    self.mock_context = mock.create_autospec(
+        model.context.ModelContext, instance=True, spec_set=True
+    )
+    self.mock_context.is_national = False
+    self.enter_context(
+        mock.patch.object(
+            model.context, "ModelContext", return_value=self.mock_context
+        )
+    )
+
+    # Patch EDAEngine to avoid initialization errors
+    self.mock_eda_engine = mock.create_autospec(
+        eda_engine.EDAEngine, instance=True, spec_set=True
+    )
+    self.mock_eda_engine.kpi_has_variability = True
+    self.enter_context(
+        mock.patch.object(
+            eda_engine, "EDAEngine", return_value=self.mock_eda_engine
+        )
+    )
+
+    self.mmm = model.Meridian(input_data=self.mock_input_data)
+    # Verify equations was set to our mock (sanity check of the setup)
+    self.assertIs(self.mmm.model_equations, self.mock_equations)
+
+  def test_adstock_hill_media_delegates(self):
+    media_val = mock.Mock()
+    alpha = mock.Mock()
+    ec = mock.Mock()
+    slope = mock.Mock()
+    decay_functions = "geometric"
+    n_times_output = 10
+
+    self.mmm.adstock_hill_media(
+        media=media_val,
+        alpha=alpha,
+        ec=ec,
+        slope=slope,
+        decay_functions=decay_functions,
+        n_times_output=n_times_output,
+    )
+
+    self.mock_equations.adstock_hill_media.assert_called_once_with(
+        media=media_val,
+        alpha=alpha,
+        ec=ec,
+        slope=slope,
+        decay_functions=decay_functions,
+        n_times_output=n_times_output,
+    )
+
+  def test_adstock_hill_rf_delegates(self):
+    reach = mock.Mock()
+    frequency = mock.Mock()
+    alpha = mock.Mock()
+    ec = mock.Mock()
+    slope = mock.Mock()
+    decay_functions = "geometric"
+    n_times_output = 10
+
+    self.mmm.adstock_hill_rf(
+        reach=reach,
+        frequency=frequency,
+        alpha=alpha,
+        ec=ec,
+        slope=slope,
+        decay_functions=decay_functions,
+        n_times_output=n_times_output,
+    )
+
+    self.mock_equations.adstock_hill_rf.assert_called_once_with(
+        reach=reach,
+        frequency=frequency,
+        alpha=alpha,
+        ec=ec,
+        slope=slope,
+        decay_functions=decay_functions,
+        n_times_output=n_times_output,
+    )
+
+  def test_calculate_beta_x_delegates(self):
+    is_non_media = True
+    incremental_outcome_x = mock.Mock()
+    linear_predictor_diff = mock.Mock()
+    eta_x = mock.Mock()
+    beta_gx_dev = mock.Mock()
+
+    self.mmm.calculate_beta_x(
+        is_non_media=is_non_media,
+        incremental_outcome_x=incremental_outcome_x,
+        linear_predictor_counterfactual_difference=linear_predictor_diff,
+        eta_x=eta_x,
+        beta_gx_dev=beta_gx_dev,
+    )
+
+    self.mock_equations.calculate_beta_x.assert_called_once_with(
+        is_non_media=is_non_media,
+        incremental_outcome_x=incremental_outcome_x,
+        linear_predictor_counterfactual_difference=linear_predictor_diff,
+        eta_x=eta_x,
+        beta_gx_dev=beta_gx_dev,
+    )
+
+  def test_linear_predictor_counterfactual_difference_media_delegates(self):
+    media_transformed = mock.Mock()
+    alpha_m = mock.Mock()
+    ec_m = mock.Mock()
+    slope_m = mock.Mock()
+
+    self.mmm.linear_predictor_counterfactual_difference_media(
+        media_transformed=media_transformed,
+        alpha_m=alpha_m,
+        ec_m=ec_m,
+        slope_m=slope_m,
+    )
+
+    self.mock_equations.linear_predictor_counterfactual_difference_media.assert_called_once_with(
+        media_transformed=media_transformed,
+        alpha_m=alpha_m,
+        ec_m=ec_m,
+        slope_m=slope_m,
+    )
+
+  def test_linear_predictor_counterfactual_difference_rf_delegates(self):
+    rf_transformed = mock.Mock()
+    alpha_rf = mock.Mock()
+    ec_rf = mock.Mock()
+    slope_rf = mock.Mock()
+
+    self.mmm.linear_predictor_counterfactual_difference_rf(
+        rf_transformed=rf_transformed,
+        alpha_rf=alpha_rf,
+        ec_rf=ec_rf,
+        slope_rf=slope_rf,
+    )
+
+    self.mock_equations.linear_predictor_counterfactual_difference_rf.assert_called_once_with(
+        rf_transformed=rf_transformed,
+        alpha_rf=alpha_rf,
+        ec_rf=ec_rf,
+        slope_rf=slope_rf,
+    )
+
+
+if __name__ == "__main__":
+  absltest.main()

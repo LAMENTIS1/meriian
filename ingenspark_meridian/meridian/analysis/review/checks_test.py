@@ -1,0 +1,2812 @@
+# Copyright 2026 The Meridian Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections.abc import Callable, Sequence
+import statistics
+from unittest import mock
+
+from absl.testing import absltest
+from absl.testing import parameterized
+import arviz as az
+from ingenspark_meridian.meridian import backend
+from ingenspark_meridian.meridian import constants
+from ingenspark_meridian.meridian.analysis import analyzer as analyzer_module
+from ingenspark_meridian.meridian.analysis.review import checks
+from ingenspark_meridian.meridian.analysis.review import configs
+from ingenspark_meridian.meridian.analysis.review import constants as review_constants
+from ingenspark_meridian.meridian.analysis.review import results
+from ingenspark_meridian.meridian.data import input_data
+from ingenspark_meridian.meridian.model import context
+from ingenspark_meridian.meridian.model import transformers
+import numpy as np
+import xarray as xr
+
+
+class ConvergenceCheckTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.model_context = mock.create_autospec(
+        spec=context.ModelContext, spec_set=True, instance=True
+    )
+    self.inference_data = mock.create_autospec(
+        spec=az.InferenceData, spec_set=False, instance=True
+    )
+    self.inference_data.posterior = mock.create_autospec(
+        xr.Dataset, spec_set=True, instance=True
+    )
+    self.analyzer = mock.create_autospec(
+        spec=analyzer_module.Analyzer, spec_set=True, instance=True
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="not_converged_high_rhat",
+          rhat_mock_value=11.0,
+          expected_case=results.ConvergenceCases.NOT_CONVERGED,
+      ),
+      dict(
+          testcase_name="needs_review_medium_rhat",
+          rhat_mock_value=9.0,
+          expected_case=results.ConvergenceCases.NOT_FULLY_CONVERGED,
+      ),
+      dict(
+          testcase_name="converged_low_rhat",
+          rhat_mock_value=1.1,
+          expected_case=results.ConvergenceCases.CONVERGED,
+      ),
+  )
+  def test_convergence_check(
+      self,
+      rhat_mock_value: float,
+      expected_case: results.ConvergenceCases,
+  ):
+    self.analyzer.get_rhat.return_value = {
+        "mock_var": np.array([rhat_mock_value])
+    }
+
+    config = configs.ConvergenceConfig()
+    convergence_check = checks.ConvergenceCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+    )
+    result = convergence_check.run()
+    self.assertEqual(result.case, expected_case)
+
+    if result.case == results.ConvergenceCases.CONVERGED:
+      self.assertEqual(
+          result.recommendation,
+          "The model has likely converged, as all parameters have R-hat values"
+          " < 1.2.",
+      )
+    elif result.case == results.ConvergenceCases.NOT_FULLY_CONVERGED:
+      self.assertEqual(
+          result.recommendation,
+          "The model hasn't fully converged, and the `max_r_hat` for parameter"
+          " `mock_var` is 9.00. "
+          + review_constants.NOT_FULLY_CONVERGED_RECOMMENDATION,
+      )
+    elif result.case == results.ConvergenceCases.NOT_CONVERGED:
+      self.assertEqual(
+          result.recommendation,
+          "The model hasn't converged, and the `max_r_hat` for parameter"
+          " `mock_var` is 11.00. "
+          + review_constants.NOT_CONVERGED_RECOMMENDATION,
+      )
+
+  def test_convergence_check_with_nan_rhats(self):
+    self.analyzer.get_rhat.return_value = {
+        "mock_var": np.array([np.nan, np.nan])
+    }
+
+    config = configs.ConvergenceConfig()
+    convergence_check = checks.ConvergenceCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+    )
+    result = convergence_check.run()
+    self.assertEqual(result.case, results.ConvergenceCases.CONVERGED)
+    self.assertTrue(np.isnan(result.details[results.constants.RHAT]))
+    self.assertTrue(np.isnan(result.details[results.constants.PARAMETER]))
+    self.assertEqual(
+        result.details[results.constants.CONVERGENCE_THRESHOLD],
+        config.convergence_threshold,
+    )
+    self.assertEqual(
+        result.recommendation,
+        "The model has likely converged, as all parameters have R-hat values"
+        " < 1.2.",
+    )
+
+
+class ROIConsistencyCheckTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.model_context = mock.create_autospec(
+        spec=context.ModelContext, spec_set=True, instance=True
+    )
+    self.model_context.model_spec.effective_media_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_ROI
+    )
+    self.model_context.model_spec.effective_rf_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_ROI
+    )
+    self.inference_data = mock.create_autospec(
+        spec=az.InferenceData, spec_set=False, instance=True
+    )
+    self.inference_data.posterior = mock.create_autospec(
+        xr.Dataset, spec_set=False, instance=True
+    )
+    self.inference_data.posterior.media_channel = mock.create_autospec(
+        xr.DataArray, spec_set=False, instance=True
+    )
+    self.inference_data.posterior.rf_channel = mock.create_autospec(
+        xr.DataArray, spec_set=False, instance=True
+    )
+    self.analyzer = mock.create_autospec(
+        spec=analyzer_module.Analyzer, spec_set=True, instance=True
+    )
+    self.config = configs.ROIConsistencyConfig(
+        prior_lower_quantile=0.01, prior_upper_quantile=0.99
+    )
+
+  def _get_quantile_side_effect(
+      self, num_channels: int, return_scalar: bool = False
+  ) -> Callable[..., np.ndarray]:
+    """Returns a side effect function for mocking quantile calculations."""
+
+    def side_effect(q):
+      if q == 0.01:
+        return 1.0 if return_scalar else np.full((num_channels,), 1.0)
+      elif q == 0.99:
+        return 10.0 if return_scalar else np.full((num_channels,), 10.0)
+      else:
+        raise ValueError(f"Unexpected quantile: {q}")
+
+    return side_effect
+
+  def _run_roi_consistency_check(
+      self,
+      media_channel_names: Sequence[str] | None = None,
+      posterior_means: Sequence[float] | None = None,
+      rf_channel_names: Sequence[str] | None = None,
+      rf_posterior_means: Sequence[float] | None = None,
+  ) -> results.ROIConsistencyCheckResult:
+    """Runs the ROI consistency check with mocked channel data.
+
+    Args:
+      media_channel_names: A sequence of media channel names.
+      posterior_means: A sequence of posterior means corresponding to the media
+        channels.
+      rf_channel_names: A sequence of RF channel names.
+      rf_posterior_means: A sequence of posterior means corresponding to the RF
+        channels.
+
+    Returns:
+      The `ROIConsistencyCheckResult` object from running the check.
+    """
+    coords = []
+    if media_channel_names:
+      self.inference_data.posterior.media_channel.values = media_channel_names
+      self.inference_data.posterior.roi_m = np.array(
+          posterior_means, dtype=float
+      )[np.newaxis, np.newaxis, :]
+      coords.append(constants.MEDIA_CHANNEL)
+
+    if rf_channel_names:
+      self.inference_data.posterior.rf_channel.values = rf_channel_names
+      self.inference_data.posterior.roi_rf = np.array(
+          rf_posterior_means, dtype=float
+      )[np.newaxis, np.newaxis, :]
+      coords.append(constants.RF_CHANNEL)
+
+    self.inference_data.posterior.coords = coords
+
+    self.analyzer.filter_and_aggregate_geos_and_times.side_effect = (
+        lambda tensor, **kwargs: tensor
+    )
+
+    check = checks.ROIConsistencyCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=self.config,
+    )
+    return check.run()
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="all_pass",
+          media_channel_names=["ch1"],
+          posterior_means=[5.0],
+          rf_channel_names=["rf1"],
+          rf_posterior_means=[6.0],
+          expected_aggregate_case=results.ROIConsistencyAggregateCases.PASS,
+          expected_channel_cases=[
+              results.ROIConsistencyChannelCases.ROI_PASS,
+              results.ROIConsistencyChannelCases.ROI_PASS,
+          ],
+          expected_details={
+              "quantile_not_defined_msg": "",
+              "inf_channels_msg": "",
+              "low_high_channels_msg": "",
+          },
+      ),
+      dict(
+          testcase_name="all_pass_global_prior",
+          media_channel_names=["ch1"],
+          posterior_means=[5.0],
+          rf_channel_names=["rf1"],
+          rf_posterior_means=[6.0],
+          expected_aggregate_case=results.ROIConsistencyAggregateCases.PASS,
+          expected_channel_cases=[
+              results.ROIConsistencyChannelCases.ROI_PASS,
+              results.ROIConsistencyChannelCases.ROI_PASS,
+          ],
+          expected_details={
+              "quantile_not_defined_msg": "",
+              "inf_channels_msg": "",
+              "low_high_channels_msg": "",
+          },
+          global_prior=True,
+      ),
+      dict(
+          testcase_name="high_low_pass",
+          media_channel_names=["ch1", "ch2"],
+          posterior_means=[10.1, 5.0],
+          rf_channel_names=["rf1"],
+          rf_posterior_means=[0.9],
+          expected_aggregate_case=results.ROIConsistencyAggregateCases.REVIEW,
+          expected_channel_cases=[
+              results.ROIConsistencyChannelCases.ROI_HIGH,
+              results.ROIConsistencyChannelCases.ROI_PASS,
+              results.ROIConsistencyChannelCases.ROI_LOW,
+          ],
+          expected_details={
+              "quantile_not_defined_msg": "",
+              "inf_channels_msg": "",
+              "low_high_channels_msg": (
+                  "We've detected an unusually low ROI estimate (for channel"
+                  " `rf1`) and an unusually high ROI estimate (for channel"
+                  " `ch1`) where the posterior point estimate falls into the"
+                  " extreme tail of your custom prior."
+              ),
+          },
+      ),
+      dict(
+          testcase_name="high_low_pass_global_prior",
+          media_channel_names=["ch1", "ch2"],
+          posterior_means=[10.1, 5.0],
+          rf_channel_names=["rf1"],
+          rf_posterior_means=[0.9],
+          expected_aggregate_case=results.ROIConsistencyAggregateCases.REVIEW,
+          expected_channel_cases=[
+              results.ROIConsistencyChannelCases.ROI_HIGH,
+              results.ROIConsistencyChannelCases.ROI_PASS,
+              results.ROIConsistencyChannelCases.ROI_LOW,
+          ],
+          expected_details={
+              "quantile_not_defined_msg": "",
+              "inf_channels_msg": "",
+              "low_high_channels_msg": (
+                  "We've detected an unusually low ROI estimate (for channel"
+                  " `rf1`) and an unusually high ROI estimate (for channel"
+                  " `ch1`) where the posterior point estimate falls into the"
+                  " extreme tail of your custom prior."
+              ),
+          },
+          global_prior=True,
+      ),
+      dict(
+          testcase_name="high_low",
+          media_channel_names=["ch1"],
+          posterior_means=[10.1],
+          rf_channel_names=["rf1", "rf2"],
+          rf_posterior_means=[0.9, 0.8],
+          expected_aggregate_case=results.ROIConsistencyAggregateCases.REVIEW,
+          expected_channel_cases=[
+              results.ROIConsistencyChannelCases.ROI_HIGH,
+              results.ROIConsistencyChannelCases.ROI_LOW,
+              results.ROIConsistencyChannelCases.ROI_LOW,
+          ],
+          expected_details={
+              "quantile_not_defined_msg": "",
+              "inf_channels_msg": "",
+              "low_high_channels_msg": (
+                  "We've detected an unusually low ROI estimate (for channels"
+                  " `rf1`, `rf2`) and an unusually high ROI estimate (for"
+                  " channel `ch1`) where the posterior point estimate falls"
+                  " into the extreme tail of your custom prior."
+              ),
+          },
+      ),
+      dict(
+          testcase_name="only_high_media",
+          media_channel_names=["ch1", "ch2"],
+          posterior_means=[10.1, 11.1],
+          expected_aggregate_case=results.ROIConsistencyAggregateCases.REVIEW,
+          expected_channel_cases=[
+              results.ROIConsistencyChannelCases.ROI_HIGH,
+              results.ROIConsistencyChannelCases.ROI_HIGH,
+          ],
+          expected_details={
+              "quantile_not_defined_msg": "",
+              "inf_channels_msg": "",
+              "low_high_channels_msg": (
+                  "We've detected an unusually high ROI estimate (for channels"
+                  " `ch1`, `ch2`) where the posterior point estimate falls"
+                  " into the extreme tail of your custom prior."
+              ),
+          },
+      ),
+      dict(
+          testcase_name="only_low_rf",
+          rf_channel_names=["rf1", "rf2"],
+          rf_posterior_means=[0.9, 0.8],
+          expected_aggregate_case=results.ROIConsistencyAggregateCases.REVIEW,
+          expected_channel_cases=[
+              results.ROIConsistencyChannelCases.ROI_LOW,
+              results.ROIConsistencyChannelCases.ROI_LOW,
+          ],
+          expected_details={
+              "quantile_not_defined_msg": "",
+              "inf_channels_msg": "",
+              "low_high_channels_msg": (
+                  "We've detected an unusually low ROI estimate (for channels"
+                  " `rf1`, `rf2`) where the posterior point estimate falls"
+                  " into the extreme tail of your custom prior."
+              ),
+          },
+      ),
+  )
+  def test_roi_consistency_check(
+      self,
+      expected_aggregate_case: results.ROIConsistencyAggregateCases,
+      expected_channel_cases: Sequence[results.ROIConsistencyChannelCases],
+      expected_details: dict[str, str],
+      media_channel_names: Sequence[str] | None = None,
+      posterior_means: Sequence[float] | None = None,
+      rf_channel_names: Sequence[str] | None = None,
+      rf_posterior_means: Sequence[float] | None = None,
+      global_prior: bool = False,
+  ):
+    mock_prior_media = mock.create_autospec(
+        spec=backend.tfd.Distribution, spec_set=True, instance=True
+    )
+    if media_channel_names:
+      mock_prior_media.quantile.side_effect = self._get_quantile_side_effect(
+          num_channels=len(media_channel_names), return_scalar=global_prior
+      )
+
+    mock_prior_rf = mock.create_autospec(
+        spec=backend.tfd.Distribution, spec_set=True, instance=True
+    )
+    if rf_channel_names:
+      mock_prior_rf.quantile.side_effect = self._get_quantile_side_effect(
+          num_channels=len(rf_channel_names), return_scalar=global_prior
+      )
+
+    self.model_context.model_spec.prior.roi_m = mock_prior_media
+    self.model_context.model_spec.prior.roi_rf = mock_prior_rf
+
+    result = self._run_roi_consistency_check(
+        media_channel_names=media_channel_names,
+        posterior_means=posterior_means,
+        rf_channel_names=rf_channel_names,
+        rf_posterior_means=rf_posterior_means,
+    )
+
+    self.assertEqual(result.case, expected_aggregate_case)
+    self.assertEqual(
+        [r.case for r in result.channel_results], expected_channel_cases
+    )
+    self.assertEqual(result.details, expected_details)
+
+  def test_roi_consistency_check_infinite_roi_prior(self):
+    mock_prior_media = mock.create_autospec(
+        spec=backend.tfd.Distribution, spec_set=True, instance=True
+    )
+    mock_prior_media.quantile.side_effect = (
+        lambda q: np.array([-np.inf, -np.inf])
+        if q == 0.01
+        else np.array([np.inf, np.inf])
+    )
+
+    mock_prior_rf = mock.create_autospec(
+        spec=backend.tfd.Distribution, spec_set=True, instance=True
+    )
+    mock_prior_rf.quantile.side_effect = self._get_quantile_side_effect(
+        num_channels=1
+    )
+
+    self.model_context.model_spec.prior.roi_m = mock_prior_media
+    self.model_context.model_spec.prior.roi_rf = mock_prior_rf
+
+    result = self._run_roi_consistency_check(
+        media_channel_names=["ch1", "ch2"],
+        posterior_means=[5.0, 5.0],
+        rf_channel_names=["rf1"],
+        rf_posterior_means=[6.0],
+    )
+
+    self.assertEqual(result.case, results.ROIConsistencyAggregateCases.REVIEW)
+    self.assertEqual(
+        [r.case for r in result.channel_results],
+        [
+            results.ROIConsistencyChannelCases.PRIOR_ROI_QUANTILE_INF,
+            results.ROIConsistencyChannelCases.PRIOR_ROI_QUANTILE_INF,
+            results.ROIConsistencyChannelCases.ROI_PASS,
+        ],
+    )
+    expected_details = {
+        "quantile_not_defined_msg": "",
+        "inf_channels_msg": (
+            "Prior ROI quantiles are infinite for channels: ch1, ch2"
+        ),
+        "low_high_channels_msg": "",
+    }
+    self.assertEqual(result.details, expected_details)
+
+  def test_roi_consistency_check_quantile_not_defined(self):
+    mock_prior_media = mock.create_autospec(
+        spec=backend.tfd.Distribution, spec_set=True, instance=True
+    )
+    mock_prior_media.quantile.side_effect = NotImplementedError
+
+    mock_prior_rf = mock.create_autospec(
+        spec=backend.tfd.Distribution, spec_set=True, instance=True
+    )
+    mock_prior_rf.quantile.side_effect = self._get_quantile_side_effect(
+        num_channels=1
+    )
+
+    self.model_context.model_spec.prior.roi_m = mock_prior_media
+    self.model_context.model_spec.prior.roi_rf = mock_prior_rf
+
+    result = self._run_roi_consistency_check(
+        media_channel_names=["ch1"],
+        posterior_means=[5.0],
+        rf_channel_names=["rf1"],
+        rf_posterior_means=[6.0],
+    )
+
+    self.assertEqual(result.case, results.ROIConsistencyAggregateCases.REVIEW)
+    self.assertEqual(
+        [r.case for r in result.channel_results],
+        [
+            results.ROIConsistencyChannelCases.QUANTILE_NOT_DEFINED,
+            results.ROIConsistencyChannelCases.ROI_PASS,
+        ],
+    )
+    expected_details = {
+        "quantile_not_defined_msg": (
+            "The quantile method is not defined for the following parameters:"
+            f" [{mock_prior_media}]. The ROI Consistency check cannot be"
+            " performed for these parameters."
+        ),
+        "inf_channels_msg": "",
+        "low_high_channels_msg": "",
+    }
+    self.assertEqual(result.details, expected_details)
+
+  def test_roi_consistency_check_quantile_not_defined_all_channels(self):
+    mock_prior_media = mock.create_autospec(
+        spec=backend.tfd.Distribution, spec_set=True, instance=True
+    )
+    mock_prior_media.quantile.side_effect = NotImplementedError
+
+    mock_prior_rf = mock.create_autospec(
+        spec=backend.tfd.Distribution, spec_set=True, instance=True
+    )
+    mock_prior_rf.quantile.side_effect = NotImplementedError
+
+    self.model_context.model_spec.prior.roi_m = mock_prior_media
+    self.model_context.model_spec.prior.roi_rf = mock_prior_rf
+
+    result = self._run_roi_consistency_check(
+        media_channel_names=["ch1"],
+        posterior_means=[5.0],
+        rf_channel_names=["rf1"],
+        rf_posterior_means=[6.0],
+    )
+    self.assertEqual(result.case, results.ROIConsistencyAggregateCases.REVIEW)
+    expected_details = {
+        "quantile_not_defined_msg": (
+            "The quantile method is not defined for the following parameters:"
+            f" [{mock_prior_media}, {mock_prior_rf}]. The ROI Consistency check"
+            " cannot be performed for these parameters."
+        ),
+        "inf_channels_msg": "",
+        "low_high_channels_msg": "",
+    }
+    self.assertEqual(result.details, expected_details)
+    self.assertEqual(
+        [res.case for res in result.channel_results],
+        [
+            results.ROIConsistencyChannelCases.QUANTILE_NOT_DEFINED,
+            results.ROIConsistencyChannelCases.QUANTILE_NOT_DEFINED,
+        ],
+    )
+
+  def test_roi_consistency_check_with_selected_times_geos(self):
+    self.inference_data.posterior.media_channel.values = ["ch1"]
+    self.inference_data.posterior.roi_m = np.array([5.0])[
+        np.newaxis, np.newaxis, :
+    ]
+    self.inference_data.posterior.coords = [constants.MEDIA_CHANNEL]
+    mock_prior_media = mock.create_autospec(
+        spec=backend.tfd.Distribution, spec_set=True, instance=True
+    )
+    mock_prior_media.quantile.side_effect = self._get_quantile_side_effect(1)
+    self.model_context.model_spec.prior.roi_m = mock_prior_media
+    self.model_context.model_spec.prior.roi_rf = None
+
+    self.analyzer.filter_and_aggregate_geos_and_times.side_effect = (
+        lambda tensor, **kwargs: tensor
+    )
+
+    check = checks.ROIConsistencyCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=self.config,
+        selected_times=["time1"],
+        selected_geos=["geo1"],
+    )
+    res = check.run()
+    self.assertEqual(res.case, results.ROIConsistencyAggregateCases.PASS)
+
+  def test_is_relevant_true_when_custom_roi_priors(self):
+    self.model_context.n_media_channels = 1
+    self.model_context.model_spec.effective_media_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_ROI
+    )
+    self.assertTrue(checks.ROIConsistencyCheck.is_relevant(self.model_context))
+
+  def test_is_relevant_false_when_non_roi_priors(self):
+    self.model_context.n_media_channels = 1
+    self.model_context.model_spec.effective_media_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_COEFFICIENT
+    )
+    self.model_context.n_rf_channels = 0
+    self.model_context.model_spec.effective_rf_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_COEFFICIENT
+    )
+    self.assertFalse(checks.ROIConsistencyCheck.is_relevant(self.model_context))
+
+
+class PriorPosteriorShiftCheckTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.model_context = mock.create_autospec(
+        spec=context.ModelContext, spec_set=True, instance=True
+    )
+    self.model_context.model_spec.effective_media_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_ROI
+    )
+    self.model_context.model_spec.effective_rf_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_ROI
+    )
+    self.inference_data = mock.create_autospec(
+        spec=az.InferenceData, spec_set=False, instance=True
+    )
+    self.inference_data.posterior = mock.create_autospec(
+        xr.Dataset, spec_set=False, instance=True
+    )
+    self.inference_data.posterior.media_channel = mock.create_autospec(
+        xr.DataArray, spec_set=False, instance=True
+    )
+    self.inference_data.posterior.rf_channel = mock.create_autospec(
+        xr.DataArray, spec_set=False, instance=True
+    )
+    self.analyzer = mock.create_autospec(
+        spec=analyzer_module.Analyzer, spec_set=True, instance=True
+    )
+    self.config = configs.PriorPosteriorShiftConfig(
+        n_bootstraps=100, alpha=0.05, seed=0
+    )
+
+  def _run_prior_posterior_shift_check(
+      self,
+      media_channel_names: Sequence[str] | None = None,
+      posterior_media_samples: np.ndarray | None = None,
+      rf_channel_names: Sequence[str] | None = None,
+      posterior_rf_samples: np.ndarray | None = None,
+      quantile_not_defined: bool = False,
+  ) -> results.PriorPosteriorShiftCheckResult:
+    """Runs the PriorPosteriorShiftCheck with mocked data."""
+    posterior_vars = {}
+    posterior_coords = {}
+    if media_channel_names is not None and posterior_media_samples is not None:
+      n_channels = len(media_channel_names)
+      n_chains, n_draws, _ = posterior_media_samples.shape
+      posterior_coords.update({
+          constants.CHAIN: range(n_chains),
+          constants.DRAW: range(n_draws),
+          constants.MEDIA_CHANNEL: media_channel_names,
+      })
+      self.inference_data.posterior.media_channel.values = media_channel_names
+      posterior_vars[constants.ROI_M] = mock.create_autospec(
+          spec=xr.DataArray,
+          spec_set=True,
+          instance=True,
+          values=posterior_media_samples,
+      )
+
+      dist_m = mock.create_autospec(
+          spec=backend.tfd.Distribution, spec_set=True, instance=True
+      )
+      dist_m.mean.return_value = np.zeros(n_channels)
+
+      if quantile_not_defined:
+        dist_m.quantile.side_effect = NotImplementedError
+      else:
+
+        def quantile_m(q):
+          if q == 0.5:
+            return np.zeros(n_channels)
+          elif q == 0.25:
+            return np.full(n_channels, -0.67448975)
+          elif q == 0.75:
+            return np.full(n_channels, 0.67448975)
+
+        dist_m.quantile.side_effect = quantile_m
+      self.model_context.model_spec.prior.roi_m = dist_m
+
+    if rf_channel_names is not None and posterior_rf_samples is not None:
+      n_channels = len(rf_channel_names)
+      n_chains, n_draws, _ = posterior_rf_samples.shape
+      posterior_coords.update({
+          constants.CHAIN: range(n_chains),
+          constants.DRAW: range(n_draws),
+          constants.RF_CHANNEL: rf_channel_names,
+      })
+      self.inference_data.posterior.rf_channel.values = rf_channel_names
+      posterior_vars[constants.ROI_RF] = mock.create_autospec(
+          spec=xr.DataArray,
+          spec_set=True,
+          instance=True,
+          values=posterior_rf_samples,
+      )
+
+      dist_rf = mock.create_autospec(
+          spec=backend.tfd.Distribution, spec_set=True, instance=True
+      )
+      dist_rf.mean.return_value = np.zeros(n_channels)
+
+      if quantile_not_defined:
+        dist_rf.quantile.side_effect = NotImplementedError
+      else:
+
+        def quantile_rf(q):
+          if q == 0.5:
+            return np.zeros(n_channels)
+          elif q == 0.25:
+            return np.full(n_channels, -0.67448975)
+          elif q == 0.75:
+            return np.full(n_channels, 0.67448975)
+
+        dist_rf.quantile.side_effect = quantile_rf
+      self.model_context.model_spec.prior.roi_rf = dist_rf
+
+    def getitem_side_effect(key):
+      return getattr(self.inference_data.posterior, key)
+
+    self.inference_data.posterior.__getitem__.side_effect = getitem_side_effect
+    self.inference_data.posterior.variables = posterior_vars
+    self.inference_data.posterior.coords = posterior_coords
+
+    check = checks.PriorPosteriorShiftCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=self.config,
+    )
+    return check.run()
+
+  def test_prior_posterior_shift_check_skips_rf_channels_without_roi_priors(
+      self,
+  ):
+    # RF channels use mROI priors, so the posterior has no `roi_rf`.
+    self.model_context.model_spec.effective_rf_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_MROI
+    )
+    result = self._run_prior_posterior_shift_check(
+        media_channel_names=["ch1"],
+        posterior_media_samples=np.full((1, 100, 1), 5.0),
+        rf_channel_names=["rf1"],
+        posterior_rf_samples=np.full((1, 100, 1), 5.0),
+    )
+    self.assertEqual(
+        [r.channel_name for r in result.channel_results], ["ch1"]
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="all_shifted_media",
+          media_channel_names=["ch1", "ch2"],
+          posterior_medians=[5.0, 5.0],
+          expected_aggregate_case=(
+              results.PriorPosteriorShiftAggregateCases.PASS
+          ),
+          expected_channel_cases=[
+              results.PriorPosteriorShiftChannelCases.SHIFT,
+              results.PriorPosteriorShiftChannelCases.SHIFT,
+          ],
+          expected_details={"channels_str": ""},
+      ),
+      dict(
+          testcase_name="one_not_shifted_media",
+          media_channel_names=["ch1", "ch2"],
+          posterior_medians=[5.0, 0.0],
+          expected_aggregate_case=(
+              results.PriorPosteriorShiftAggregateCases.REVIEW
+          ),
+          expected_channel_cases=[
+              results.PriorPosteriorShiftChannelCases.SHIFT,
+              results.PriorPosteriorShiftChannelCases.NO_SHIFT,
+          ],
+          expected_details={"channels_str": "`ch2`"},
+      ),
+      dict(
+          testcase_name="one_shifted_one_not_rf",
+          rf_channel_names=["rf1", "rf2"],
+          posterior_medians=[5.0, 0.0],
+          expected_aggregate_case=(
+              results.PriorPosteriorShiftAggregateCases.REVIEW
+          ),
+          expected_channel_cases=[
+              results.PriorPosteriorShiftChannelCases.SHIFT,
+              results.PriorPosteriorShiftChannelCases.NO_SHIFT,
+          ],
+          expected_details={"channels_str": "`rf2`"},
+      ),
+      dict(
+          testcase_name="mixed_channels_one_not_shifted",
+          media_channel_names=["ch1"],
+          posterior_medians_media=[5.0],
+          rf_channel_names=["rf1"],
+          posterior_medians_rf=[0.0],
+          expected_aggregate_case=(
+              results.PriorPosteriorShiftAggregateCases.REVIEW
+          ),
+          expected_channel_cases=[
+              results.PriorPosteriorShiftChannelCases.SHIFT,
+              results.PriorPosteriorShiftChannelCases.NO_SHIFT,
+          ],
+          expected_details={"channels_str": "`rf1`"},
+      ),
+  )
+  def test_prior_posterior_shift_check(
+      self,
+      expected_aggregate_case,
+      expected_channel_cases,
+      expected_details,
+      media_channel_names=None,
+      posterior_medians=None,
+      posterior_medians_media=None,
+      rf_channel_names=None,
+      posterior_medians_rf=None,
+  ):
+    np.random.seed(0)
+    prior_samples = np.random.normal(0, 1, size=(1, 1000, 1))
+    post_samples_shifted = np.random.normal(5.0, 1, size=(1, 100, 1))
+    post_samples_not_shifted = prior_samples[:, :100, :]
+
+    post_media = None
+    if media_channel_names:
+      if posterior_medians_media is None:
+        posterior_medians_media = posterior_medians
+      post_media_parts = []
+      for median in posterior_medians_media:  # pyrefly: ignore[not-iterable]
+        if median == 0.0:
+          post_media_parts.append(post_samples_not_shifted)
+        else:
+          post_media_parts.append(post_samples_shifted)
+      post_media = np.concatenate(post_media_parts, axis=2)
+
+    post_rf = None
+    if rf_channel_names:
+      if posterior_medians_rf is None:
+        posterior_medians_rf = posterior_medians
+      post_rf_parts = []
+      for median in posterior_medians_rf:  # pyrefly: ignore[not-iterable]
+        if median == 0.0:
+          post_rf_parts.append(post_samples_not_shifted)
+        else:
+          post_rf_parts.append(post_samples_shifted)
+      post_rf = np.concatenate(post_rf_parts, axis=2)
+
+    result = self._run_prior_posterior_shift_check(
+        media_channel_names=media_channel_names,
+        posterior_media_samples=post_media,
+        rf_channel_names=rf_channel_names,
+        posterior_rf_samples=post_rf,
+    )
+    all_channels = []
+    if media_channel_names:
+      all_channels.extend(media_channel_names)
+    if rf_channel_names:
+      all_channels.extend(rf_channel_names)
+
+    self.assertEqual(result.case, expected_aggregate_case)
+    self.assertEqual(result.details, expected_details)
+    self.assertLen(result.channel_results, len(expected_channel_cases))
+    self.assertEqual(
+        [res.case for res in result.channel_results], expected_channel_cases
+    )
+    self.assertEqual(
+        [res.channel_name for res in result.channel_results], all_channels
+    )
+
+  def test_prior_posterior_shift_check_quantile_not_defined(self):
+    np.random.seed(0)
+    post_samples_shifted = np.random.normal(5.0, 1, size=(1, 100, 1))
+
+    result = self._run_prior_posterior_shift_check(
+        media_channel_names=["ch1"],
+        posterior_media_samples=post_samples_shifted,
+        rf_channel_names=None,
+        posterior_rf_samples=None,
+        quantile_not_defined=True,
+    )
+    # With quantile throwing NotImplementedError, we only check for shift in
+    # MEAN.
+    # The posterior is N(5,1) and prior is N(0,1), so mean is different and
+    # shift should be detected.
+    self.assertEqual(
+        result.case, results.PriorPosteriorShiftAggregateCases.PASS
+    )
+    self.assertEqual(result.details, {"channels_str": ""})
+    self.assertLen(result.channel_results, 1)
+    self.assertEqual(
+        result.channel_results[0].case,
+        results.PriorPosteriorShiftChannelCases.SHIFT,
+    )
+    self.assertEqual(result.channel_results[0].channel_name, "ch1")
+
+  def test_bootstrap_custom_n_samples_per_bootstrap(self):
+    x = np.ones((3, 50))
+    x_bs_default = checks._bootstrap(x, n_bootstraps=10)
+    self.assertEqual(x_bs_default.shape, (10, 3, 50))
+    x_bs_custom = checks._bootstrap(
+        x, n_bootstraps=10, n_samples_per_bootstrap=25
+    )
+    self.assertEqual(x_bs_custom.shape, (10, 3, 25))
+
+  def test_prior_posterior_shift_check_custom_n_samples_per_bootstrap(self):
+    np.random.seed(0)
+    post_samples_shifted = np.random.normal(5.0, 1, size=(1, 50, 1))
+    self.config = configs.PriorPosteriorShiftConfig(
+        n_bootstraps=100, n_samples_per_bootstrap=30, alpha=0.05, seed=0
+    )
+    result = self._run_prior_posterior_shift_check(
+        media_channel_names=["ch1"],
+        posterior_media_samples=post_samples_shifted,
+        rf_channel_names=None,
+        posterior_rf_samples=None,
+    )
+    self.assertEqual(
+        result.case, results.PriorPosteriorShiftAggregateCases.PASS
+    )
+    self.assertLen(result.channel_results, 1)
+    self.assertEqual(
+        result.channel_results[0].case,
+        results.PriorPosteriorShiftChannelCases.SHIFT,
+    )
+
+  def test_is_relevant_true_when_using_roi_priors(self):
+    self.model_context.n_media_channels = 1
+    self.model_context.model_spec.effective_media_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_ROI
+    )
+    self.assertTrue(
+        checks.PriorPosteriorShiftCheck.is_relevant(self.model_context)
+    )
+
+  def test_is_relevant_false_when_using_non_roi_priors(self):
+    self.model_context.n_media_channels = 1
+    self.model_context.model_spec.effective_media_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_COEFFICIENT
+    )
+    self.model_context.n_rf_channels = 0
+    self.model_context.model_spec.effective_rf_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_COEFFICIENT
+    )
+    self.assertFalse(
+        checks.PriorPosteriorShiftCheck.is_relevant(self.model_context)
+    )
+
+
+class BaselineCheckTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.model_context = mock.create_autospec(
+        spec=context.ModelContext, spec_set=True, instance=True
+    )
+    self.inference_data = mock.create_autospec(
+        spec=az.InferenceData, spec_set=False, instance=True
+    )
+    self.inference_data.posterior = mock.create_autospec(
+        xr.Dataset, spec_set=True, instance=True
+    )
+    self.analyzer = mock.create_autospec(
+        spec=analyzer_module.Analyzer, spec_set=True, instance=True
+    )
+    self.config = configs.BaselineConfig(
+        negative_baseline_prob_review_threshold=0.2,
+        negative_baseline_prob_fail_threshold=0.8,
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="pass",
+          prob=0.1,
+          expected_case=results.BaselineCases.PASS,
+      ),
+      dict(
+          testcase_name="review",
+          prob=0.5,
+          expected_case=results.BaselineCases.REVIEW,
+      ),
+      dict(
+          testcase_name="fail",
+          prob=0.9,
+          expected_case=results.BaselineCases.FAIL,
+      ),
+  )
+  def test_baseline_check(
+      self, prob: float, expected_case: results.BaselineCases
+  ):
+    self.analyzer.negative_baseline_probability.return_value = prob
+    check = checks.BaselineCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=self.config,
+    )
+    result = check.run()
+    self.assertEqual(result.case, expected_case)
+    if expected_case == results.BaselineCases.PASS:
+      self.assertEqual(
+          result.recommendation,
+          "The posterior probability that the baseline is negative is 0.10. "
+          + review_constants.BASELINE_PASS_RECOMMENDATION,
+      )
+    elif expected_case == results.BaselineCases.REVIEW:
+      self.assertEqual(
+          result.recommendation,
+          "The posterior probability that the baseline is negative is 0.50. "
+          + review_constants.BASELINE_REVIEW_RECOMMENDATION,
+      )
+    else:
+      self.assertEqual(
+          result.recommendation,
+          "The posterior probability that the baseline is negative is 0.90. "
+          + review_constants.BASELINE_FAIL_RECOMMENDATION,
+      )
+
+  def test_baseline_check_with_selected_times_geos(self):
+    self.analyzer.negative_baseline_probability.return_value = 0.5
+    check = checks.BaselineCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=self.config,
+        selected_times=["time1"],
+        selected_geos=["geo1"],
+    )
+    check.run()
+    self.analyzer.negative_baseline_probability.assert_called_once_with(
+        selected_geos=["geo1"],
+        selected_times=["time1"],
+    )
+
+
+def _mock_filter_and_aggregate(
+    tensor,
+    aggregate_times: bool = False,
+    aggregate_geos: bool = False,
+    **unused_kwargs,
+):
+  if aggregate_times and aggregate_geos:
+    return np.sum(tensor, axis=(-2, -1) if tensor.ndim >= 2 else -1)
+  if aggregate_times:
+    return np.sum(tensor, axis=-1)
+  if aggregate_geos:
+    return np.sum(tensor, axis=-2)
+  return tensor
+
+
+def _reference_two_sided_ppp(
+    observed: float, means: np.ndarray, stddevs: np.ndarray
+) -> float:
+  """Computes the two-sided PPP with `statistics.NormalDist` as a reference."""
+  center = float(np.mean(means))
+  distance = abs(observed - center)
+  tail_probabilities = []
+  for mean, stddev in zip(np.ravel(means), np.ravel(stddevs), strict=True):
+    if stddev == 0:
+      tail_probabilities.append(float(abs(mean - center) >= distance))
+    else:
+      normal = statistics.NormalDist(mu=float(mean), sigma=float(stddev))
+      tail_probabilities.append(
+          normal.cdf(center - distance) + 1.0 - normal.cdf(center + distance)
+      )
+  return float(np.mean(tail_probabilities))
+
+
+class BayesianPPPCheckTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.model_context = mock.create_autospec(
+        spec=context.ModelContext,
+        spec_set=True,
+        instance=True,
+    )
+    self.mock_kpi_transformer = mock.create_autospec(
+        spec=transformers.KpiTransformer, spec_set=True, instance=True
+    )
+    self.mock_kpi_transformer.population_scaled_stdev = 1.0
+    self.model_context.kpi_transformer = self.mock_kpi_transformer
+    self.model_context.population = np.array([1.0, 1.0])
+    self.model_context.input_data.revenue_per_kpi = None
+
+    self.inference_data = mock.create_autospec(
+        spec=az.InferenceData, spec_set=False, instance=True
+    )
+    self.inference_data.posterior = {
+        constants.SIGMA: np.array([[0.0, 0.0]])
+    }
+    self.analyzer = mock.create_autospec(
+        spec=analyzer_module.Analyzer, spec_set=True, instance=True
+    )
+    self.config = configs.BayesianPPPConfig(ppp_threshold=0.05)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="pass",
+          kpi=np.array([10, 20]),
+          revenue_per_kpi=None,
+          expected_outcome=np.array([25, 35]),
+          expected_case=results.BayesianPPPCases.PASS,
+          expected_ppp=1.0,
+      ),
+      dict(
+          testcase_name="fail",
+          kpi=np.array([10, 30]),
+          revenue_per_kpi=None,
+          expected_outcome=np.array([29, 31]),
+          expected_case=results.BayesianPPPCases.FAIL,
+          expected_ppp=0.0,
+      ),
+      dict(
+          testcase_name="pass_with_revenue_per_kpi",
+          kpi=np.array([5.0, 10.0]),
+          revenue_per_kpi=2.0,
+          expected_outcome=np.array([25, 35]),
+          expected_case=results.BayesianPPPCases.PASS,
+          expected_ppp=1.0,
+      ),
+  )
+  def test_bayesian_ppp_check(
+      self,
+      kpi,
+      revenue_per_kpi,
+      expected_outcome,
+      expected_case,
+      expected_ppp,
+  ):
+    self.model_context.input_data.kpi = kpi
+    self.model_context.input_data.revenue_per_kpi = revenue_per_kpi
+    self.analyzer.expected_outcome.return_value = expected_outcome
+    self.analyzer.filter_and_aggregate_geos_and_times.side_effect = (
+        lambda tensor, **kwargs: tensor
+    )
+
+    check = checks.BayesianPPPCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=self.config,
+    )
+    result = check.run()
+
+    self.analyzer.expected_outcome.assert_called_once_with(
+        aggregate_times=True,
+        aggregate_geos=True,
+        selected_geos=None,
+        selected_times=None,
+    )
+    self.assertEqual(result.case, expected_case)
+    self.assertAlmostEqual(
+        result.details[results.constants.BAYESIAN_PPP], expected_ppp
+    )
+
+  def test_bayesian_ppp_check_with_selected_times_geos(self):
+    self.model_context.input_data.kpi = np.array([10, 20])
+    self.analyzer.expected_outcome.return_value = np.array([25, 35])
+    self.analyzer.filter_and_aggregate_geos_and_times.side_effect = (
+        lambda tensor, **kwargs: tensor
+    )
+
+    check = checks.BayesianPPPCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=self.config,
+        selected_times=["time1"],
+        selected_geos=["geo1"],
+    )
+    check.run()
+    self.analyzer.expected_outcome.assert_called_once_with(
+        aggregate_times=True,
+        aggregate_geos=True,
+        selected_geos=["geo1"],
+        selected_times=["time1"],
+    )
+
+  def test_bayesian_ppp_matches_closed_form(self):
+    # Observed total is 10 + 26 = 36, and the posterior predictive mean is 30.
+    self.model_context.input_data.kpi = np.array([10.0, 26.0])
+    expected_outcome = np.array([25.0, 35.0])
+    sigma = np.array([[1.0, 2.0]])
+    self.analyzer.expected_outcome.return_value = expected_outcome
+    self.analyzer.filter_and_aggregate_geos_and_times.side_effect = (
+        lambda tensor, **kwargs: tensor
+    )
+    self.inference_data.posterior = {constants.SIGMA: sigma}
+
+    result = checks.BayesianPPPCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=self.config,
+    ).run()
+
+    self.analyzer.expected_outcome.assert_called_once_with(
+        aggregate_times=True,
+        aggregate_geos=True,
+        selected_geos=None,
+        selected_times=None,
+    )
+    # Two unit-population cells give a total sigma of sigma * sqrt(2).
+    expected_total_sigma = np.array([np.sqrt(2.0), 2.0 * np.sqrt(2.0)])
+    self.assertAlmostEqual(
+        result.details[results.constants.BAYESIAN_PPP],
+        _reference_two_sided_ppp(36.0, expected_outcome, expected_total_sigma),
+    )
+    self.assertEqual(result.case, results.BayesianPPPCases.PASS)
+
+  def test_bayesian_ppp_mixes_point_mass_and_normal_draws(self):
+    # Observed total is 36 and the posterior predictive mean is 30. The first
+    # draw has zero sigma and lies within 6 of the mean, so it contributes 0.
+    self.model_context.input_data.kpi = np.array([10.0, 26.0])
+    expected_outcome = np.array([25.0, 35.0])
+    self.analyzer.expected_outcome.return_value = expected_outcome
+    self.analyzer.filter_and_aggregate_geos_and_times.side_effect = (
+        lambda tensor, **kwargs: tensor
+    )
+    self.inference_data.posterior = {constants.SIGMA: np.array([[0.0, 1.0]])}
+
+    result = checks.BayesianPPPCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=self.config,
+    ).run()
+
+    self.assertAlmostEqual(
+        result.details[results.constants.BAYESIAN_PPP],
+        _reference_two_sided_ppp(
+            36.0, expected_outcome, np.array([0.0, np.sqrt(2.0)])
+        ),
+    )
+
+  def test_bayesian_ppp_fails_when_sigma_is_nan(self):
+    self.model_context.input_data.kpi = np.array([10.0, 26.0])
+    self.analyzer.expected_outcome.return_value = np.array([25.0, 35.0])
+    self.analyzer.filter_and_aggregate_geos_and_times.side_effect = (
+        lambda tensor, **kwargs: tensor
+    )
+    self.inference_data.posterior = {
+        constants.SIGMA: np.array([[np.nan, 1.0]])
+    }
+
+    result = checks.BayesianPPPCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=self.config,
+    ).run()
+
+    self.assertTrue(np.isnan(result.details[results.constants.BAYESIAN_PPP]))
+    self.assertEqual(result.case, results.BayesianPPPCases.FAIL)
+
+  def test_two_sided_normal_mixture_p_value_rejects_mismatched_shapes(self):
+    with self.assertRaisesRegex(ValueError, "must have the same shape"):
+      checks._two_sided_normal_mixture_p_value(
+          observed=36.0,
+          means=np.array([25.0, 35.0]),
+          stddevs=np.array([[1.0], [2.0]]),
+      )
+
+  def test_bayesian_ppp_is_deterministic(self):
+    self.model_context.input_data.kpi = np.array([50.0, 62.0])
+    rng = np.random.default_rng(seed=0)
+    self.analyzer.expected_outcome.return_value = rng.normal(
+        100.0, 5.0, size=(1, 100)
+    )
+    self.analyzer.filter_and_aggregate_geos_and_times.side_effect = (
+        lambda tensor, **kwargs: tensor
+    )
+    self.inference_data.posterior = {
+        constants.SIGMA: rng.uniform(5.0, 10.0, size=(1, 100))
+    }
+    check = checks.BayesianPPPCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=self.config,
+    )
+
+    np.random.seed(0)
+    global_state_before = np.random.get_state()
+    first_ppp = check.run().details[results.constants.BAYESIAN_PPP]
+    global_state_after = np.random.get_state()
+    np.random.seed(1)
+    second_ppp = check.run().details[results.constants.BAYESIAN_PPP]
+
+    self.assertEqual(first_ppp, second_ppp)
+    # The check neither draws from nor reseeds NumPy's global random state.
+    np.testing.assert_array_equal(global_state_before[1], global_state_after[1])
+    self.assertEqual(global_state_before[2], global_state_after[2])
+
+  def test_bayesian_ppp_matches_monte_carlo_estimate(self):
+    # Observed total is 50 + 62 = 112.
+    self.model_context.input_data.kpi = np.array([50.0, 62.0])
+    n_draws = 200
+    rng = np.random.default_rng(seed=0)
+    expected_outcome = rng.normal(100.0, 5.0, size=(1, n_draws))
+    sigma = rng.uniform(5.0, 10.0, size=(1, n_draws))
+    self.analyzer.expected_outcome.return_value = expected_outcome
+    self.analyzer.filter_and_aggregate_geos_and_times.side_effect = (
+        lambda tensor, **kwargs: tensor
+    )
+    self.inference_data.posterior = {constants.SIGMA: sigma}
+
+    result = checks.BayesianPPPCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=self.config,
+    ).run()
+
+    # Simulate many replicates of one predictive draw per posterior draw, and
+    # count draws at least as far from their replicate's mean as the observed
+    # total.
+    total_sigma = sigma.flatten() * np.sqrt(2.0)
+    simulated_totals = rng.normal(
+        expected_outcome.flatten(), total_sigma, size=(5000, n_draws)
+    )
+    replicate_means = np.mean(simulated_totals, axis=1, keepdims=True)
+    monte_carlo_ppp = np.mean(
+        np.abs(simulated_totals - replicate_means)
+        >= np.abs(112.0 - replicate_means)
+    )
+    self.assertAlmostEqual(
+        result.details[results.constants.BAYESIAN_PPP],
+        monte_carlo_ppp,
+        delta=0.005,
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="national_kpi",
+          n_geos=1,
+          use_revenue=False,
+          unique_sigma=False,
+      ),
+      dict(
+          testcase_name="national_revenue",
+          n_geos=1,
+          use_revenue=True,
+          unique_sigma=False,
+      ),
+      dict(
+          testcase_name="geo_kpi_shared_sigma",
+          n_geos=3,
+          use_revenue=False,
+          unique_sigma=False,
+      ),
+      dict(
+          testcase_name="geo_revenue_geo_sigma",
+          n_geos=3,
+          use_revenue=True,
+          unique_sigma=True,
+      ),
+  )
+  def test_bayesian_ppp_matches_closed_form_for_national_and_geo_models(
+      self, n_geos, use_revenue, unique_sigma
+  ):
+    rng = np.random.default_rng(seed=0)
+    n_chains, n_draws, n_times = 2, 50, 4
+    geos = [f"geo_{i}" for i in range(n_geos)]
+    kpi = rng.uniform(50.0, 100.0, (n_geos, n_times))
+    pop = np.linspace(100.0, 500.0, n_geos) if n_geos > 1 else np.array([1.0])
+    price = rng.uniform(1.5, 2.5, (n_geos, n_times)) if use_revenue else None
+
+    model_context = mock.create_autospec(
+        spec=context.ModelContext, spec_set=True, instance=True
+    )
+    model_context.kpi_transformer = transformers.KpiTransformer(
+        kpi=backend.to_tensor(kpi),
+        population=backend.to_tensor(pop),
+    )
+    model_context.population = pop
+    model_context.input_data.kpi = kpi
+    model_context.input_data.revenue_per_kpi = price
+
+    if unique_sigma:
+      sigma_da = xr.DataArray(
+          rng.uniform(0.1, 0.3, (n_chains, n_draws, n_geos)),
+          dims=["chain", "draw", "geo"],
+          coords={"geo": geos},
+      )
+    else:
+      sigma_da = xr.DataArray(
+          rng.uniform(0.1, 0.3, (n_chains, n_draws)),
+          dims=["chain", "draw"],
+      )
+    inference_data = mock.create_autospec(
+        spec=az.InferenceData, spec_set=False, instance=True
+    )
+    inference_data.posterior = {constants.SIGMA: sigma_da}
+
+    analyzer = mock.create_autospec(
+        spec=analyzer_module.Analyzer, spec_set=True, instance=True
+    )
+    analyzer.filter_and_aggregate_geos_and_times.side_effect = (
+        _mock_filter_and_aggregate
+    )
+    check = checks.BayesianPPPCheck(
+        model_context=model_context,
+        inference_data=inference_data,
+        analyzer=analyzer,
+        config=configs.BayesianPPPConfig(),
+    )
+    total_sigma = check._calculate_total_sigma()
+    observed_total = float(np.sum(kpi * price if price is not None else kpi))
+    # Center the expected totals one total sigma above the observed total.
+    expected_outcome = rng.normal(
+        observed_total + np.mean(total_sigma),
+        np.mean(total_sigma),
+        size=(n_chains, n_draws),
+    )
+    analyzer.expected_outcome.return_value = expected_outcome
+
+    result = check.run()
+
+    # The outcome is float32 when JAX runs without x64, so allow for rounding.
+    self.assertAlmostEqual(
+        result.details[results.constants.BAYESIAN_PPP],
+        _reference_two_sided_ppp(observed_total, expected_outcome, total_sigma),
+        delta=1e-6,
+    )
+
+  def test_bayesian_ppp_is_larger_when_sigma_is_larger(self):
+    self.model_context.input_data.kpi = np.array([50.0, 50.0])
+    expected_outcome = np.full((1, 1000), 80.0)
+    self.analyzer.expected_outcome.return_value = expected_outcome
+    self.analyzer.filter_and_aggregate_geos_and_times.side_effect = (
+        lambda tensor, **kwargs: tensor
+    )
+
+    # Run with smaller sigma.
+    self.inference_data.posterior = {
+        constants.SIGMA: np.full((1, 1000), 0.1)
+    }
+    result_small_sigma = checks.BayesianPPPCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=self.config,
+    ).run()
+
+    # Run with larger sigma.
+    self.inference_data.posterior = {
+        constants.SIGMA: np.full((1, 1000), 20.0)
+    }
+    result_large_sigma = checks.BayesianPPPCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=self.config,
+    ).run()
+
+    self.assertGreater(
+        result_large_sigma.details[results.constants.BAYESIAN_PPP],
+        result_small_sigma.details[results.constants.BAYESIAN_PPP],
+    )
+
+  def test_kpi_transformer_sensitivity_matches_analytical_weights(self):
+    n_geos, n_times = 4, 6
+    kpi_raw = np.random.uniform(100.0, 500.0, (n_geos, n_times))
+    pop = np.array([50.0, 100.0, 200.0, 400.0])
+    kpi_transformer = transformers.KpiTransformer(
+        kpi=backend.to_tensor(kpi_raw),
+        population=backend.to_tensor(pop),
+    )
+    slope = (
+        kpi_transformer.inverse(backend.to_tensor(np.ones((n_geos, 1))))
+        - kpi_transformer.inverse(backend.to_tensor(np.zeros((n_geos, 1))))
+    )
+    expected_slope = np.asarray(slope)
+    analytical_slope = (
+        float(kpi_transformer.population_scaled_stdev) * pop[:, np.newaxis]
+    )
+
+    np.testing.assert_allclose(expected_slope, analytical_slope, rtol=1e-6)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="geo_revenue_shared_sigma",
+          n_geos=3,
+          n_times=4,
+          use_revenue=True,
+          unique_sigma=False,
+      ),
+      dict(
+          testcase_name="geo_kpi_shared_sigma",
+          n_geos=3,
+          n_times=4,
+          use_revenue=False,
+          unique_sigma=False,
+      ),
+      dict(
+          testcase_name="geo_revenue_geo_sigma",
+          n_geos=3,
+          n_times=4,
+          use_revenue=True,
+          unique_sigma=True,
+      ),
+      dict(
+          testcase_name="geo_kpi_geo_sigma",
+          n_geos=3,
+          n_times=4,
+          use_revenue=False,
+          unique_sigma=True,
+      ),
+      dict(
+          testcase_name="national_revenue",
+          n_geos=1,
+          n_times=4,
+          use_revenue=True,
+          unique_sigma=False,
+      ),
+      dict(
+          testcase_name="national_kpi",
+          n_geos=1,
+          n_times=4,
+          use_revenue=False,
+          unique_sigma=False,
+      ),
+  )
+  def test_calculate_total_sigma_configuration_matrix(
+      self, n_geos, n_times, use_revenue, unique_sigma
+  ):
+    n_chains, n_draws = 2, 5
+    geos = [f"geo_{i}" for i in range(n_geos)]
+
+    kpi = np.random.uniform(50.0, 100.0, (n_geos, n_times))
+    pop = np.linspace(100.0, 500.0, n_geos) if n_geos > 1 else np.array([1.0])
+    price = (
+        np.random.uniform(1.5, 2.5, (n_geos, n_times)) if use_revenue else None
+    )
+
+    kpi_transformer = transformers.KpiTransformer(
+        kpi=backend.to_tensor(kpi),
+        population=backend.to_tensor(pop),
+    )
+
+    model_context = mock.create_autospec(
+        spec=context.ModelContext, spec_set=True, instance=True
+    )
+    model_context.kpi_transformer = kpi_transformer
+    model_context.population = pop
+    model_context.input_data.kpi = kpi
+    model_context.input_data.revenue_per_kpi = price
+
+    if unique_sigma:
+      sigma_vals = np.random.uniform(0.1, 0.3, (n_chains, n_draws, n_geos))
+      sigma_da = xr.DataArray(
+          sigma_vals,
+          dims=["chain", "draw", "geo"],
+          coords={"geo": geos},
+      )
+    else:
+      sigma_vals = np.random.uniform(0.1, 0.3, (n_chains, n_draws))
+      sigma_da = xr.DataArray(
+          sigma_vals,
+          dims=["chain", "draw"],
+      )
+
+    inference_data = mock.create_autospec(
+        spec=az.InferenceData, spec_set=False, instance=True
+    )
+    inference_data.posterior = {constants.SIGMA: sigma_da}
+
+    analyzer = mock.create_autospec(
+        spec=analyzer_module.Analyzer, spec_set=True, instance=True
+    )
+
+    analyzer.filter_and_aggregate_geos_and_times.side_effect = (
+        _mock_filter_and_aggregate
+    )
+
+    check = checks.BayesianPPPCheck(
+        model_context=model_context,
+        inference_data=inference_data,
+        analyzer=analyzer,
+        config=configs.BayesianPPPConfig(),
+    )
+
+    # Compute expected analytical total sigma.
+    stdev = float(kpi_transformer.population_scaled_stdev)
+    if price is not None:
+      weight = pop[:, np.newaxis] * price
+    else:
+      weight = np.broadcast_to(
+          pop[:, np.newaxis] if n_geos > 1 else pop, (n_geos, n_times)
+      )
+    weight_sq = weight**2
+    weight_sq_sum_time = np.sum(weight_sq, axis=-1)
+
+    if unique_sigma:
+      expected_total_var = np.sum(
+          (sigma_vals**2) * weight_sq_sum_time, axis=-1
+      ) * (stdev**2)
+      expected_total_sigma = np.sqrt(expected_total_var).flatten()
+    else:
+      expected_total_sigma = sigma_vals.flatten() * (
+          stdev * np.sqrt(np.sum(weight_sq))
+      )
+
+    actual_total_sigma = check._calculate_total_sigma()
+    np.testing.assert_allclose(
+        actual_total_sigma, expected_total_sigma, rtol=1e-6
+    )
+
+  def test_calculate_total_sigma_subset_filtering(self):
+    n_chains, n_draws, n_geos, n_times = 2, 4, 4, 5
+    geos = [f"geo_{i}" for i in range(n_geos)]
+    selected_geos = ["geo_0", "geo_2"]
+    selected_times = ["time_1", "time_3", "time_4"]
+    selected_geo_idx = [0, 2]
+    selected_time_idx = [1, 3, 4]
+
+    kpi = np.random.uniform(50.0, 100.0, (n_geos, n_times))
+    pop = np.array([100.0, 200.0, 300.0, 400.0])
+    price = np.random.uniform(1.0, 2.0, (n_geos, n_times))
+
+    kpi_transformer = transformers.KpiTransformer(
+        kpi=backend.to_tensor(kpi),
+        population=backend.to_tensor(pop),
+    )
+
+    model_context = mock.create_autospec(
+        spec=context.ModelContext, spec_set=True, instance=True
+    )
+    model_context.kpi_transformer = kpi_transformer
+    model_context.population = pop
+    model_context.input_data.kpi = kpi
+    model_context.input_data.revenue_per_kpi = price
+
+    sigma_vals = np.random.uniform(0.1, 0.3, (n_chains, n_draws, n_geos))
+    sigma_da = xr.DataArray(
+        sigma_vals,
+        dims=["chain", "draw", "geo"],
+        coords={"geo": geos},
+    )
+    inference_data = mock.create_autospec(
+        spec=az.InferenceData, spec_set=False, instance=True
+    )
+    inference_data.posterior = {constants.SIGMA: sigma_da}
+
+    analyzer = mock.create_autospec(
+        spec=analyzer_module.Analyzer, spec_set=True, instance=True
+    )
+
+    def mock_subset_filter_and_aggregate(
+        tensor,
+        selected_geos=None,
+        selected_times=None,
+        aggregate_geos=False,
+        aggregate_times=False,
+        **unused_kwargs,
+    ):
+      t = np.asarray(tensor)
+      geo_idx = [0, 2] if selected_geos else list(range(n_geos))
+      time_idx = [1, 3, 4] if selected_times else list(range(n_times))
+      t_filtered = t[..., geo_idx, :][..., :, time_idx]
+      if aggregate_times and aggregate_geos:
+        return np.sum(t_filtered, axis=(-2, -1))
+      if aggregate_times:
+        return np.sum(t_filtered, axis=-1)
+      if aggregate_geos:
+        return np.sum(t_filtered, axis=-2)
+      return t_filtered
+
+    analyzer.filter_and_aggregate_geos_and_times.side_effect = (
+        mock_subset_filter_and_aggregate
+    )
+
+    check = checks.BayesianPPPCheck(
+        model_context=model_context,
+        inference_data=inference_data,
+        analyzer=analyzer,
+        config=configs.BayesianPPPConfig(),
+        selected_geos=selected_geos,
+        selected_times=selected_times,
+    )
+
+    # Compute expected analytical total sigma under filtered subsets.
+    stdev = float(kpi_transformer.population_scaled_stdev)
+    weight = pop[:, np.newaxis] * price
+    weight_sq_filtered = (
+        weight[selected_geo_idx, :][:, selected_time_idx] ** 2
+    ).sum(axis=-1)
+    sigma_selected = sigma_vals[:, :, selected_geo_idx]
+    expected_total_var = np.sum(
+        (sigma_selected**2) * weight_sq_filtered, axis=-1
+    ) * (stdev**2)
+    expected_total_sigma = np.sqrt(expected_total_var).flatten()
+
+    actual_total_sigma = check._calculate_total_sigma()
+    np.testing.assert_allclose(
+        actual_total_sigma, expected_total_sigma, rtol=1e-6
+    )
+
+
+class GoodnessOfFitCheckTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.model_context = mock.create_autospec(
+        spec=context.ModelContext, spec_set=True, instance=True
+    )
+    self.inference_data = mock.create_autospec(
+        spec=az.InferenceData, spec_set=False, instance=True
+    )
+    self.inference_data.posterior = mock.create_autospec(
+        xr.Dataset, spec_set=True, instance=True
+    )
+    self.analyzer = mock.create_autospec(
+        spec=analyzer_module.Analyzer, spec_set=True, instance=True
+    )
+
+  def _get_gof_dataset(
+      self,
+      r_squared_all: float,
+      mape_all: float,
+      wmape_all: float,
+      r_squared_train: float,
+      mape_train: float,
+      wmape_train: float,
+      r_squared_test: float,
+      mape_test: float,
+      wmape_test: float,
+  ) -> xr.Dataset:
+    dims = (
+        constants.METRIC,
+        constants.EVALUATION_SET_VAR,
+        constants.GEO_GRANULARITY,
+    )
+    data = np.array([
+        [[1.0, r_squared_all], [1.0, r_squared_train], [1.0, r_squared_test]],
+        [[1.0, mape_all], [1.0, mape_train], [1.0, mape_test]],
+        [[1.0, wmape_all], [1.0, wmape_train], [1.0, wmape_test]],
+    ])
+    coords = {
+        constants.METRIC: [
+            constants.R_SQUARED,
+            constants.MAPE,
+            constants.WMAPE,
+        ],
+        constants.EVALUATION_SET_VAR: [
+            constants.ALL_DATA,
+            constants.TRAIN,
+            constants.TEST,
+        ],
+        constants.GEO_GRANULARITY: [constants.GEO, constants.NATIONAL],
+    }
+    return xr.Dataset(
+        data_vars={constants.VALUE: (dims, data)},
+        coords=coords,
+    )
+
+  def _get_gof_dataset_no_holdout(
+      self,
+      r_squared: float,
+      mape: float,
+      wmape: float,
+  ) -> xr.Dataset:
+    dims = (
+        constants.METRIC,
+        constants.GEO_GRANULARITY,
+    )
+    data = np.array([
+        [1.0, r_squared],
+        [1.0, mape],
+        [1.0, wmape],
+    ])
+    coords = {
+        constants.METRIC: [
+            constants.R_SQUARED,
+            constants.MAPE,
+            constants.WMAPE,
+        ],
+        constants.GEO_GRANULARITY: [constants.GEO, constants.NATIONAL],
+    }
+    return xr.Dataset(
+        data_vars={constants.VALUE: (dims, data)},
+        coords=coords,
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="pass_geo",
+          r_squared_all=0.5,
+          r_squared_train=0.6,
+          r_squared_test=0.4,
+          mape=0.1,
+          wmape=0.1,
+          expected_case=results.GoodnessOfFitCases.PASS,
+      ),
+      dict(
+          testcase_name="review_zero_all_geo",
+          r_squared_all=0.0,
+          r_squared_train=0.6,
+          r_squared_test=0.4,
+          mape=0.1,
+          wmape=0.1,
+          expected_case=results.GoodnessOfFitCases.REVIEW,
+      ),
+      dict(
+          testcase_name="review_negative_train_geo",
+          r_squared_all=0.5,
+          r_squared_train=-0.1,
+          r_squared_test=0.4,
+          mape=0.1,
+          wmape=0.1,
+          expected_case=results.GoodnessOfFitCases.REVIEW,
+      ),
+      dict(
+          testcase_name="review_negative_test_geo",
+          r_squared_all=0.5,
+          r_squared_train=0.6,
+          r_squared_test=-0.1,
+          mape=0.1,
+          wmape=0.1,
+          expected_case=results.GoodnessOfFitCases.REVIEW,
+      ),
+  )
+  def test_goodness_of_fit_check_holdout(
+      self,
+      r_squared_all,
+      r_squared_train,
+      r_squared_test,
+      mape,
+      wmape,
+      expected_case,
+  ):
+    self.model_context.n_geos = 2
+    gof_dataset = self._get_gof_dataset(
+        r_squared_all=r_squared_all,
+        mape_all=mape,
+        wmape_all=wmape,
+        r_squared_train=r_squared_train,
+        mape_train=mape,
+        wmape_train=wmape,
+        r_squared_test=r_squared_test,
+        mape_test=mape,
+        wmape_test=wmape,
+    )
+    self.analyzer.predictive_accuracy.return_value = gof_dataset
+    config = configs.GoodnessOfFitConfig()
+    gof_check = checks.GoodnessOfFitCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+    )
+    result = gof_check.run()
+    self.assertEqual(result.case, expected_case)
+    self.assertIn(
+        f"R-squared = {r_squared_all:.4f} (All)", result.recommendation
+    )
+    self.assertIn(f"{r_squared_train:.4f} (Train)", result.recommendation)
+    self.assertIn(f"{r_squared_test:.4f} (Test)", result.recommendation)
+    self.assertIn(f"MAPE = {mape:.4f} (All)", result.recommendation)
+    self.assertIn(f"wMAPE = {wmape:.4f} (All)", result.recommendation)
+    if expected_case == results.GoodnessOfFitCases.PASS:
+      self.assertEndsWith(
+          result.recommendation,
+          review_constants.GOODNESS_OF_FIT_PASS_RECOMMENDATION,
+      )
+    else:
+      self.assertIn(
+          review_constants.GOODNESS_OF_FIT_REVIEW_RECOMMENDATION,
+          result.recommendation,
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="pass_geo_no_holdout",
+          r_squared=0.5,
+          mape=0.1,
+          wmape=0.1,
+          expected_case=results.GoodnessOfFitCases.PASS,
+      ),
+      dict(
+          testcase_name="review_negative_geo_no_holdout",
+          r_squared=-0.1,
+          mape=0.1,
+          wmape=0.1,
+          expected_case=results.GoodnessOfFitCases.REVIEW,
+      ),
+  )
+  def test_goodness_of_fit_check_no_holdout(
+      self, r_squared, mape, wmape, expected_case
+  ):
+    self.model_context.n_geos = 2
+    gof_dataset = self._get_gof_dataset_no_holdout(
+        r_squared, mape, wmape
+    )
+    self.analyzer.predictive_accuracy.return_value = gof_dataset
+    config = configs.GoodnessOfFitConfig()
+    gof_check = checks.GoodnessOfFitCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+    )
+    result = gof_check.run()
+    self.assertEqual(result.case, expected_case)
+    self.assertIn(f"R-squared = {r_squared:.4f}", result.recommendation)
+    self.assertIn(f"MAPE = {mape:.4f}", result.recommendation)
+    self.assertIn(f"wMAPE = {wmape:.4f}", result.recommendation)
+    if expected_case == results.GoodnessOfFitCases.PASS:
+      self.assertEndsWith(
+          result.recommendation,
+          review_constants.GOODNESS_OF_FIT_PASS_RECOMMENDATION,
+      )
+    else:
+      self.assertIn(
+          review_constants.GOODNESS_OF_FIT_REVIEW_RECOMMENDATION,
+          result.recommendation,
+      )
+
+  def test_goodness_of_fit_check_with_custom_threshold(self):
+    self.model_context.n_geos = 2
+    gof_dataset = self._get_gof_dataset_no_holdout(0.4, 0.1, 0.1)
+    self.analyzer.predictive_accuracy.return_value = gof_dataset
+    config = configs.GoodnessOfFitConfig(r_squared_threshold=0.5)
+    gof_check = checks.GoodnessOfFitCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+    )
+    result = gof_check.run()
+    self.assertEqual(result.case, results.GoodnessOfFitCases.REVIEW)
+
+    # When r_squared (0.4) > r_squared_threshold (0.3), the check should pass.
+    pass_config = configs.GoodnessOfFitConfig(r_squared_threshold=0.3)
+    gof_check_pass = checks.GoodnessOfFitCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=pass_config,
+    )
+    pass_result = gof_check_pass.run()
+    self.assertEqual(pass_result.case, results.GoodnessOfFitCases.PASS)
+
+  def test_goodness_of_fit_check_with_selected_times_geos(self):
+    self.model_context.n_geos = 2
+    gof_dataset = self._get_gof_dataset_no_holdout(0.5, 0.1, 0.1)
+    self.analyzer.predictive_accuracy.return_value = gof_dataset
+    config = configs.GoodnessOfFitConfig()
+    check = checks.GoodnessOfFitCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+        selected_times=["time1"],
+        selected_geos=["geo1"],
+    )
+    check.run()
+    self.analyzer.predictive_accuracy.assert_called_once_with(
+        selected_geos=["geo1"],
+        selected_times=["time1"],
+    )
+
+
+class ImplausibleROICheckTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.model_context = mock.create_autospec(
+        spec=context.ModelContext, spec_set=True, instance=True
+    )
+    self.input_data = mock.create_autospec(
+        spec=input_data.InputData, spec_set=True, instance=True
+    )
+    self.model_context.input_data = self.input_data
+    self.model_context.model_spec.effective_media_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_ROI
+    )
+    self.model_context.model_spec.effective_rf_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_ROI
+    )
+    self.inference_data = mock.create_autospec(
+        spec=az.InferenceData, spec_set=False, instance=True
+    )
+    self.inference_data.posterior = mock.create_autospec(
+        spec=xr.Dataset, spec_set=False, instance=True
+    )
+    self.inference_data.posterior.media_channel = mock.create_autospec(
+        spec=xr.DataArray, spec_set=True, instance=True
+    )
+    self.inference_data.posterior.roi_m = mock.create_autospec(
+        spec=xr.DataArray, spec_set=True, instance=True
+    )
+    self.inference_data.posterior.rf_channel = mock.create_autospec(
+        spec=xr.DataArray, spec_set=True, instance=True
+    )
+    self.inference_data.posterior.roi_rf = mock.create_autospec(
+        spec=xr.DataArray, spec_set=True, instance=True
+    )
+    self.analyzer = mock.create_autospec(
+        spec=analyzer_module.Analyzer, spec_set=True, instance=True
+    )
+    self.config = configs.ImplausibleROIConfig()
+
+  def test_implausible_roi_check_pass(self):
+    # Spend share: [0.5, 0.5]
+    self.model_context.input_data.get_total_spend.return_value = np.array(
+        [50.0, 50.0]
+    )
+    self.inference_data.posterior.media_channel.values = np.array(
+        ["ch1", "ch2"]
+    )
+    # Mean ROI: [2.0, 4.0]
+    # Spend weighted: [1.0, 2.0] (< 45.0 upper bound)
+    # Reciprocal spend weighted: [4.0, 8.0] (> 1.25 lower bound)
+    self.inference_data.posterior.roi_m.values = np.array([
+        [[2.0, 4.0]],
+    ])  # (chain=1, draw=1, channel=2)
+    self.inference_data.posterior.coords = [constants.MEDIA_CHANNEL]
+
+    config = configs.ImplausibleROIConfig(
+        roi_lower_bound=1.25, roi_upper_bound=45.0
+    )
+    check = checks.ImplausibleROICheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+    )
+    result = check.run()
+    self.assertEqual(result.case, results.ImplausibleROIAggregateCases.PASS)
+    self.assertEmpty(result.high_roi_channels)
+    self.assertEmpty(result.low_roi_channels)
+    self.assertAlmostEqual(result.channel_results[0].spend_share, 0.5)
+    self.assertAlmostEqual(result.channel_results[1].spend_share, 0.5)
+    self.assertEqual(result.roi_lower_bound, 1.25)
+    self.assertEqual(result.roi_upper_bound, 45.0)
+
+  def test_implausible_roi_check_spend_share_calculation(self):
+    # Spend share for [10.0, 30.0] is [0.25, 0.75]
+    self.model_context.input_data.get_total_spend.return_value = np.array(
+        [10.0, 30.0]
+    )
+    self.inference_data.posterior.media_channel.values = np.array(
+        ["ch1", "ch2"]
+    )
+    # Mean ROI: [2.0, 4.0]
+    # ch1: spend_weighted=2.0*0.25=0.5, reciprocal=2.0/0.25=8.0
+    # ch2: spend_weighted=4.0*0.75=3.0, reciprocal=4.0/0.75=5.333
+    # All are within bounds (0.5, 20.0), so check should pass.
+    self.inference_data.posterior.roi_m.values = np.array([
+        [[2.0, 4.0]],
+    ])  # (chain=1, draw=1, channel=2)
+    self.inference_data.posterior.coords = [constants.MEDIA_CHANNEL]
+
+    config = configs.ImplausibleROIConfig()
+    check = checks.ImplausibleROICheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+    )
+    result = check.run()
+
+    with self.subTest("AggregateCase"):
+      self.assertEqual(result.case, results.ImplausibleROIAggregateCases.PASS)
+      self.assertEmpty(result.high_roi_channels)
+      self.assertEmpty(result.low_roi_channels)
+
+    with self.subTest("SpendShareCalculation"):
+      self.assertLen(result.channel_results, 2)
+      self.assertAlmostEqual(result.channel_results[0].spend_share, 0.25)
+      self.assertAlmostEqual(result.channel_results[1].spend_share, 0.75)
+
+  def test_implausible_roi_check_pass_with_3d_spend(self):
+    # Spend share: [0.5, 0.5]
+    self.model_context.input_data.get_total_spend.return_value = np.array(
+        [[[20.0, 30.0]], [[30.0, 20.0]]]
+    )
+    self.inference_data.posterior.media_channel.values = np.array(
+        ["ch1", "ch2"]
+    )
+    # Mean ROI: [2.0, 4.0]
+    # Spend weighted: [1.0, 2.0] (< 20.0 upper bound)
+    # Reciprocal spend weighted: [4.0, 8.0] (> 0.5 lower bound)
+    self.inference_data.posterior.roi_m.values = np.array([
+        [[2.0, 4.0]],
+    ])  # (chain=1, draw=1, channel=2)
+    self.inference_data.posterior.coords = [constants.MEDIA_CHANNEL]
+
+    config = configs.ImplausibleROIConfig()
+    check = checks.ImplausibleROICheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+    )
+    result = check.run()
+    self.assertEqual(result.case, results.ImplausibleROIAggregateCases.PASS)
+    self.assertEmpty(result.high_roi_channels)
+    self.assertEmpty(result.low_roi_channels)
+
+  def test_implausible_roi_check_high(self):
+    self.model_context.input_data.get_total_spend.return_value = np.array(
+        [50.0, 50.0]
+    )
+    self.inference_data.posterior.media_channel.values = np.array(
+        ["ch1", "ch2"]
+    )
+    # ch1: ROI mean = 50.0. Spend weighted = 25.0 (> 20.0 upper bound)
+    # -> high ROI!
+    self.inference_data.posterior.roi_m.values = np.array([
+        [[50.0, 4.0]],
+    ])
+    self.inference_data.posterior.coords = [constants.MEDIA_CHANNEL]
+
+    config = configs.ImplausibleROIConfig()
+    check = checks.ImplausibleROICheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+    )
+    result = check.run()
+    self.assertEqual(result.case, results.ImplausibleROIAggregateCases.REVIEW)
+    self.assertEqual(result.high_roi_channels, ["ch1"])
+    self.assertEmpty(result.low_roi_channels)
+
+  def test_implausible_roi_check_low(self):
+    self.model_context.input_data.get_total_spend.return_value = np.array(
+        [50.0, 50.0]
+    )
+    self.inference_data.posterior.media_channel.values = np.array(
+        ["ch1", "ch2"]
+    )
+    # ch2: ROI mean = 0.1. Reciprocal spend weighted = 0.2 (< 0.5 lower bound)
+    # -> low ROI!
+    self.inference_data.posterior.roi_m.values = np.array([
+        [[2.0, 0.1]],
+    ])
+    self.inference_data.posterior.coords = [constants.MEDIA_CHANNEL]
+
+    config = configs.ImplausibleROIConfig()
+    check = checks.ImplausibleROICheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+    )
+    result = check.run()
+    self.assertEqual(result.case, results.ImplausibleROIAggregateCases.REVIEW)
+    self.assertEmpty(result.high_roi_channels)
+    self.assertEqual(result.low_roi_channels, ["ch2"])
+
+  def test_implausible_roi_check_pass_with_media_and_rf_channels(self):
+    # Spend: ch1=50, ch2=50, rf1=50. Spend share: [1/3, 1/3, 1/3]
+    self.model_context.input_data.get_total_spend.return_value = np.array(
+        [50.0, 50.0, 50.0]
+    )
+    self.inference_data.posterior.media_channel.values = np.array(
+        ["ch1", "ch2"]
+    )
+    self.inference_data.posterior.rf_channel.values = np.array(["rf1"])
+    # Media channel Mean ROI: [2.0, 4.0]
+    # RF channel Mean ROI: [3.0]
+    # For ch1: spend_weighted=2/3, reciprocal=6.
+    # For ch2: spend_weighted=4/3, reciprocal=12.
+    # For rf1: spend_weighted=3/3=1, reciprocal=9.
+    # All are within bounds (0.5, 20.0).
+    self.inference_data.posterior.roi_m.values = np.array([
+        [[2.0, 4.0]],
+    ])  # (chain=1, draw=1, channel=2)
+    self.inference_data.posterior.roi_rf.values = np.array([
+        [[3.0]],
+    ])  # (chain=1, draw=1, channel=1)
+    self.inference_data.posterior.coords = [
+        constants.MEDIA_CHANNEL,
+        constants.RF_CHANNEL,
+    ]
+
+    config = configs.ImplausibleROIConfig()
+    check = checks.ImplausibleROICheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+    )
+    result = check.run()
+    self.assertEqual(result.case, results.ImplausibleROIAggregateCases.PASS)
+    self.assertEmpty(result.high_roi_channels)
+    self.assertEmpty(result.low_roi_channels)
+
+  def test_implausible_roi_check_skips_rf_channels_without_roi_priors(self):
+    # RF channels use mROI priors, so the posterior has no `roi_rf`.
+    self.model_context.model_spec.effective_rf_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_MROI
+    )
+    self.model_context.input_data.get_total_spend.return_value = np.array(
+        [50.0, 50.0, 50.0]
+    )
+    self.inference_data.posterior.media_channel.values = np.array(
+        ["ch1", "ch2"]
+    )
+    self.inference_data.posterior.rf_channel.values = np.array(["rf1"])
+    self.inference_data.posterior.roi_m.values = np.array([
+        [[2.0, 4.0]],
+    ])  # (chain=1, draw=1, channel=2)
+    self.inference_data.posterior.roi_rf.values = None
+    self.inference_data.posterior.coords = [
+        constants.MEDIA_CHANNEL,
+        constants.RF_CHANNEL,
+    ]
+
+    check = checks.ImplausibleROICheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=configs.ImplausibleROIConfig(),
+    )
+    result = check.run()
+
+    self.assertEqual(
+        [r.channel_name for r in result.channel_results], ["ch1", "ch2"]
+    )
+
+  def test_is_relevant_true_when_using_roi_priors(self):
+    self.model_context.n_media_channels = 1
+    self.model_context.model_spec.effective_media_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_ROI
+    )
+    self.assertTrue(checks.ImplausibleROICheck.is_relevant(self.model_context))
+
+  def test_is_relevant_false_when_using_non_roi_priors(self):
+    self.model_context.n_media_channels = 1
+    self.model_context.model_spec.effective_media_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_COEFFICIENT
+    )
+    self.model_context.n_rf_channels = 0
+    self.model_context.model_spec.effective_rf_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_COEFFICIENT
+    )
+    self.assertFalse(checks.ImplausibleROICheck.is_relevant(self.model_context))
+
+
+class HighVarianceCheckTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.model_context = mock.create_autospec(
+        spec=context.ModelContext, spec_set=True, instance=True
+    )
+    self.input_data = mock.create_autospec(
+        spec=input_data.InputData, spec_set=False, instance=True
+    )
+    self.model_context.input_data = self.input_data
+    self.model_context.model_spec.effective_media_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_ROI
+    )
+    self.model_context.model_spec.effective_rf_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_ROI
+    )
+    self.inference_data = mock.create_autospec(
+        spec=az.InferenceData, spec_set=False, instance=True
+    )
+    self.inference_data.posterior = mock.create_autospec(
+        spec=xr.Dataset, spec_set=False, instance=True
+    )
+    self.inference_data.posterior.media_channel = mock.create_autospec(
+        spec=xr.DataArray, spec_set=False, instance=True
+    )
+    self.inference_data.posterior.rf_channel = mock.create_autospec(
+        spec=xr.DataArray, spec_set=False, instance=True
+    )
+    self.inference_data.posterior.roi_m = mock.create_autospec(
+        spec=xr.DataArray, spec_set=False, instance=True
+    )
+    self.inference_data.posterior.roi_rf = mock.create_autospec(
+        spec=xr.DataArray, spec_set=False, instance=True
+    )
+    self.analyzer = mock.create_autospec(
+        spec=analyzer_module.Analyzer, spec_set=True, instance=True
+    )
+
+  def test_high_variance_roi_check_pass(self):
+    mock_hdi = self.enter_context(mock.patch("arviz.hdi", autospec=True))
+    # Spend share: [0.5]
+    self.model_context.input_data.get_total_spend.return_value = np.array(
+        [100.0]
+    )
+    self.inference_data.posterior.media_channel.values = np.array(["ch1"])
+    self.inference_data.posterior.roi_m.values = np.array([
+        [[2.0]],
+    ])
+    self.inference_data.posterior.coords = [constants.MEDIA_CHANNEL]
+
+    # HDI bounds: [1.5, 2.5]
+    # Width: 1.0, Rel Width: 0.5
+    # Rel Width Ratio = 0.5 / 2.07377 ≈ 0.24
+    # Spend weighted ratio = 0.12 (< 1.0 upper bound)
+    mock_hdi.return_value = np.array([[1.5, 2.5]])
+
+    config = configs.HighVarianceConfig()
+    check = checks.HighVarianceCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+    )
+    result = check.run()
+    self.assertEqual(result.case, results.HighVarianceAggregateCases.PASS)
+    self.assertEmpty(result.high_variance_channels)
+
+  def test_high_variance_roi_check_high(self):
+    mock_hdi = self.enter_context(mock.patch("arviz.hdi", autospec=True))
+    # Spend share: [0.5]
+    self.model_context.input_data.get_total_spend.return_value = np.array(
+        [100.0]
+    )
+    self.inference_data.posterior.media_channel.values = np.array(["ch1"])
+    self.inference_data.posterior.roi_m.values = np.array([
+        [[1.0]],
+    ])
+    self.inference_data.posterior.coords = [constants.MEDIA_CHANNEL]
+
+    # HDI bounds: [0.0, 10.0]
+    # Width: 10.0, Rel Width: 10.0
+    # Rel Width Ratio = 10.0 / 2.07377 ≈ 4.82
+    # Spend weighted ratio = 2.41 (> 1.0 upper bound)
+    mock_hdi.return_value = np.array([[0.0, 10.0]])
+
+    config = configs.HighVarianceConfig()
+    check = checks.HighVarianceCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+    )
+    result = check.run()
+    self.assertEqual(result.case, results.HighVarianceAggregateCases.REVIEW)
+    self.assertEqual(result.high_variance_channels, ["ch1"])
+
+  def _setup_media_and_rf_channels_for_hdi_check(self):
+    mock_hdi = self.enter_context(mock.patch("arviz.hdi", autospec=True))
+    # Spend: ch1=50, ch2=50, rf1=50. Spend share: [1/3, 1/3, 1/3]
+    self.model_context.input_data.get_total_spend.return_value = np.array(
+        [50.0, 50.0, 50.0]
+    )
+    self.inference_data.posterior.media_channel.values = np.array(
+        ["ch1", "ch2"]
+    )
+    self.inference_data.posterior.rf_channel.values = np.array(["rf1"])
+    self.inference_data.posterior.roi_m.values = np.array([
+        [[2.0, 4.0]],
+    ])  # (chain=1, draw=1, channel=2)
+    self.inference_data.posterior.roi_rf.values = np.array([
+        [[3.0]],
+    ])  # (chain=1, draw=1, channel=1)
+    self.inference_data.posterior.coords = [
+        constants.MEDIA_CHANNEL,
+        constants.RF_CHANNEL,
+    ]
+
+    # HDI bounds for 3 channels:
+    # ch1: [1.5, 2.5], width=1.0, median=2.0, rel_width=0.5
+    # ch2: [3.5, 4.5], width=1.0, median=4.0, rel_width=0.25
+    # rf1: [2.5, 3.5], width=1.0, median=3.0, rel_width=0.333
+    mock_hdi.return_value = np.array([[1.5, 2.5], [3.5, 4.5], [2.5, 3.5]])
+
+    # Expected prior_widths_concat for [ch1, ch2, rf1] is [2.0, 2.0, 2.0]
+    # rel_width_post for ch1=0.5, ch2=0.25, rf1=1/3
+    # relative_width_ratio for ch1=0.25, ch2=0.125, rf1=1/6
+    # spend_share = 1/3 for all
+    # spend_weighted_ratio for ch1=0.0833, ch2=0.0416, rf1=0.0555 (< 1.0)
+    return mock_hdi
+
+  def test_high_variance_roi_check_pass_with_media_and_rf_channels(self):
+    mock_hdi = self._setup_media_and_rf_channels_for_hdi_check()
+    config = configs.HighVarianceConfig(prior_relative_hdi_width=2.0)
+    check = checks.HighVarianceCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+    )
+    result = check.run()
+    self.assertEqual(result.case, results.HighVarianceAggregateCases.PASS)
+    self.assertEmpty(result.high_variance_channels)
+    mock_hdi.assert_called_once()
+
+  def test_high_variance_roi_check_hdi_call_arguments(self):
+    mock_hdi = self._setup_media_and_rf_channels_for_hdi_check()
+    config = configs.HighVarianceConfig(prior_relative_hdi_width=2.0)
+    check = checks.HighVarianceCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+    )
+    check.run()
+
+    mock_hdi.assert_called_once()
+    posterior_roi_concat = np.array([[[2.0, 4.0, 3.0]]])
+    np.testing.assert_allclose(mock_hdi.call_args[0][0], posterior_roi_concat)
+    self.assertEqual(mock_hdi.call_args[1]["hdi_prob"], config.hdi_prob)
+
+  @parameterized.named_parameters(
+      dict(
+          # Ratio = (3.0 / 1.0) / 2.0 = 1.5, which is not above the custom
+          # threshold of 1.5 (it would be flagged with the default of 1.0).
+          testcase_name="boundary_pass",
+          roi_m_values=np.array([[[1.0]]]),
+          hdi_return_value=np.array([[0.0, 3.0]]),
+          prior_relative_hdi_width=2.0,
+          high_variance_threshold=1.5,
+          expected_relative_width_ratio=1.5,
+      ),
+      dict(
+          testcase_name="zero_mean_roi_pass",
+          roi_m_values=np.array([[[0.0]]]),
+          hdi_return_value=np.array([[-1.0, 1.0]]),
+          prior_relative_hdi_width=2.0,
+          high_variance_threshold=1.0,
+          expected_relative_width_ratio=0.0,
+      ),
+      dict(
+          testcase_name="zero_prior_width_pass",
+          roi_m_values=np.array([[[1.0]]]),
+          hdi_return_value=np.array([[0.0, 2.0]]),
+          prior_relative_hdi_width=0.0,
+          high_variance_threshold=1.0,
+          expected_relative_width_ratio=0.0,
+      ),
+  )
+  def test_high_variance_roi_check_edge_cases(
+      self,
+      roi_m_values,
+      hdi_return_value,
+      prior_relative_hdi_width,
+      high_variance_threshold,
+      expected_relative_width_ratio,
+  ):
+    mock_hdi = self.enter_context(mock.patch("arviz.hdi", autospec=True))
+    self.model_context.input_data.get_total_spend.return_value = np.array(
+        [100.0]
+    )
+    self.inference_data.posterior.media_channel.values = np.array(["ch1"])
+    self.inference_data.posterior.roi_m.values = roi_m_values
+    self.inference_data.posterior.coords = [constants.MEDIA_CHANNEL]
+
+    mock_hdi.return_value = hdi_return_value
+
+    config = configs.HighVarianceConfig(
+        prior_relative_hdi_width=prior_relative_hdi_width,
+        high_variance_threshold=high_variance_threshold,
+    )
+    check = checks.HighVarianceCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=config,
+    )
+    result = check.run()
+    self.assertEqual(result.case, results.HighVarianceAggregateCases.PASS)
+    self.assertEqual(result.high_variance_channels, [])
+    self.assertEqual(
+        result.channel_results[0].relative_width_ratio,
+        expected_relative_width_ratio,
+    )
+    self.assertEqual(result.prior_relative_hdi_width, prior_relative_hdi_width)
+    self.assertEqual(result.high_variance_threshold, high_variance_threshold)
+
+  def test_is_relevant_true_when_using_roi_priors(self):
+    self.model_context.n_media_channels = 1
+    self.model_context.model_spec.effective_media_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_ROI
+    )
+    self.assertTrue(checks.HighVarianceCheck.is_relevant(self.model_context))
+
+  def test_is_relevant_false_when_using_non_roi_priors(self):
+    self.model_context.n_media_channels = 1
+    self.model_context.model_spec.effective_media_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_COEFFICIENT
+    )
+    self.model_context.n_rf_channels = 0
+    self.model_context.model_spec.effective_rf_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_COEFFICIENT
+    )
+    self.assertFalse(checks.HighVarianceCheck.is_relevant(self.model_context))
+
+
+class PotentialBiasCheckTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.model_context = mock.create_autospec(
+        spec=context.ModelContext, spec_set=True, instance=True
+    )
+    self.input_data = mock.create_autospec(
+        spec=input_data.InputData, spec_set=False, instance=True
+    )
+    self.model_context.input_data = self.input_data
+    self.inference_data = mock.create_autospec(
+        spec=az.InferenceData, spec_set=False, instance=True
+    )
+    self.analyzer = mock.create_autospec(
+        spec=analyzer_module.Analyzer, spec_set=True, instance=True
+    )
+    self.model_context.n_geos = 1
+    self.model_context.n_times = 4
+    self.config = configs.PotentialBiasConfig(correlation_threshold=0.03)
+    geo_da = mock.create_autospec(
+        spec=xr.DataArray, spec_set=False, instance=True
+    )
+    geo_da.values = np.array(["geo1"])
+    self.input_data.geo = geo_da
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="with_controls",
+          paid_channels=["ch1", "ch2"],
+          media_all_data=np.array(
+              [[[1.0, 1.0], [2.0, 2.0], [3.0, 1.0], [4.0, 2.0]]]
+          ),
+          controls_data=np.array([[[4.0], [5.0], [2.0], [1.0]]]),
+          expected_aggregate_case=results.PotentialBiasAggregateCases.REVIEW,
+          expected_low_correlation_channels=["ch2"],
+          expected_channel_cases=[
+              results.PotentialBiasChannelCases.ROI_PASS,
+              results.PotentialBiasChannelCases.LOW_CORRELATION,
+          ],
+          expected_correlation_matrix=xr.DataArray(
+              np.array([[[-0.84852814], [0.0]]]),
+              coords={
+                  constants.GEO: ["geo1"],
+                  constants.CHANNEL: ["ch1", "ch2"],
+                  constants.CONTROL_VARIABLE: ["ctrl0"],
+              },
+              dims=[
+                  constants.GEO,
+                  constants.CHANNEL,
+                  constants.CONTROL_VARIABLE,
+              ],
+          ),
+      ),
+      dict(
+          testcase_name="no_controls",
+          paid_channels=["ch1"],
+          media_all_data=np.array([[[1.0], [2.0], [3.0], [4.0]]]),
+          controls_data=None,
+          expected_aggregate_case=results.PotentialBiasAggregateCases.NO_CONTROLS,
+          expected_low_correlation_channels=[],
+          expected_channel_cases=[],
+          expected_correlation_matrix=xr.DataArray(
+              np.zeros((1, 1, 0)),
+              coords={
+                  constants.GEO: ["geo1"],
+                  constants.CHANNEL: ["ch1"],
+                  constants.CONTROL_VARIABLE: [],
+              },
+              dims=[
+                  constants.GEO,
+                  constants.CHANNEL,
+                  constants.CONTROL_VARIABLE,
+              ],
+          ),
+      ),
+      dict(
+          testcase_name="constant_input",
+          paid_channels=["ch1"],
+          media_all_data=np.array([
+              [[1.0], [2.0], [3.0], [4.0]],
+              [[1.0], [1.0], [1.0], [1.0]],  # constant media in geo2
+          ]),
+          controls_data=np.array([
+              [[4.0], [5.0], [2.0], [1.0]],
+              [[4.0], [5.0], [2.0], [1.0]],
+          ]),
+          expected_aggregate_case=results.PotentialBiasAggregateCases.PASS,
+          expected_low_correlation_channels=[],
+          expected_channel_cases=[
+              results.PotentialBiasChannelCases.ROI_PASS,
+          ],
+          expected_correlation_matrix=xr.DataArray(
+              np.array([[[-0.84852814]], [[np.nan]]]),
+              coords={
+                  constants.GEO: ["geo1", "geo2"],
+                  constants.CHANNEL: ["ch1"],
+                  constants.CONTROL_VARIABLE: ["ctrl0"],
+              },
+              dims=[
+                  constants.GEO,
+                  constants.CHANNEL,
+                  constants.CONTROL_VARIABLE,
+              ],
+          ),
+      ),
+  )
+  def test_potential_bias_check(
+      self,
+      paid_channels,
+      media_all_data,
+      controls_data,
+      expected_aggregate_case,
+      expected_low_correlation_channels,
+      expected_channel_cases,
+      expected_correlation_matrix,
+  ):
+    self.input_data.get_all_paid_channels.return_value = np.array(paid_channels)
+    self.input_data.get_all_media_and_rf.return_value = media_all_data
+
+    n_geos = media_all_data.shape[0]
+    self.model_context.n_geos = n_geos
+    self.input_data.geo.values = np.array([f"geo{i+1}" for i in range(n_geos)])
+
+    if controls_data is not None:
+      controls_da = mock.create_autospec(
+          spec=xr.DataArray, spec_set=False, instance=True
+      )
+      controls_da.values = controls_data
+      coord_da = mock.create_autospec(
+          spec=xr.DataArray, spec_set=False, instance=True
+      )
+      coord_da.values = np.array(
+          [f"ctrl{i}" for i in range(controls_data.shape[-1])]
+      )
+      controls_da.coords = {constants.CONTROL_VARIABLE: coord_da}
+      self.input_data.controls = controls_da
+      self.model_context.n_controls = controls_data.shape[-1]
+    else:
+      self.input_data.controls = None
+      self.model_context.n_controls = 0
+
+    check = checks.PotentialBiasCheck(
+        model_context=self.model_context,
+        inference_data=self.inference_data,
+        analyzer=self.analyzer,
+        config=self.config,
+    )
+
+    result = check.run()
+    self.assertEqual(result.case, expected_aggregate_case)
+    # Custom threshold from setUp (the default is 0.1).
+    self.assertEqual(result.correlation_threshold, 0.03)
+    self.assertEqual(
+        result.low_correlation_channels, expected_low_correlation_channels
+    )
+    self.assertEqual(
+        [res.case for res in result.channel_results], expected_channel_cases
+    )
+    xr.testing.assert_allclose(
+        result.correlation_matrix, expected_correlation_matrix, atol=1e-6
+    )
+    xr.testing.assert_allclose(
+        result.details[results.constants.CORRELATION_MATRIX],
+        expected_correlation_matrix,
+        atol=1e-6,
+    )
+
+
+class ChannelCheckConfigTest(parameterized.TestCase):
+
+  def test_is_failing_channels_within_threshold_abs(self):
+    config = configs.ChannelCheckConfig(failing_channels_threshold=1)
+    self.assertTrue(config.is_failing_channels_within_threshold(1, 10))
+    self.assertFalse(config.is_failing_channels_within_threshold(2, 10))
+
+  def test_is_failing_channels_within_threshold_ratio(self):
+    config = configs.ChannelCheckConfig(failing_channels_ratio_threshold=0.1)
+    self.assertTrue(config.is_failing_channels_within_threshold(1, 10))
+    self.assertFalse(config.is_failing_channels_within_threshold(2, 10))
+
+  def test_is_failing_channels_within_threshold_either_condition(self):
+    # Both thresholds set: passes if EITHER absolute or ratio threshold is met.
+    config = configs.ChannelCheckConfig(
+        failing_channels_threshold=1,
+        failing_channels_ratio_threshold=0.1,
+    )
+    # n_failing = 1, n_total = 5 -> abs pass (1 <= 1), ratio fail (0.2 > 0.1)
+    # -> True
+    self.assertTrue(config.is_failing_channels_within_threshold(1, 5))
+    # n_failing = 2, n_total = 50 -> abs fail (2 > 1), ratio pass (0.04 <= 0.1)
+    # -> True
+    self.assertTrue(config.is_failing_channels_within_threshold(2, 50))
+    # n_failing = 3, n_total = 10 -> abs fail (3 > 1), ratio fail (0.3 > 0.1)
+    # -> False
+    self.assertFalse(config.is_failing_channels_within_threshold(3, 10))
+
+  def test_invalid_thresholds(self):
+    with self.assertRaises(ValueError):
+      configs.ChannelCheckConfig(failing_channels_threshold=-1)
+    with self.assertRaises(ValueError):
+      configs.ChannelCheckConfig(failing_channels_ratio_threshold=-0.1)
+    with self.assertRaises(ValueError):
+      configs.ChannelCheckConfig(failing_channels_ratio_threshold=1.5)
+
+  def test_is_failing_channels_within_threshold_zero_or_negative_total(self):
+    config = configs.ChannelCheckConfig(failing_channels_threshold=1)
+    self.assertFalse(config.is_failing_channels_within_threshold(1, 0))
+    self.assertFalse(config.is_failing_channels_within_threshold(1, -1))
+
+  def test_is_failing_channels_within_threshold_default_config(self):
+    config = configs.ChannelCheckConfig()
+    self.assertTrue(config.is_failing_channels_within_threshold(0, 10))
+    self.assertFalse(config.is_failing_channels_within_threshold(1, 10))
+
+
+class ChannelChecksThresholdTest(absltest.TestCase):
+
+  def test_roi_consistency_thresholds(self):
+    model_context = mock.create_autospec(
+        spec=context.ModelContext, spec_set=True, instance=True
+    )
+    model_context.n_media_channels = 2
+    model_context.n_rf_channels = 0
+    model_context.model_spec.effective_media_prior_type = (
+        constants.TREATMENT_PRIOR_TYPE_ROI
+    )
+    inference_data = mock.create_autospec(
+        spec=az.InferenceData, spec_set=False, instance=True
+    )
+    inference_data.posterior = mock.create_autospec(
+        spec=xr.Dataset, spec_set=False, instance=True
+    )
+    inference_data.posterior.coords = {constants.MEDIA_CHANNEL: ["ch1", "ch2"]}
+    inference_data.posterior.media_channel = mock.create_autospec(
+        spec=xr.DataArray, spec_set=False, instance=True
+    )
+    inference_data.posterior.media_channel.values = np.array(["ch1", "ch2"])
+
+    mock_prior = mock.create_autospec(
+        spec=backend.tfd.Distribution, spec_set=True, instance=True
+    )
+    mock_prior.quantile.side_effect = lambda q: 0.1 if q == 0.01 else 0.9
+    model_context.model_spec.prior.roi_m = mock_prior
+
+    inference_data.posterior.roi_m = np.array([[[0.05, 0.5]]])
+    analyzer = mock.create_autospec(
+        spec=analyzer_module.Analyzer, spec_set=True, instance=True
+    )
+
+    cfg_default = configs.ROIConsistencyConfig(failing_channels_threshold=0)
+    check_default = checks.ROIConsistencyCheck(
+        model_context=model_context,
+        inference_data=inference_data,
+        analyzer=analyzer,
+        config=cfg_default,
+    )
+    res_default = check_default.run()
+    self.assertEqual(
+        res_default.case, results.ROIConsistencyAggregateCases.REVIEW
+    )
+    self.assertLen(res_default.channel_results, 2)
+
+    cfg_custom = configs.ROIConsistencyConfig(failing_channels_threshold=1)
+    check_custom = checks.ROIConsistencyCheck(
+        model_context=model_context,
+        inference_data=inference_data,
+        analyzer=analyzer,
+        config=cfg_custom,
+    )
+    res_custom = check_custom.run()
+    self.assertEqual(res_custom.case, results.ROIConsistencyAggregateCases.PASS)
+    self.assertEqual(
+        res_custom.channel_results[0].case,
+        results.ROIConsistencyChannelCases.ROI_LOW,
+    )
+
+  def test_prior_posterior_shift_thresholds(self):
+    model_context = mock.create_autospec(
+        spec=context.ModelContext, spec_set=True, instance=True
+    )
+    model_context.n_media_channels = 2
+    model_context.n_rf_channels = 0
+    inference_data = mock.create_autospec(
+        spec=az.InferenceData, spec_set=False, instance=True
+    )
+    inference_data.posterior = mock.create_autospec(
+        spec=xr.Dataset, spec_set=False, instance=True
+    )
+    inference_data.posterior.coords = {constants.MEDIA_CHANNEL: ["ch1", "ch2"]}
+    inference_data.posterior.media_channel = mock.create_autospec(
+        spec=xr.DataArray, spec_set=False, instance=True
+    )
+    inference_data.posterior.media_channel.values = np.array(["ch1", "ch2"])
+    inference_data.posterior.__getitem__.side_effect = lambda k: getattr(
+        inference_data.posterior, k
+    )
+
+    mock_prior = mock.create_autospec(
+        spec=backend.tfd.Distribution, spec_set=True, instance=True
+    )
+    mock_prior.mean.return_value = np.array([1.0, 1.0])
+    mock_prior.quantile.return_value = np.array([1.0, 1.0])
+    model_context.model_spec.prior.roi_m = mock_prior
+    analyzer = mock.create_autospec(
+        spec=analyzer_module.Analyzer, spec_set=True, instance=True
+    )
+
+    cfg_custom = configs.PriorPosteriorShiftConfig(
+        failing_channels_ratio_threshold=0.6
+    )
+    with mock.patch.object(
+        checks,
+        "_calculate_new_statistics_from_samples",
+        return_value={
+            "mean": np.array([[10.0, 1.0]]),
+            "median": np.array([[10.0, 1.0]]),
+            "q1": np.array([[10.0, 1.0]]),
+            "q3": np.array([[10.0, 1.0]]),
+        },
+    ):
+      check = checks.PriorPosteriorShiftCheck(
+          model_context=model_context,
+          inference_data=inference_data,
+          analyzer=analyzer,
+          config=cfg_custom,
+      )
+      res = check.run()
+      self.assertEqual(res.case, results.PriorPosteriorShiftAggregateCases.PASS)
+
+
+if __name__ == "__main__":
+  absltest.main()
